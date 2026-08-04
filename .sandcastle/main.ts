@@ -669,6 +669,9 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         ISSUE_TITLE: issue.title,
         BRANCH: branch,
         BASE_BRANCH: issue.base,
+        // Drives the commit-subject format in the implement/review prompts: 'ralph'
+        // (RALPH:-prefixed subjects) vs 'conventional' (type(scope): …, commitlint-safe).
+        COMMIT_STYLE: cfg.project.commitStyle,
       };
       await acquire();
       try {
