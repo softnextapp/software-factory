@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Runtime artifacts a consumer creates locally — never part of the Factory source.
+# (.sandcastle/*.ts, *.test.ts and tsconfig.json ARE tracked; only these subpaths are not.)
+.sandcastle/.env
+.sandcastle/.env.secrets
+.sandcastle/logs/
+.sandcastle/worktrees/
+
+# Local Claude settings (per-developer)
+.claude/settings.local.json
