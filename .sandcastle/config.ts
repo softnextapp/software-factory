@@ -18,11 +18,16 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Reasoning effort. claude-code serialises this as `output_config.effort`; z.ai
- * maps it onto its own `reasoning_effort` server enum (none…max). An invalid
- * value 400s on z.ai, so this is an exhaustive union, not a loose string.
+ * Reasoning effort. Exactly the engine's `claudeCode(model, { effort })` enum
+ * (@ai-hero/sandcastle `ClaudeCodeOptions.effort`): low … max. It is a literal
+ * here rather than imported from the engine so config.ts stays engine-free and
+ * unit-testable in isolation — task #1's tests run with no engine installed.
+ * z.ai maps it onto its own server-side `reasoning_effort`; an invalid value
+ * 400s there, so this is an exhaustive union, not a loose string. (z.ai's server
+ * enum is wider — none, minimal — but `claude --effort` never offers them, so a
+ * provider can never send them; they are omitted on purpose.)
  */
-export type Effort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /**
  * A provider is the quadruplet {model, base URL, token key, reasoning effort}.
