@@ -12,27 +12,7 @@ import {
   type ProjectConfig,
 } from './config.ts';
 
-let passed = 0;
-let failed = 0;
-function test(name: string, fn: () => void): void {
-  try {
-    fn();
-    passed++;
-    console.log('  ok   ' + name);
-  } catch (e) {
-    failed++;
-    console.log('FAIL   ' + name + '\n        ' + (e as Error).message);
-  }
-}
-function throws(fn: () => void): void {
-  let threw = false;
-  try {
-    fn();
-  } catch {
-    threw = true;
-  }
-  assert.ok(threw, 'expected the call to throw, but it did not');
-}
+import { test, throws, finish } from './test-harness.ts';
 
 // ---------------------------------------------------------------------------
 // loadRunConfig — the env contract
@@ -185,5 +165,4 @@ test('loadConfig() convenience wires defaults end to end', () => {
   assert.equal(c.providerFor('planner').model, c.project.providers.zai.model);
 });
 
-console.log(`\n${passed} passed, ${failed} failed`);
-if (failed > 0) process.exit(1);
+finish();

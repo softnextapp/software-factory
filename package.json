@@ -4,7 +4,7 @@
   "type": "module",
   "description": "SoftNext shared Sandcastle factory config layer. See CONTEXT.md.",
   "scripts": {
-    "test": "tsx .sandcastle/config.test.ts && tsx .sandcastle/plan.test.ts",
+    "test": "tsx .sandcastle/config.test.ts && tsx .sandcastle/plan.test.ts && tsx .sandcastle/chain.test.ts",
     "typecheck": "tsc --noEmit -p .sandcastle/tsconfig.json"
   },
   "devDependencies": {
