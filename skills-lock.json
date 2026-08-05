@@ -1,0 +1,135 @@
+{
+  "source": {
+    "repo": "https://github.com/mattpocock/skills",
+    "plugin": "mattpocock-skills",
+    "pluginVersion": "1.2.0"
+  },
+  "skills": [
+    {
+      "name": "ask-matt",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/ask-matt",
+      "hash": "faaa71bb9ed7861c4e3eda1adb9d9aedcaef4a0580a8779bac8119a4c970025f"
+    },
+    {
+      "name": "code-review",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/code-review",
+      "hash": "9475d327e3d19b4640198fbb6c533a94696c5f99c633390d991198d74f12e31a"
+    },
+    {
+      "name": "codebase-design",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/codebase-design",
+      "hash": "b2af66b7297ae3bb1f6d9b5c27cce88288ebf937cf0319489bfd6bc24939f86b"
+    },
+    {
+      "name": "diagnosing-bugs",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/diagnosing-bugs",
+      "hash": "bb318284654d1f077be2635b47b69a19755e635282775d4e2eec109db9e81a38"
+    },
+    {
+      "name": "domain-modeling",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/domain-modeling",
+      "hash": "8d774870ffd93ad77b07f56bbe59fb76c8f9e246fe49e0181ed65a519fc28929"
+    },
+    {
+      "name": "grill-with-docs",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/grill-with-docs",
+      "hash": "05c1b216a482ea0fd5a5281e96b0f1b5fd5e1c1e9edd572709c71944ef6fd7d6"
+    },
+    {
+      "name": "implement",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/implement",
+      "hash": "3180dbe245245f99dceb669e597cf633935cc87be0ca3c39a86dde54e62a4db9"
+    },
+    {
+      "name": "improve-codebase-architecture",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/improve-codebase-architecture",
+      "hash": "4e24a95060abfc657dd5c22eee9b595e4bc63678802110b17086ff8d42bd26e2"
+    },
+    {
+      "name": "prototype",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/prototype",
+      "hash": "598186ce2adb916c38d6e122040f119d1c1ed97ade090d807455a3a37c527588"
+    },
+    {
+      "name": "research",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/research",
+      "hash": "3bbc342f7484484d31118fd7cb148690aba2600b318d6b680edc6ce2c2399948"
+    },
+    {
+      "name": "resolving-merge-conflicts",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/resolving-merge-conflicts",
+      "hash": "cf66bf26fb8a943d426271120f033825f7ed591349812ff4f636d3db56c976dc"
+    },
+    {
+      "name": "setup-matt-pocock-skills",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/setup-matt-pocock-skills",
+      "hash": "77a741aeb13b11ccc12cd639c456f92b51b7cf639a416792090acfe6eac990d4"
+    },
+    {
+      "name": "tdd",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/tdd",
+      "hash": "a3e5ff266e1f4bbc364ae3a77546451e106bd195ff9919b603f2bd959030aa10"
+    },
+    {
+      "name": "to-spec",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/to-spec",
+      "hash": "9e9d9d82f96ac0abca549e345aa23ed7064b30b3b9044efe56a34dd47c6d8e3e"
+    },
+    {
+      "name": "to-tickets",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/to-tickets",
+      "hash": "b7c6499e10c567abdbfca7f5c730f2de91584a517816ace5aaaff49f4790e947"
+    },
+    {
+      "name": "triage",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/triage",
+      "hash": "ca9de3d5cb0c5d96252c784da4d1e760574d3c22d80fa0285a02b36efb45301a"
+    },
+    {
+      "name": "wayfinder",
+      "category": "engineering",
+      "path": ".claude/skills/engineering/wayfinder",
+      "hash": "cb8cc9487a0a9342f7c5545811c5a4f49d34971813b6057c6f1f470153fc11ae"
+    },
+    {
+      "name": "grill-me",
+      "category": "productivity",
+      "path": ".claude/skills/productivity/grill-me",
+      "hash": "cec05582f13830a7bd63984474b999c806a7b93935ed638a27f32eac1b7f976b"
+    },
+    {
+      "name": "grilling",
+      "category": "productivity",
+      "path": ".claude/skills/productivity/grilling",
+      "hash": "5ec71b63ca01084807463b85a30fa317b3fbd05330fb6cb67bb92db90467f6ac"
+    },
+    {
+      "name": "handoff",
+      "category": "productivity",
+      "path": ".claude/skills/productivity/handoff",
+      "hash": "9f8a832aafee3eec6dae6902d758b2438fefb116a6afb9914777238538b14d2b"
+    },
+    {
+      "name": "teach",
+      "category": "productivity",
+      "path": ".claude/skills/productivity/teach",
+      "hash": "209d2ead53b2c6eba2425198f6f09eb51fd2bde490c34da2d93b187b4b749414"
+    }
+  ]
+}

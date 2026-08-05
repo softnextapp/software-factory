@@ -23,6 +23,9 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/chain.ts` | Chained-MR base resolution. |
 | `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/GitLab facts. |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
+| `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |
+| `.claude/skills/` | The vendored Matt Pocock skills — see [Vendored skills](#vendored-skills). |
+| `skills-lock.json` | Manifest of record for the vendored skills (source + path + content hash each). |
 | `docs/adr/` | Architecture decision records. |
 
 ## The Orchestration
@@ -189,6 +192,40 @@ Only the tokens the **active profile's** providers need are required; `main.ts`
 validates them at startup, not at the first sandbox. `.env` keeps only what *every*
 agent needs.
 
+## Vendored skills
+
+The Matt Pocock skills are **vendored directly** into `.claude/skills/`
+([ADR-0005](docs/adr/0005-matt-skills-vendored-with-lockfile.md)), so a consumer
+clones and starts with **zero network dependency** — no plugin marketplace, no
+GitHub fetch at install time (the very thing the Webshare proxy exists to work
+around). The set is the engineering suite plus the relevant productivity skills:
+
+- **`engineering/`** — `ask-matt`, `code-review`, `codebase-design`,
+  `diagnosing-bugs`, `domain-modeling`, `grill-with-docs`, `implement`,
+  `improve-codebase-architecture`, `prototype`, `research`,
+  `resolving-merge-conflicts`, `setup-matt-pocock-skills`, `tdd`, `to-spec`,
+  `to-tickets`, `triage`, `wayfinder`.
+- **`productivity/`** — `grill-me`, `grilling`, `handoff`, `teach`.
+
+Deliberately **not** vendored: `deprecated/`, `personal/`, `in-progress/`,
+`misc/`, and the writing skills — outside the Factory boundary
+([ADR-0003](docs/adr/0003-factory-boundary.md)).
+
+`skills-lock.json` is the **manifest of record**: each skill's upstream source,
+repo-relative path, and a SHA-256 over its contents. Verify the vendored copy is
+intact, or regenerate it after an intentional update:
+
+```sh
+npm run skills:check   # verify .claude/skills/ matches the lock (exit 1 on drift)
+npm run skills:lock    # regenerate skills-lock.json from the current tree
+```
+
+The lock covers every directory containing a `SKILL.md` — which is the whole of
+`.claude/skills/`, so the manifest is a complete inventory of the vendored tree.
+A consumer who prefers auto-updating skills can ignore the vendored set and
+install the `mattpocock-skills` plugin instead — both are documented
+alternatives in ADR-0005.
+
 ## v0.1 scope
 
 **Served out of the box:** the **Split** profile + **human-merge** (`glab mr create
@@ -207,8 +244,9 @@ agent needs.
 ## Developing
 
 ```sh
-npm test          # config + plan + chain contract tests (45 cases)
+npm test          # config + plan + chain + skills-lock contract tests (59 cases)
 npm run typecheck # tsc --noEmit over .sandcastle/
+npm run skills:check  # verify .claude/skills/ against skills-lock.json
 ```
 
 Tests are pure (no network, no secrets, no `process.env`) and use `node:assert/strict`
