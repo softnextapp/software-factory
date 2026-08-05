@@ -111,3 +111,26 @@ export function parsePlan(stdout: string, allowedBases: AllowedBases): PlannedIs
       : { number: issue.number, title: issue.title, branch: issue.branch, base };
   });
 }
+
+/**
+ * Apply the `SANDCASTLE_ONLY` operator restriction to a planned set: keep only the
+ * issues whose number is in `only`, drop the rest. `only === null` (the env unset)
+ * is an unrestricted round — everything is kept.
+ *
+ * The planner is also told the allow-list (it cannot read process.env), but the
+ * planner is an agent, so main.ts calls this to *enforce* the restriction on
+ * whatever the planner actually returned. `SANDCASTLE_FORCE` (re-run issues that
+ * already have an open MR) is a planner concern only — it changes what the planner
+ * proposes, not what this filter accepts, so it has no place here.
+ */
+export function applyOnly(
+  issues: readonly PlannedIssue[],
+  only: number[] | null,
+): { kept: PlannedIssue[]; dropped: PlannedIssue[] } {
+  if (only === null) return { kept: [...issues], dropped: [] };
+  const allow = new Set(only);
+  const kept: PlannedIssue[] = [];
+  const dropped: PlannedIssue[] = [];
+  for (const issue of issues) (allow.has(issue.number) ? kept : dropped).push(issue);
+  return { kept, dropped };
+}

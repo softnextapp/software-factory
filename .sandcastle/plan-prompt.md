@@ -20,6 +20,20 @@ normal base. That MR's unmerged work is therefore **already present** in the tre
 implementer receives. When it is `off`, each issue is branched from its normal base
 and sees none of the open MRs.
 
+## Operator restriction this round
+
+- `SANDCASTLE_ONLY`: **{{ONLY}}** (a comma list of issue numbers, or `none`).
+- `SANDCASTLE_FORCE`: **{{FORCE}}** (`on` / `off`).
+
+When `SANDCASTLE_ONLY` is not `none`, the operator has restricted this round to those
+issue numbers. **Choose only from them** — intersect them with the open-issues queue
+above, and propose exactly the ones that are open and workable. Do **not** substitute
+other issues to fill the round; if none of them are open+workable, emit an empty plan.
+
+When `SANDCASTLE_FORCE` is `on`, the operator explicitly asked to re-run those issues
+even if they already have an open MR (listed above) or otherwise appear resolved.
+Re-doing them is intended — include them anyway, and a fresh branch will be cut.
+
 # Task
 
 You are the **planner**. You do **not** write code, run tests, or touch issues. You choose which open issues should be worked **in parallel** this round and assign each a branch. A separate implementer + reviewer then handle each branch independently.

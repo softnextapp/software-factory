@@ -6,7 +6,7 @@
 // signature-contract cases. Pure: no network, no process.env.
 // Run: npx tsx .sandcastle/plan.test.ts
 import assert from 'node:assert/strict';
-import { baseForLabels, parsePlan } from './plan.ts';
+import { baseForLabels, parsePlan, applyOnly } from './plan.ts';
 import { test, throws, finish } from './test-harness.ts';
 
 // A representative project: a trunk plus one label-routed epic base. allowedBases is
@@ -115,6 +115,57 @@ test('first matching label wins (host label order)', () => {
   const labelBases = { accessibilite: 'epic/a', refactor: 'epic/b' };
   assert.equal(baseForLabels(['accessibilite', 'refactor'], labelBases, 'main'), 'epic/a');
   assert.equal(baseForLabels(['refactor', 'accessibilite'], labelBases, 'main'), 'epic/b');
+});
+
+// --- applyOnly (SANDCASTLE_ONLY restriction) --------------------------------
+
+// Issues a planner might propose; numbers chosen so order is intentionally mixed.
+const PLANNED = [
+  { number: 7, title: 'Fix X', branch: 'sandcastle/issue-7-fix-x' },
+  { number: 42, title: 'Add Y', branch: 'sandcastle/issue-42-add-y' },
+  { number: 3, title: 'Polish Z', branch: 'sandcastle/issue-3-polish-z' },
+];
+
+test('only === null → everything kept, nothing dropped (unrestricted round)', () => {
+  const r = applyOnly(PLANNED, null);
+  assert.equal(r.kept.length, 3);
+  assert.equal(r.dropped.length, 0);
+  assert.deepEqual(
+    r.kept.map((i) => i.number),
+    [7, 42, 3],
+  );
+});
+
+test('only set → kept are exactly the allow-listed numbers, rest dropped, order preserved', () => {
+  const r = applyOnly(PLANNED, [42, 3]);
+  assert.deepEqual(
+    r.kept.map((i) => i.number),
+    [42, 3],
+  );
+  assert.deepEqual(
+    r.dropped.map((i) => i.number),
+    [7],
+  );
+});
+
+test('only set but no planner issue matches → kept empty, all dropped', () => {
+  const r = applyOnly(PLANNED, [999]);
+  assert.equal(r.kept.length, 0);
+  assert.equal(r.dropped.length, 3);
+});
+
+test('only numbers not in the plan are silently ignored (no phantom issues created)', () => {
+  const r = applyOnly(PLANNED, [7, 999]);
+  assert.deepEqual(
+    r.kept.map((i) => i.number),
+    [7],
+  );
+});
+
+test('only with a single entry restricts to that one issue', () => {
+  const r = applyOnly(PLANNED, [42]);
+  assert.equal(r.kept.length, 1);
+  assert.equal(r.kept[0]?.number, 42);
 });
 
 finish();

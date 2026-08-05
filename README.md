@@ -101,20 +101,8 @@ The Factory resolves a **`FactoryConfig`** from two layers:
 | `SANDCASTLE_MAX_PARALLEL` | `4` | Max issues worked concurrently in Phase 2. Positive integer. **Forced to `1` when `SANDCASTLE_CHAIN=1`** (a stack is built one MR at a time). |
 | `SANDCASTLE_CHAIN` | off | `1`/`true` (case-insensitive) → on; everything else → off. On, a round forks from the head of the open-MR stack and stacks its MR — see [Chained](#modes) below. |
 | `SANDCASTLE_DRYRUN` | off | `1`/`true` → on. Prints the resolved wiring (profile, per-role model/effort/env with tokens masked, base-branch checks, chain state) and exits. Launches nothing. |
-
-<details>
-<summary><code>SANDCASTLE_ONLY</code> / <code>SANDCASTLE_FORCE</code> — validated, not yet wired</summary>
-
-`config.ts` parses and validates two more knobs, but the `main.ts` loop does **not**
-yet consume them — they are reserved for a follow-up. They are listed here so a value
-you set is not a silent no-op you have to hunt down:
-
-| Variable | Default | Status |
-|---|---|---|
-| `SANDCASTLE_ONLY` | unset | Intended: a comma list of positive issue numbers to restrict the queue to. **Parsed + validated; not consumed by the loop yet.** |
-| `SANDCASTLE_FORCE` | off | Intended: force a re-run. **`=1` requires `SANDCASTLE_ONLY`; parsed + validated, not consumed by the loop yet.** |
-
-</details>
+| `SANDCASTLE_ONLY` | unset | A comma list of positive issue numbers to restrict the round to (e.g. `42` or `42,43`). The planner is told the allow-list, and `main.ts` **enforces** it on the result — issues outside the list are dropped even if the planner proposed them. If none match, the round stops. |
+| `SANDCASTLE_FORCE` | off | `1`/`true` → on. **Requires `SANDCASTLE_ONLY`** (config throws otherwise). Tells the planner to re-propose the `ONLY` issues even if they already have an open MR or appear resolved — a deliberate re-run. |
 
 ### Project identity (`ProjectConfig`, in `config.ts`)
 

@@ -45,7 +45,7 @@ import {
   type DiffStat,
   type IssueInfo,
 } from './mr-body.ts';
-import { baseForLabels, parsePlan, type PlannedIssue } from './plan.ts';
+import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.ts';
 import { loadConfig, type Provider, type Role } from './config.ts';
 
 type Sandbox = Awaited<ReturnType<typeof sandcastle.createSandbox>>;
@@ -542,6 +542,16 @@ if (cfg.run.dryRun) {
       chain: cfg.run.chain
         ? { enabled: true, ...chainDryRun() }
         : { enabled: false, hint: 'SANDCASTLE_CHAIN=1 to stack MRs instead of fanning out' },
+      only:
+        cfg.run.only === null
+          ? { enabled: false, hint: 'SANDCASTLE_ONLY=12,34 to restrict the round to those issues' }
+          : {
+              enabled: true,
+              issues: cfg.run.only,
+              force: cfg.run.force
+                ? 'on — planner re-proposes them even with an open MR'
+                : 'off',
+            },
       bases: Object.fromEntries(
         ALLOWED_BASES.map((base) => {
           try {
@@ -583,24 +593,68 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     // the base and not see the blocker's code. On, the stack puts the blocker's
     // branch underneath, so the same issue is workable. Same queue, opposite answer;
     // the planner cannot read process.env, so the mode is passed in.
-    promptArgs: { CHAIN_MODE: cfg.run.chain ? 'on' : 'off' },
+    //
+    // ONLY/FORCE are the same kind of run-knob the planner cannot see. ONLY tells it
+    // the round is restricted to specific issue numbers (it should propose from that
+    // set); FORCE tells it to re-propose them even if they already have an open MR.
+    // main.ts still enforces ONLY on the result (see applyOnly below) — the planner
+    // is an agent — so a value here is guidance, not trust.
+    promptArgs: {
+      CHAIN_MODE: cfg.run.chain ? 'on' : 'off',
+      ONLY: cfg.run.only === null ? 'none' : cfg.run.only.join(', '),
+      FORCE: cfg.run.force ? 'on' : 'off',
+    },
   });
 
-  const allPlanned = parsePlan(plan.stdout, ALLOWED_BASES);
-  if (allPlanned.length === 0) {
+  const parsed = parsePlan(plan.stdout, ALLOWED_BASES);
+  if (parsed.length === 0) {
     console.log('Planner returned no issues. Stopping.');
     break;
   }
 
-  // Enforced here rather than trusted to the prompt: the planner is an agent, and a
-  // second issue in a chained round would fork from a branch that does not exist yet.
-  // The dropped issues keep their `sandcastle` label and come back next round.
-  const planned = allPlanned.slice(0, cfg.effectiveMaxParallel);
-  if (planned.length < allPlanned.length) {
-    console.log(
-      `  ⛓ chain: planner proposed ${allPlanned.length} issues; keeping ` +
-        `#${planned[0]?.number} only — a stack is built one MR at a time.`,
-    );
+  // SANDCASTLE_ONLY restricts the round to specific issue numbers. Enforced in code
+  // (applyOnly), not trusted to the planner: it intersects the plan with the
+  // operator's allow-list and drops everything else. FORCE was passed to the planner
+  // above so it re-proposes the issues even if they already have an open MR; this
+  // filter then guarantees only the allow-list survives.
+  let candidates = parsed;
+  if (cfg.run.only !== null) {
+    const onlyList = cfg.run.only.join(',');
+    const { kept, dropped } = applyOnly(parsed, cfg.run.only);
+    if (dropped.length > 0) {
+      console.log(
+        `  ⊘ SANDCASTLE_ONLY=${onlyList}: dropped ${dropped.length} planner issue(s) ` +
+          `outside the allow-list (${dropped.map((i) => '#' + i.number).join(', ')}).`,
+      );
+    }
+    if (kept.length === 0) {
+      console.log(
+        `  ⊘ SANDCASTLE_ONLY=${onlyList}: none of the planned issues match the allow-list. ` +
+          `Stopping — if the issue is not in the open queue, the planner cannot pick it.`,
+      );
+      break;
+    }
+    candidates = kept;
+  }
+
+  // Cap the round to its configured parallelism. In chained mode that cap is 1 (a
+  // stack is built one MR at a time — a second issue would fork from a branch that
+  // does not exist yet); otherwise it is MAX_PARALLEL. The dropped issues keep their
+  // `sandcastle` label and come back next round.
+  const planned = candidates.slice(0, cfg.effectiveMaxParallel);
+  if (planned.length < candidates.length) {
+    if (cfg.run.chain) {
+      console.log(
+        `  ⛓ chain: ${candidates.length} issue(s) queued; keeping #${planned[0]?.number} ` +
+          `only — a stack is built one MR at a time.`,
+      );
+    } else {
+      console.log(
+        `  ⛷ max parallel: ${candidates.length} issue(s) queued, cap is ` +
+          `${cfg.effectiveMaxParallel}; running #${planned.map((i) => i.number).join(', ')} ` +
+          `this round, the rest next round.`,
+      );
+    }
   }
 
   // Resolve + validate every base before any sandbox is created, so an unpublished
