@@ -6,16 +6,18 @@
 //
 // This script does all three, plus the two things a real consumer also needs to
 // actually run `main.ts`: it wires the full Factory runtime (the Engine + the
-// `tsx`/`typescript`/`@types/node` dev tools), and it writes an ESM shim when the
-// consumer is CJS so `main.ts` even transpiles (the workaround from issue #8,
-// applied on demand here rather than shipped as a tracked file).
+// `tsx`/`typescript`/`@types/node` dev tools), and it ensures the self-contained ESM
+// shim is present so `main.ts` even transpiles. The shim — `.sandcastle/package.json =
+// { "type": "module" }` — ships as a tracked Factory file (issue #8's fix), so step 1's
+// `git archive` copy already lands it for every consumer regardless of their root
+// `package.json`; step 3 below only repairs it in place if it is somehow missing.
 //
 // Invoked from the Factory root, targeting a consumer directory:
 //   npx tsx .sandcastle/adopt.ts <consumer-path> [--force]
 // The Factory is config-only (ADR-0001) and clone-and-own (ADR-0002): adoption
 // copies the `.sandcastle/` config layer ONCE and leaves the consumer owning it.
 //
-// Pure helpers (detectPackageManager, pmAddArgs, needsEsmShim,
+// Pure helpers (detectPackageManager, pmAddArgs, consumerRootIsCjs,
 // buildExcludePatch, engineRuntimeDeps, computeMissing, toSpecs, parseArgs) are
 // exported for the contract test; main() does the fs/spawn side effects and runs
 // only when the file is invoked directly (see the guard at the bottom).
@@ -68,14 +70,16 @@ export function pmAddArgs(pm: PackageManager, specs: string[], dev: boolean): st
 }
 
 /**
- * Does the consumer need the `.sandcastle/package.json` ESM shim?
+ * Would a consumer whose root `package.json` is this be left CJS at `.sandcastle/`?
  *
  * `main.ts` uses top-level `await`; tsx/esbuild transpiles it as ESM only when the
- * nearest `package.json` has `"type": "module"`. Under adoption that nearest file is
- * the consumer's root package.json, so a CJS consumer (no `"type":"module"`, or none
- * at all) cannot even load `main.ts` without a local shim. Issue #8.
+ * nearest `package.json` has `"type": "module"`. The self-contained shim
+ * (`.sandcastle/package.json`) ships as a tracked file and step 1's copy lands it, so
+ * this is normally already satisfied. This predicate gates only the step-3 *repair*:
+ * if the shim is somehow missing AND the consumer's root is CJS (no `"type":"module"`,
+ * or none at all), the repair writes it. Issue #8.
  */
-export function needsEsmShim(consumerPkgJson: string | null): boolean {
+export function consumerRootIsCjs(consumerPkgJson: string | null): boolean {
   if (!consumerPkgJson) return true; // no package.json → tsx defaults to CJS → shim
   try {
     const pkg = JSON.parse(consumerPkgJson) as { type?: string };
@@ -284,17 +288,20 @@ function main(): void {
     info('② runtime already resolvable in the consumer — nothing to install.');
   }
 
-  // 3. ESM shim for CJS consumers (so main.ts transpiles — issue #8).
+  // 3. Ensure the self-contained ESM shim is present (so main.ts transpiles — issue #8).
+  //    The shim ships as a tracked `.sandcastle/package.json`, so step 1's copy above
+  //    already landed it; this only repairs it in place if a CJS consumer is somehow
+  //    missing it (e.g. a partial/stale copy from before this file shipped).
   const shim = join(consumerSandcastle, 'package.json');
-  if (needsEsmShim(consumerPkg)) {
+  if (consumerRootIsCjs(consumerPkg)) {
     if (!existsSync(shim)) {
-      info('③ write ESM shim .sandcastle/package.json (consumer is CJS; issue #8)');
+      info('③ repair ESM shim .sandcastle/package.json (tracked copy missing; consumer is CJS; issue #8)');
       writeFileSync(shim, JSON.stringify({ type: 'module' }, null, 2) + '\n');
     } else {
-      info('③ ESM shim already present — skip.');
+      info('③ ESM shim present (shipped with .sandcastle/) — skip.');
     }
   } else {
-    info('③ consumer is already ESM — no shim needed.');
+    info('③ consumer root is already ESM — shim still ships with .sandcastle/ as a belt-and-braces.');
   }
 
   // 4. Ignore `.sandcastle/` locally without touching the consumer's tracked .gitignore.

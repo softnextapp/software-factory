@@ -141,9 +141,10 @@ It does four things, none of which touch the consumer's tracked `.gitignore`:
    Engine out of the Factory clone and warns — make it permanent with a real `add`
    later. The saved range follows your package manager's default (npm adds a `^`);
    pin exact (`@0.12.0`) if you need to.
-3. **Write an ESM shim** when your repo is CJS (no `"type":"module"`) — `main.ts` uses
-   top-level `await`, so a CJS consumer needs `.sandcastle/package.json =
-   {"type":"module"}` for `tsx` to transpile it (issue #8). ESM repos are skipped.
+3. **Self-contained ESM** — `main.ts` uses top-level `await`, so `.sandcastle/` ships its
+   own `{"type":"module"}` package.json. It lands with the step-1 copy and makes
+   `main.ts` transpile regardless of your repo's root `package.json` (issue #8) — CJS or
+   ESM alike. Adopt repairs it in place only if a stale copy is somehow missing it.
 4. **Ignore `.sandcastle/` locally** — appends to `.git/info/exclude`, so the Factory
    config stays untracked without editing your committed `.gitignore`.
 
@@ -393,7 +394,7 @@ alternatives in ADR-0005.
 ## Developing
 
 ```sh
-npm test          # config + tokens + plan + chain + skills-lock + dockerfile-base + adopt contract tests (143 cases)
+npm test          # config + tokens + plan + chain + skills-lock + dockerfile-base + adopt + esm-shim contract tests (147 cases)
 npm run typecheck # tsc --noEmit over .sandcastle/
 npm run skills:check  # verify .claude/skills/ against skills-lock.json
 npm run image:check   # verify .sandcastle/Dockerfile.base against the universal-runtime contract

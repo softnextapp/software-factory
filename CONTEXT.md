@@ -19,7 +19,7 @@ A project's clone-and-own copy of the Factory (its `.sandcastle/` + `.claude/` c
 _Avoid_: deployment, installation.
 
 **Adoption**:
-The act of bringing the Factory into a repo that already has its own history and remote — the in-place counterpart to the greenfield clone. Performed by `.sandcastle/adopt.ts`, which copies the tracked `.sandcastle/` config layer, wires the Engine and dev tools into the consumer, writes an ESM shim when the consumer is CJS, and ignores `.sandcastle/` locally without editing the consumer's committed `.gitignore`. The result is a Factory instance that drifts from the reference exactly like a greenfield clone.
+The act of bringing the Factory into a repo that already has its own history and remote — the in-place counterpart to the greenfield clone. Performed by `.sandcastle/adopt.ts`, which copies the tracked `.sandcastle/` config layer, wires the Engine and dev tools into the consumer, ships a self-contained ESM shim (`.sandcastle/package.json` with `{"type":"module"}`) so `main.ts` transpiles regardless of the consumer's root `package.json`, and ignores `.sandcastle/` locally without editing the consumer's committed `.gitignore`. The result is a Factory instance that drifts from the reference exactly like a greenfield clone.
 _Avoid_: submodule (adoption is clone-and-own, not a linked submodule), vendor (the Engine stays an npm dependency).
 
 **Project context**:

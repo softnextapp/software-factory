@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import {
   detectPackageManager,
   pmAddArgs,
-  needsEsmShim,
+  consumerRootIsCjs,
   buildExcludePatch,
   engineRuntimeDeps,
   computeMissing,
@@ -69,23 +69,28 @@ test('multiple specs are passed through in order', () => {
 });
 
 // ---------------------------------------------------------------------------
-// needsEsmShim — when must the .sandcastle/package.json shim be written?
+// consumerRootIsCjs — is the consumer's ROOT package.json CJS?
+// After issue #8 the shim ships as a tracked .sandcastle/package.json (step 1's copy
+// lands it for every consumer), so this no longer decides whether the consumer *gets*
+// a shim — it gates only adopt's step-3 REPAIR of a shim that is somehow missing. A
+// CJS root is the only case a missing shim would actually break main.ts; an ESM root
+// doesn't need it, so the gate stays idle there.
 // ---------------------------------------------------------------------------
 
-test('CJS consumer (no type field) → shim needed', () => {
-  assert.equal(needsEsmShim('{"name":"app"}'), true);
+test('CJS consumer (no type field) → treated as CJS', () => {
+  assert.equal(consumerRootIsCjs('{"name":"app"}'), true);
 });
-test('explicit "type":"commonjs" → shim needed', () => {
-  assert.equal(needsEsmShim('{"type":"commonjs"}'), true);
+test('explicit "type":"commonjs" → CJS', () => {
+  assert.equal(consumerRootIsCjs('{"type":"commonjs"}'), true);
 });
-test('ESM consumer ("type":"module") → NO shim', () => {
-  assert.equal(needsEsmShim('{"name":"app","type":"module"}'), false);
+test('ESM consumer ("type":"module") → NOT CJS', () => {
+  assert.equal(consumerRootIsCjs('{"name":"app","type":"module"}'), false);
 });
-test('no package.json at all → shim needed (tsx defaults to CJS)', () => {
-  assert.equal(needsEsmShim(null), true);
+test('no package.json at all → treated as CJS (tsx defaults to CJS)', () => {
+  assert.equal(consumerRootIsCjs(null), true);
 });
-test('malformed package.json → shim needed (assume CJS; redundant shim is harmless)', () => {
-  assert.equal(needsEsmShim('{ not json'), true);
+test('malformed package.json → treated as CJS (a redundant repair is harmless)', () => {
+  assert.equal(consumerRootIsCjs('{ not json'), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -224,8 +229,8 @@ test('parseArgs: two positional paths → usage error', () => {
 
 test('end-to-end decision: a pnpm CJS consumer missing only the engine', () => {
   // Mirrors the captable-manager case: has tsx/typescript/@types/node already,
-  // CJS (no "type":"module"), pnpm. Only @ai-hero/sandcastle should be installed,
-  // and an ESM shim must be written.
+  // CJS (no "type":"module"), pnpm. Only @ai-hero/sandcastle should be installed;
+  // the CJS root also arms the shim-repair gate (the shim itself ships in step 1).
   const consumer = JSON.stringify({
     name: 'captable-manager',
     devDependencies: { tsx: '^4.19.0', typescript: '^5.6.0', '@types/node': '^22.0.0' },
@@ -236,12 +241,13 @@ test('end-to-end decision: a pnpm CJS consumer missing only the engine', () => {
   assert.equal(pm, 'pnpm');
   assert.deepEqual(toSpecs(missing.deps), ['@ai-hero/sandcastle@0.12.0']);
   assert.deepEqual(toSpecs(missing.devDeps), []); // all three dev tools already present
-  assert.equal(needsEsmShim(consumer), true); // CJS → shim
+  assert.equal(consumerRootIsCjs(consumer), true); // CJS root → repair gate fires
   assert.deepEqual(pmAddArgs(pm, toSpecs(missing.deps), false), ['add', '@ai-hero/sandcastle@0.12.0']);
 });
 
 test('end-to-end decision: an npm ESM greenfield-style consumer needs nothing installed', () => {
-  // Already has the full runtime and is ESM → no installs, no shim.
+  // Already has the full runtime and is ESM → no installs; ESM root, so the
+  // shim-repair gate is idle (the shim still ships, via step 1's tracked-file copy).
   const consumer = JSON.stringify({
     type: 'module',
     dependencies: { '@ai-hero/sandcastle': '0.12.0' },
@@ -250,7 +256,7 @@ test('end-to-end decision: an npm ESM greenfield-style consumer needs nothing in
   const missing = computeMissing(engineRuntimeDeps(FACTORY_PKG), consumer);
   assert.deepEqual(toSpecs(missing.deps), []);
   assert.deepEqual(toSpecs(missing.devDeps), []);
-  assert.equal(needsEsmShim(consumer), false);
+  assert.equal(consumerRootIsCjs(consumer), false);
 });
 
 finish();

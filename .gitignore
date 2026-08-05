@@ -2,7 +2,9 @@
 node_modules/
 
 # Runtime artifacts a consumer creates locally — never part of the Factory source.
-# (.sandcastle/*.ts, *.test.ts and tsconfig.json ARE tracked; only these subpaths are not.)
+# (.sandcastle/*.ts, *.test.ts, tsconfig.json and package.json ARE tracked; only these
+#  subpaths are not. The tracked .sandcastle/package.json is the self-contained ESM shim
+#  — { "type": "module" } — so main.ts transpiles regardless of the consumer's root pkg.)
 .sandcastle/.env
 .sandcastle/.env.secrets
 .sandcastle/logs/
