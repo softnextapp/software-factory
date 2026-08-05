@@ -4,7 +4,7 @@
 // parsers moved to host.ts — see host.test.ts). Pure: no network, no CLI, no
 // process.env. Run: npx tsx .sandcastle/chain.test.ts
 import assert from 'node:assert/strict';
-import { resolveChainedBase, type OpenMergeRequest } from './chain.ts';
+import { resolveChainedBase, decideBaseSync, type OpenMergeRequest } from './chain.ts';
 import { test, finish } from './test-harness.ts';
 
 const ROOT = 'epic/rgaa-accessibilite';
@@ -86,6 +86,22 @@ test('a hand-made cycle terminates (does not hang the round)', () => {
   const loop = mr('branch-a', 'branch-b', '2026-07-29T10:00:00Z');
   const r = resolveChainedBase([a, b, loop], ROOT);
   assert.equal(r.base, 'branch-b');
+});
+
+// --- decideBaseSync (base-branch reconciliation, issue #14) -----------------
+// Pure 3-way decision: given the two ancestry facts about local vs origin, what
+// should main.ts's syncBaseToOrigin do? Called only when local ≠ origin.
+
+test('decideBaseSync: origin ahead → fast-forward', () => {
+  assert.equal(decideBaseSync({ originAheadOfLocal: true, localAheadOfOrigin: false }), 'fast-forward');
+});
+
+test('decideBaseSync: local ahead → keep local (legitimate curation, never rewind)', () => {
+  assert.equal(decideBaseSync({ originAheadOfLocal: false, localAheadOfOrigin: true }), 'ahead');
+});
+
+test('decideBaseSync: neither → diverged (ff-only refuses; warn and skip)', () => {
+  assert.equal(decideBaseSync({ originAheadOfLocal: false, localAheadOfOrigin: false }), 'diverged');
 });
 
 finish();

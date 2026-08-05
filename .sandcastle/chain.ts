@@ -140,3 +140,34 @@ function orderedPath(
   }
   return path;
 }
+
+// ---------------------------------------------------------------------------
+// Base-branch reconciliation (issue #14)
+//
+// Before forking agent branches, main.ts fast-forwards each base to origin so a
+// round never builds on stale code. This is the PURE 3-way decision main.ts's
+// syncBaseToOrigin composes with `git merge-base --is-ancestor`; the side-effecting
+// fetch/merge itself stays in main.ts (chain.ts stays pure + host-agnostic).
+// ---------------------------------------------------------------------------
+
+export type BaseSyncDecision = 'fast-forward' | 'ahead' | 'diverged';
+
+/**
+ * How to reconcile a local base with its origin counterpart, given the two ancestry
+ * facts. Called only when local ≠ origin (the equal case is in-sync and handled by
+ * the caller).
+ *
+ *  - `originAheadOfLocal` (local is an ancestor of origin) → the remote is strictly
+ *    ahead → a fast-forward brings local up to date.
+ *  - `localAheadOfOrigin` (origin is an ancestor of local) → the local base is being
+ *    curated ahead of origin → legitimate; leave it (never rewind a base).
+ *  - neither → true divergence → fast-forward is impossible; warn and skip.
+ */
+export function decideBaseSync(rel: {
+  originAheadOfLocal: boolean;
+  localAheadOfOrigin: boolean;
+}): BaseSyncDecision {
+  if (rel.originAheadOfLocal) return 'fast-forward';
+  if (rel.localAheadOfOrigin) return 'ahead';
+  return 'diverged';
+}

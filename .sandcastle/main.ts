@@ -37,7 +37,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import * as sandcastle from '@ai-hero/sandcastle';
 import { docker } from '@ai-hero/sandcastle/sandboxes/docker';
-import { resolveChainedBase } from './chain.ts';
+import { resolveChainedBase, decideBaseSync } from './chain.ts';
 import {
   createHost,
   HOST_TERMS,
@@ -435,29 +435,31 @@ const assertBaseUsable = (base: string): void => {
         `  git push -u origin ${base}`,
     );
   }
-  // Existing-but-stale is the quiet failure: agents fork off the local ref, so a
-  // local base behind origin means every branch this round is built on old code and
-  // the MRs read as conflicts nobody caused. A warning rather than a throw — being
-  // ahead of origin is legitimate (a base you are curating locally), and only the
-  // operator can tell the two apart.
-  try {
-    const local = execFileSync('git', ['rev-parse', `refs/heads/${base}`], {
-      encoding: 'utf8',
-    }).trim();
-    const remote = execFileSync('git', ['ls-remote', 'origin', `refs/heads/${base}`], {
-      encoding: 'utf8',
-    })
-      .trim()
-      .split(/\s+/)[0];
-    if (remote !== undefined && remote !== local) {
-      console.warn(
-        `  ⚠ base \`${base}\`: local ${local.slice(0, 8)} ≠ origin ${remote.slice(0, 8)}. ` +
-          `Agents fork from the LOCAL ref — if it is behind, this round is built on old code.\n` +
-          `    git fetch origin && git switch ${base} && git pull`,
-      );
+  // In the DRY RUN this staleness compare is advisory and read-only (it prints the
+  // warning below). In a LIVE run, syncBaseToOrigin reconciles the base instead, so
+  // the compare is skipped here to avoid a misleading "forking from stale local"
+  // message right before the sync fast-forwards it (issue #14). Being ahead of origin
+  // is legitimate (a base you are curating locally) and never rewound either way.
+  if (cfg.run.dryRun) {
+    try {
+      const local = execFileSync('git', ['rev-parse', `refs/heads/${base}`], {
+        encoding: 'utf8',
+      }).trim();
+      const remote = execFileSync('git', ['ls-remote', 'origin', `refs/heads/${base}`], {
+        encoding: 'utf8',
+      })
+        .trim()
+        .split(/\s+/)[0];
+      if (remote !== undefined && remote !== local) {
+        console.warn(
+          `  ⚠ base \`${base}\`: local ${local.slice(0, 8)} ≠ origin ${remote.slice(0, 8)}. ` +
+            `Agents fork from the LOCAL ref — if it is behind, this round is built on old code.\n` +
+            `    git fetch origin && git switch ${base} && git pull`,
+        );
+      }
+    } catch {
+      // Comparison is advisory; the two hard checks above already passed.
     }
-  } catch {
-    // Comparison is advisory; the two hard checks above already passed.
   }
   verifiedBases.add(base);
 };
@@ -477,6 +479,75 @@ const ensureLocalRef = (branch: string): void => {
   // Explicit refspec, not a bare `git fetch`: this must create the LOCAL branch,
   // which is what `git worktree` forks from. Fails loudly if origin lost it too.
   execFileSync('git', ['fetch', 'origin', `${branch}:${branch}`], { stdio: 'inherit' });
+};
+
+// Reconcile a base branch with origin before agents fork from it (issue #14): a
+// round that forks from a stale local base builds on old code. Fast-forward only — a
+// base curated locally ahead of origin is legitimate and never rewound, and true
+// divergence is left for the operator. LIVE path only (the dry run keeps the
+// read-only staleness warning in assertBaseUsable and exits before the loop).
+// Idempotent per base per run: a chained round touches the same trunk repeatedly.
+const syncedBases = new Set<string>();
+const syncBaseToOrigin = (base: string): void => {
+  // Localized non-mutation guarantee (issue #14): the dry run also exits before the
+  // loop, but this keeps the "never fetch/ff in a dry run" contract from depending on
+  // that exit staying where it is today.
+  if (cfg.run.dryRun) return;
+  if (syncedBases.has(base)) return;
+  syncedBases.add(base);
+  try {
+    execFileSync('git', ['fetch', 'origin', base], { stdio: 'ignore' });
+  } catch {
+    console.warn(
+      `  ⚠ base \`${base}\`: could not fetch origin to sync — forking from the local ref (it may be stale).`,
+    );
+    return;
+  }
+  let local: string;
+  let remote: string;
+  try {
+    local = execFileSync('git', ['rev-parse', `refs/heads/${base}`], { encoding: 'utf8' }).trim();
+    remote = execFileSync('git', ['rev-parse', `refs/remotes/origin/${base}`], { encoding: 'utf8' }).trim();
+  } catch {
+    return; // assertBaseUsable already guaranteed both refs exist.
+  }
+  if (local === remote) return; // already at origin's tip
+  const isAncestor = (a: string, b: string): boolean => {
+    try {
+      execFileSync('git', ['merge-base', '--is-ancestor', a, b], { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const decision = decideBaseSync({
+    originAheadOfLocal: isAncestor(local, remote),
+    localAheadOfOrigin: isAncestor(remote, local),
+  });
+  if (decision === 'fast-forward') {
+    try {
+      const current = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).trim();
+      if (current === base) {
+        // Checked out: merge --ff-only moves HEAD and the working tree together.
+        execFileSync('git', ['merge', '--ff-only', `origin/${base}`], { stdio: 'inherit' });
+      } else {
+        // Not checked out: fast-forward the local ref (refuses if it is checked out
+        // in any worktree, so this never clobbers a colleague's checkout).
+        execFileSync('git', ['fetch', 'origin', `${base}:${base}`], { stdio: 'inherit' });
+      }
+      console.log(`  ↻ base \`${base}\` fast-forwarded to origin (${local.slice(0, 8)} → ${remote.slice(0, 8)}).`);
+    } catch {
+      console.warn(`  ⚠ base \`${base}\` could not be fast-forwarded — forking from the local ref.`);
+    }
+  } else if (decision === 'ahead') {
+    console.warn(
+      `  ⚠ base \`${base}\` is ahead of origin — keeping the local ref (local curation is legitimate; not pushed back).`,
+    );
+  } else {
+    console.warn(
+      `  ⚠ base \`${base}\` diverged from origin — not syncing (fast-forward only). Reconcile by hand if intended.`,
+    );
+  }
 };
 
 // Resolve the base a ticket should actually be built on. Without SANDCASTLE_CHAIN
@@ -755,6 +826,10 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     }
     const base = resolveBase(labelBase);
     assertBaseUsable(base);
+    // Fast-forward the base to origin so agent branches fork from the latest
+    // published tip, not a stale local ref (issue #14). Live only — the dry run
+    // exits before Phase 2.
+    syncBaseToOrigin(base);
     // Pre-render the host's unlabel command for each queue label the issue actually
     // carries, so the implementer runs them verbatim instead of re-splitting a label
     // list (issue #15: a captable issue carries `ready-for-agent`, not `sandcastle`).

@@ -267,7 +267,7 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 | `mergeStrategy` | `'agent' \| 'human'` | `'human'` | Who merges. `human` = Draft MRs await review (v0.1). `agent` = a Merger auto-merges (fenced). |
 | `commitStyle` | `'ralph' \| 'conventional'` | `'ralph'` | MR title style. `conventional` keeps titles valid Conventional Commit headers. |
 | `gitHost` | `'gh' \| 'glab'` | `'glab'` | Host integration (`gh` = GitHub, `glab` = GitLab). Both are wired in v0.1 — see `host.ts`. |
-| `baseBranch` | `string` | `'main'` | The project trunk. |
+| `baseBranch` | `string` | `'main'` | The project trunk. A live run fast-forwards each base to `origin` before agents fork, so a round never builds on stale code; a base curated locally ahead of origin is kept as-is (#14). |
 | `labelBases` | `Record<string,string>` | `{}` | Issue label → base branch. Empty ⇒ every issue forks from `baseBranch`. |
 | `queueLabels` | `string[]` | `['sandcastle', 'ready-for-agent']` | Queue trigger labels — an open issue carrying ANY of these is candidate work. Default accepts both so the Factory (`sandcastle`) and captable (`ready-for-agent`) queue with no relabelling; narrow per consumer (#15). |
 | `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Empty ⇒ chaining is inert even with `SANDCASTLE_CHAIN=1`. |
