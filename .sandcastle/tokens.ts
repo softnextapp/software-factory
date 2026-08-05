@@ -14,9 +14,13 @@
 
 /**
  * Where a resolved token came from. `'MISSING'` means neither the environment nor
- * `.env.secrets` provided a non-empty value.
+ * the file store provided a non-empty value. `'.env'` is the host-CLI token's file
+ * store: unlike the LLM tokens (which resolve against gitignored `.env.secrets` and
+ * are baked one-per-sandbox), the host token lives in `.env` so the Engine's
+ * `resolveEnv` flows it to every sandbox — so its file fallback is `.env`, not
+ * `.env.secrets`. See main.ts / GitHub issue #17.
  */
-export type TokenSource = 'env' | '.env.secrets' | 'MISSING';
+export type TokenSource = 'env' | '.env.secrets' | '.env' | 'MISSING';
 
 /** A single token, resolved env-first. */
 export interface ResolvedToken {
@@ -67,11 +71,19 @@ function isSet(v: string | undefined): v is string {
 /**
  * Resolve a single token env-first: `env[key]` wins, then `fileSecrets[key]`,
  * else MISSING. Pure — inject both stores to test precedence.
+ *
+ * `fileSource` labels which file the fallback record came from in the returned
+ * `source` (`.env.secrets` for LLM provider tokens, `.env` for the host-CLI token —
+ * see TokenSource). It does NOT change precedence, only the diagnostic label, so a
+ * host token resolved from `.env` reports `source: '.env'` rather than mislabelling
+ * itself `.env.secrets`. Defaults to `.env.secrets` so every existing caller is
+ * unchanged.
  */
 export function resolveToken(
   key: string,
   env: Record<string, string | undefined>,
   fileSecrets: Record<string, string>,
+  fileSource: '.env.secrets' | '.env' = '.env.secrets',
 ): ResolvedToken {
   const envValue = env[key];
   const fileValue = fileSecrets[key];
@@ -85,7 +97,7 @@ export function resolveToken(
     };
   }
   if (isSet(fileValue)) {
-    return { key, value: fileValue, source: '.env.secrets', conflict: false };
+    return { key, value: fileValue, source: fileSource, conflict: false };
   }
   return { key, value: '', source: 'MISSING', conflict: false };
 }

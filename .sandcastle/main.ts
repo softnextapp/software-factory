@@ -46,6 +46,8 @@ import {
   inferGitHostFromUrl,
   manualCreateHint,
   claimLabels,
+  hostTokenKey,
+  hostTokenMissingMessage,
   type Host,
 } from './host.ts';
 import {
@@ -101,22 +103,25 @@ type RunResult = Awaited<ReturnType<Sandbox['run']>>;
 
 const cfg = loadConfig();
 
+// v0.1 wires BOTH tracker hosts (GitLab/glab and GitHub/gh). `local` (no tracker) is
+// recognised by the token layer — hostTokenKey('local') === null, so a local consumer
+// is never asked for a host token (issue #17) — but the full no-tracker loop (Phase 1-3
+// without a host CLI) is not wired yet, the same fence the mergeStrategy guard below
+// uses. Fail here, BEFORE createHost, rather than letting createHost silently fall
+// through to the glab shape for an unwired host.
+if (cfg.project.gitHost !== 'glab' && cfg.project.gitHost !== 'gh') {
+  throw new Error(
+    `gitHost=${cfg.project.gitHost} is not wired. v0.1 ships the GitLab (glab) and ` +
+      `GitHub (gh) tracker hosts only. \`local\` is token-exempt (no host token needed) ` +
+      `but its no-tracker loop is a follow-up; set gitHost: 'gh' or 'glab' to run today.`,
+  );
+}
+
 // The host module owns every glab-vs-gh difference (issue view/labels, draft MR/PR
 // creation, open-MR/PR listing, and the prompt-time command strings). main.ts never
 // spells `glab` or `gh` itself; it goes through `host` below. See host.ts.
 const host: Host = createHost(cfg.project.gitHost);
 const hostTerms = HOST_TERMS[cfg.project.gitHost];
-
-// v0.1 wires BOTH host shapes (GitLab/glab and GitHub/gh). config.ts constrains
-// gitHost to that union, so a future host added there would silently fall through
-// createHost's glab default — fail loudly here instead of no-op'ing on the host
-// code paths below, the same fence the mergeStrategy guard uses.
-if (cfg.project.gitHost !== 'glab' && cfg.project.gitHost !== 'gh') {
-  throw new Error(
-    `gitHost=${cfg.project.gitHost} is not wired. v0.1 ships the GitLab (glab) and ` +
-      `GitHub (gh) hosts only. Add the host to host.ts and this guard.`,
-  );
-}
 
 // v0.1 runs the human-merge shape only. MERGE_STRATEGY=agent (ccsnoop's auto-merging
 // 4th agent) is a follow-up module; failing here, loudly and early, keeps
@@ -216,18 +221,26 @@ const requiredTokenKeys: readonly string[] = [
   ...new Set(requiredProviders.map((name) => cfg.project.providers[name].tokenKey)),
 ];
 
-// .env token-key guard (startup fence, like gitHost / mergeStrategy above). A token
-// key in .env leaks into every sandbox under env-first → 401; fail loudly before any
-// agent runs. No .env file → nothing to guard. See tokens.ts.
-{
-  let dotEnvRaw: string | undefined;
-  try {
-    dotEnvRaw = readFileSync(DOTENV_PATH, 'utf8');
-  } catch {
-    // No .env — the common case on a fresh checkout.
-  }
-  if (dotEnvRaw !== undefined) assertNoTokenKeyInDotEnv(dotEnvRaw, requiredTokenKeys);
+// .sandcastle/.env — read ONCE and shared by the token-key guard below and the
+// host-token resolution further down. resolveEnv merges this file into every sandbox,
+// so it is the ONE place a secret is allowed BY DESIGN: the host-CLI token
+// (GH_TOKEN/GITLAB_TOKEN), which must flow to every sandbox so the in-sandbox `gh`/
+// `glab` is authed (issue #17). Provider LLM tokens stay out of it — the guard right
+// below enforces that. Missing file → empty record (the common fresh-checkout case).
+let dotEnvRaw: string | undefined;
+try {
+  dotEnvRaw = readFileSync(DOTENV_PATH, 'utf8');
+} catch {
+  // No .env — the common case on a fresh checkout.
 }
+const dotEnv: Record<string, string> = dotEnvRaw !== undefined ? parseEnvFile(dotEnvRaw) : {};
+
+// .env token-key guard (startup fence, like gitHost / mergeStrategy above). A PROVIDER
+// token key in .env leaks into every sandbox under env-first → 401; fail loudly before
+// any agent runs. The host token (GH_TOKEN/GITLAB_TOKEN) is the deliberate, documented
+// exception: it is NOT a provider tokenKey, so this guard lets it through on purpose —
+// it MUST be in .env (or the env) so resolveEnv flows it. See tokens.ts / issue #17.
+if (dotEnvRaw !== undefined) assertNoTokenKeyInDotEnv(dotEnvRaw, requiredTokenKeys);
 
 // Warn when a token is set in BOTH the environment and .env.secrets with different
 // values — env still wins; this just surfaces "why is it using the wrong token".
@@ -267,6 +280,56 @@ const validateTokens = (): void => {
       `Profile \`${cfg.run.profile}\` requires ${missing.map((m) => m.key).join(', ')} — ` +
         `not set in the environment or in ${SECRETS_PATH}.`,
     );
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Host-CLI token (issue #17)
+//
+// The planner/implementer prompts run `gh`/`glab` INSIDE the sandbox; that sandbox
+// must have the host CLI authed. The Engine's resolveEnv already flows .env (and, per
+// key, the environment) into every sandbox, so the token is NOT injected via envFor —
+// main.ts only VALIDATES it is present at startup, then reports it. A consumer who
+// drops the conventionally-named token into .env (or exports it) therefore runs the
+// planner with no main.ts patch (the captable hack that patched envFor is obsolete).
+//
+// Resolves env-first against .env — NOT .env.secrets: resolveEnv does not read
+// .env.secrets, so a host token filed there would never reach the sandbox. `local`
+// (no tracker) needs no host token: hostTokenKey('local') === null skips entirely.
+// ---------------------------------------------------------------------------
+const hostKey = hostTokenKey(cfg.project.gitHost);
+const hostToken: ResolvedToken | null =
+  hostKey === null ? null : resolveToken(hostKey, process.env, dotEnv, '.env');
+
+// Source-only report (value masked via tokenStatus), labelled so it reads as the host
+// credential alongside the provider tokens above. Skipped for `local`.
+const reportHostToken = (): void => {
+  if (hostToken === null) return;
+  const status = tokenStatus(hostToken);
+  console.log(`  • ${hostToken.key}: ${status.source} (${status.value}) — in-sandbox ${hostTerms.cli} auth`);
+};
+
+// A host token placed in .env.secrets (the LLM-token file) looks set to the operator
+// but does NOT flow to the sandbox — resolveEnv reads .env, not .env.secrets — so the
+// in-sandbox CLI would still be unauthed and exit 4. Warn and point at .env. Uses
+// hostToken.key (not the outer hostKey) so the guard needs no separate null-narrowing.
+const warnHostTokenInSecrets = (): void => {
+  if (hostToken === null || hostToken.source !== 'MISSING') return;
+  const inSecrets = secrets[hostToken.key];
+  if (inSecrets !== undefined && inSecrets !== '') {
+    console.warn(
+      `  ⚠ ${hostToken.key} is set in ${SECRETS_PATH}, but resolveEnv does not read that file — ` +
+        `move it to ${DOTENV_PATH} (or export it in your shell) so it flows into every sandbox.`,
+    );
+  }
+};
+
+// Startup guard (mirrors validateTokens): fail before the first sandbox, naming the var
+// AND the file resolveEnv flows. No-op for `local` (no host CLI → no token required).
+const validateHostToken = (): void => {
+  if (hostToken === null) return;
+  if (hostToken.source === 'MISSING') {
+    throw new Error(hostTokenMissingMessage(hostToken.key, cfg.project.gitHost, DOTENV_PATH));
   }
 };
 
@@ -705,6 +768,7 @@ if (cfg.run.dryRun) {
   // (same warnConflicts() the startup report uses).
   const resolvedTokens = resolveKeys(requiredTokenKeys);
   warnConflicts(resolvedTokens);
+  warnHostTokenInSecrets();
   console.log('[dryrun] Factory config:');
   // console.dir with depth null: console.log collapses past depth 2 and would print
   // the per-role env as [Object], defeating the point.
@@ -734,6 +798,14 @@ if (cfg.run.dryRun) {
       mergeStrategy: cfg.project.mergeStrategy,
       commitStyle: cfg.project.commitStyle,
       gitHost: cfg.project.gitHost,
+      // The in-sandbox host-CLI credential (issue #17). `local` → not required; gh/glab
+      // → the conventionally-named token resolveEnv flows from .env (or the env). A
+      // MISSING token is REPORTED here, not thrown — the dry run exits 0 like it does
+      // for missing provider tokens; the live path validates it.
+      hostCliToken:
+        hostToken === null
+          ? { required: false, reason: 'local (no tracker) — no host token needed' }
+          : { required: true, key: hostToken.key, ...tokenStatus(hostToken) },
       hostMismatch: warnHostMismatch(),
       chain: cfg.run.chain
         ? { enabled: true, ...chainDryRun() }
@@ -766,6 +838,10 @@ if (cfg.run.dryRun) {
 }
 
 validateTokens();
+// Host-CLI token: report then validate, mirroring the provider-token flow above.
+reportHostToken();
+warnHostTokenInSecrets();
+validateHostToken();
 
 // Missing sandbox image → abort NOW with the actionable build prompt from
 // image.ts, caught here (not at top level) so the operator sees guidance, not a

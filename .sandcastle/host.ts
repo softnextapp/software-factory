@@ -33,7 +33,65 @@ import type { IssueInfo } from './mr-body.ts';
 export const HOST_TERMS: Readonly<Record<GitHost, { cr: string; cli: string; name: string; ref: string }>> = {
   glab: { cr: 'merge request', cli: 'glab', name: 'GitLab', ref: '!' },
   gh: { cr: 'pull request', cli: 'gh', name: 'GitHub', ref: '#' },
+  // `local` has no collaboration CLI: the terms are placeholders so the Record<GitHost,…>
+  // type stays total. The no-tracker loop is fenced in main.ts (v0.1 ships the two tracker
+  // hosts), so these never reach a host command — they exist only to satisfy the type and
+  // to read sensibly if ever printed in a config/dry-run report.
+  local: { cr: 'change', cli: '', name: 'local (no tracker)', ref: '' },
 };
+
+// ---------------------------------------------------------------------------
+// Host-CLI auth token (issue #17)
+//
+// The role prompts run `gh`/`glab` INSIDE the agent sandbox (planner reads the
+// queue + issue, implementer unlabels + comments at queue-exit). Those sandboxes
+// carry the binary but, before this, no credentials — so every in-sandbox host
+// command exited 4 (`please run: gh auth login`) and Phase 1 died before emitting
+// a plan. The fix is NOT another envFor() relay: the Engine's resolveEnv already
+// merges .sandcastle/.env into every sandbox, so a conventionally-named token
+// placed there (or exported in the shell, which resolveEnv also picks up per key)
+// auths the in-sandbox CLI with zero main.ts patching. main.ts only VALIDATES it is
+// present at startup — these helpers say which key, per host, and build the
+// actionable missing-token message.
+// ---------------------------------------------------------------------------
+
+/**
+ * The env var the host CLI reads for auth, by `gitHost`:
+ *   gh → GH_TOKEN, glab → GITLAB_TOKEN, local → null (no host CLI, no token).
+ * `null` is how main.ts' startup guard knows a host needs NO token — a local /
+ * no-tracker consumer is never asked for one (issue #17, acceptance #2).
+ */
+export function hostTokenKey(host: GitHost): string | null {
+  if (host === 'gh') return 'GH_TOKEN';
+  if (host === 'glab') return 'GITLAB_TOKEN';
+  return null; // 'local'
+}
+
+/**
+ * The actionable message thrown at startup when a required host token is missing
+ * (neither the environment nor `.sandcastle/.env` sets it). Names the var AND the
+ * file resolveEnv flows, plus the host's own `auth login` / `auth token` commands,
+ * so an operator copy-pastes their way out. Never called for `local`
+ * (hostTokenKey('local') === null ⇒ no requirement) — defensive generic fallback
+ * if it ever is.
+ */
+export function hostTokenMissingMessage(key: string, host: GitHost, dotenvPath: string): string {
+  // Only gh/glab are ever validated (hostTokenKey('local') === null ⇒ no requirement ⇒ this
+  // is never called for `local`); the generic fallback below is defensive. The two tracker
+  // hosts share one message shape — they differ only in the CLI name, which IS the host.
+  if (host !== 'gh' && host !== 'glab') {
+    return `${key} is not set in the environment or in ${dotenvPath}.`;
+  }
+  const cli = host; // 'gh' | 'glab'
+  return (
+    `${key} is not set. The planner/implementer run \`${cli}\` inside the sandbox, which needs ` +
+    `auth there. Put the token in ${dotenvPath} — the Engine's resolveEnv flows that file ` +
+    `into every sandbox, so no main.ts patch is needed:\n` +
+    `  echo "${key}=$(${cli} auth token)" >> ${dotenvPath}   # after \`${cli} auth login\`\n` +
+    `…or export it once in your shell (~/.bashrc); resolveEnv picks up env vars too. ` +
+    `A \`local\` gitHost (no tracker) needs no host token.`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Prompt-time command strings
@@ -513,6 +571,13 @@ export function createHost(host: GitHost): Host {
           ),
         ),
     };
+  }
+
+  // 'local' (and any future host) has no collaboration CLI wired — refuse instead of
+  // silently falling through to the glab shape below. main.ts fences this earlier with
+  // a clearer, operator-facing message; this throw is the belt for any direct caller.
+  if (host !== 'glab') {
+    throw new Error(`createHost: gitHost=${host} has no host-CLI wiring (v0.1 ships gh/glab only).`);
   }
 
   return {

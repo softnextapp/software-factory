@@ -55,7 +55,14 @@ export type Profiles = Readonly<Record<ProfileName, ProfileBinding>>;
 
 export type MergeStrategy = 'agent' | 'human';
 export type CommitStyle = 'ralph' | 'conventional';
-export type GitHost = 'gh' | 'glab';
+/**
+ * The collaboration host. `gh`/`glab` ship wired (host.ts); `local` is the no-tracker
+ * case — a repo with no issue/MR host. The token layer is host-aware
+ * (host.ts `hostTokenKey`): `gh`/`glab` require a host-CLI token, `local` requires none.
+ * The full no-tracker loop (Phase 1-3 without a host CLI) is itself fenced in main.ts —
+ * v0.1 ships the two tracker hosts only — but the *token* requirement is settled here.
+ */
+export type GitHost = 'gh' | 'glab' | 'local';
 
 /**
  * Static project identity. The part of the Factory a consumer edits to describe

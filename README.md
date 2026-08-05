@@ -30,7 +30,8 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.claude/skills/` | The vendored Matt Pocock skills — see [Vendored skills](#vendored-skills). |
 | `skills-lock.json` | Manifest of record for the vendored skills (source + path + content hash each). |
 | `templates/` | Project-context skeletons a consumer fills in after cloning — see [Project context](#consuming-the-factory-clone-and-own). |
-| `.sandcastle/.env.secrets.example` | Template for the auth-token file `main.ts` reads (copy to `.env.secrets`). |
+| `.sandcastle/.env.secrets.example` | Template for the provider-token file `main.ts` reads (copy to `.env.secrets`). |
+| `.sandcastle/.env.example` | Template for the `.env` file `resolveEnv` merges into every sandbox — holds the host-CLI token (`GH_TOKEN`/`GITLAB_TOKEN`). |
 | `docs/adr/` | Architecture decision records. |
 
 ## The Orchestration
@@ -105,6 +106,12 @@ glab auth login   # or: gh auth login
 #    Plug-and-play: export the two tokens in your shell profile (~/.bashrc) and skip the file.
 cp .sandcastle/.env.secrets.example .sandcastle/.env.secrets   # optional fallback
 $EDITOR .sandcastle/.env.secrets
+
+# 5b. Provide the host-CLI token so the in-sandbox `gh`/`glab` the planner/implementer
+#     run is authed. resolveEnv merges .env into every sandbox — no main.ts patch needed.
+#     Set the var matching your gitHost: GH_TOKEN (gh) / GITLAB_TOKEN (glab). Skip for `local`.
+cp .sandcastle/.env.example .sandcastle/.env                    # optional fallback
+echo "GITLAB_TOKEN=$(glab auth token)" >> .sandcastle/.env      # or GH_TOKEN=$(gh auth token)
 
 # 6. (Optional, recommended) Configure your project identity — see below.
 $EDITOR .sandcastle/config.ts
@@ -357,6 +364,31 @@ wins), and **throws at startup if `.sandcastle/.env` declares any active provide
 `tokenKey`** — the exact leak the `.env` / `.env.secrets` split exists to stop. Only
 the tokens the **active profile's** providers need are required; `.env` keeps only what
 *every* agent needs.
+
+### Host-CLI token (the one secret that lives in `.env`)
+
+The planner/implementer prompts run `gh` / `glab` **inside** the sandbox, and that
+sandbox must have the CLI authed — otherwise the planner's `gh pr list` exits 4 and
+Phase 1 dies before emitting a plan. The provider-token rule above does **not** apply
+to the host-CLI credential: there is exactly one per host, it is the same for every
+sandbox, and claude-code never reads it, so there is no cross-provider 401. So the
+conventionally-named token goes **in `.env`**, where `resolveEnv` flows it to every
+sandbox with **no `main.ts` patch** (the `.env` / `.env.secrets` split is what makes
+that safe):
+
+```sh
+# .sandcastle/.env  (gitignored — resolveEnv merges this into every sandbox)
+GH_TOKEN=...        # gitHost: 'gh'
+GITLAB_TOKEN=...    # gitHost: 'glab' (default)
+# gitHost: 'local' → none (no host CLI, no token required)
+```
+
+`main.ts` resolves the host token **env-first against `.env`** (not `.env.secrets` —
+`resolveEnv` does not read that file), prints its source at startup and in
+`SANDCASTLE_DRYRUN`, and **throws at startup naming the var and the file** if it is
+missing — before the first sandbox, not inside it. Obtain the value with the host CLI
+(`gh auth token` / `glab auth token` after `auth login`), or export it once in your
+shell and skip the file. See [`.env.example`](.sandcastle/.env.example).
 
 ## Vendored skills
 

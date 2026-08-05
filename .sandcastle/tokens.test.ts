@@ -80,6 +80,38 @@ test('an unrelated env var does not satisfy a missing token', () => {
   assert.equal(resolveToken('K', { OTHER: 'x' }, {}).source, 'MISSING');
 });
 
+// --- fileSource label (issue #17): the host token resolves against .env, not .env.secrets ---
+
+test('resolveToken labels the file source via fileSource (default .env.secrets, unchanged)', () => {
+  // Default behaviour is byte-identical for every existing caller.
+  const t = resolveToken('GH_TOKEN', {}, { GH_TOKEN: 'tok' });
+  assert.equal(t.source, '.env.secrets');
+  assert.equal(t.value, 'tok');
+});
+
+test('resolveToken with fileSource=".env" reports source .env for a file-only value', () => {
+  // The host-CLI token lives in .env (resolveEnv flows it); its file fallback is .env,
+  // so a value filed there must report '.env', not mislabel itself '.env.secrets'.
+  const t = resolveToken('GH_TOKEN', {}, { GH_TOKEN: 'tok' }, '.env');
+  assert.equal(t.source, '.env');
+  assert.equal(t.value, 'tok');
+  assert.equal(t.conflict, false);
+});
+
+test('resolveToken fileSource=".env": env still wins, and flags a conflict', () => {
+  const envWins = resolveToken('GH_TOKEN', { GH_TOKEN: 'env' }, { GH_TOKEN: 'file' }, '.env');
+  assert.equal(envWins.source, 'env');
+  assert.equal(envWins.value, 'env');
+  assert.equal(envWins.conflict, true);
+  assert.equal(resolveToken('GH_TOKEN', {}, {}, '.env').source, 'MISSING');
+});
+
+test('tokenStatus masks a host token resolved from .env (value-free diagnostic)', () => {
+  const status = tokenStatus(resolveToken('GH_TOKEN', {}, { GH_TOKEN: 'secret' }, '.env'));
+  assert.equal(status.source, '.env');
+  assert.equal(status.value, 'SET'); // never the raw token
+});
+
 // ---------------------------------------------------------------------------
 // resolveTokens — batch + conflict detection
 // ---------------------------------------------------------------------------

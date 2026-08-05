@@ -32,6 +32,8 @@ import {
   parseGhQueue,
   dedupeQueue,
   claimLabels,
+  hostTokenKey,
+  hostTokenMissingMessage,
 } from './host.ts';
 import { test, throws, finish } from './test-harness.ts';
 
@@ -452,6 +454,50 @@ test('createHost: returns the five operations for each host', () => {
     assert.equal(typeof h.openChangeRequests, 'function', `${host}.openChangeRequests`);
     assert.equal(typeof h.queueIssues, 'function', `${host}.queueIssues`);
   }
+});
+
+// --- host-CLI token (issue #17) ---------------------------------------------
+
+test('HOST_TERMS has a total `local` entry so Record<GitHost,…> compiles', () => {
+  // `local` is fenced at the loop (no host CLI), but the type must stay total.
+  assert.ok(typeof HOST_TERMS.local.cli === 'string');
+  assert.ok(typeof HOST_TERMS.local.name === 'string');
+});
+
+test('createHost: local (no tracker) is refused, not silently treated as glab', () => {
+  // The belt for main.ts' earlier fence — a direct caller must not get a glab host.
+  throws(() => createHost('local'));
+});
+
+test('hostTokenKey: gh → GH_TOKEN, glab → GITLAB_TOKEN, local → null (no token)', () => {
+  assert.equal(hostTokenKey('gh'), 'GH_TOKEN');
+  assert.equal(hostTokenKey('glab'), 'GITLAB_TOKEN');
+  // The acceptance: a local / no-tracker consumer is never asked for a token.
+  assert.equal(hostTokenKey('local'), null);
+});
+
+test('hostTokenMissingMessage: gh names the var, the file, and the gh auth command', () => {
+  const msg = hostTokenMissingMessage('GH_TOKEN', 'gh', '.sandcastle/.env');
+  assert.ok(msg.includes('GH_TOKEN'), `names the var: ${msg}`);
+  assert.ok(msg.includes('.sandcastle/.env'), `names the file resolveEnv flows: ${msg}`);
+  assert.ok(msg.includes('gh auth token'), `tells how to obtain it: ${msg}`);
+  assert.ok(msg.includes('local'), `notes the local exemption: ${msg}`);
+  // Never leaks a value — it is a static message, but assert no secret placeholder slips in.
+  assert.ok(!msg.includes('<token>'));
+});
+
+test('hostTokenMissingMessage: glab names GITLAB_TOKEN and the glab auth command', () => {
+  const msg = hostTokenMissingMessage('GITLAB_TOKEN', 'glab', '.sandcastle/.env');
+  assert.ok(msg.includes('GITLAB_TOKEN'), `names the var: ${msg}`);
+  assert.ok(msg.includes('.sandcastle/.env'), `names the file: ${msg}`);
+  assert.ok(msg.includes('glab auth token'), `glab obtain hint: ${msg}`);
+});
+
+test('hostTokenMissingMessage: local falls back to a generic message (never called in practice)', () => {
+  // hostTokenKey('local')===null ⇒ main.ts never validates ⇒ never calls this. Defensive.
+  const msg = hostTokenMissingMessage('GH_TOKEN', 'local', '.sandcastle/.env');
+  assert.ok(msg.includes('GH_TOKEN'));
+  assert.ok(msg.includes('.sandcastle/.env'));
 });
 
 finish();
