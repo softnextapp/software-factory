@@ -207,6 +207,17 @@ function linkEngine(factoryRoot: string, consumerRoot: string): boolean {
   }
 }
 
+/** Does the Engine resolve in the consumer's OWN tree? Used to tell a benign non-zero
+ * install exit from a genuine failure, so adopt does not clobber a good install with the
+ * linkEngine fallback (issue #13): pnpm v11 exits non-zero on ERR_PNPM_IGNORED_BUILDS
+ * (unapproved native build scripts, e.g. esbuild via tsx) even when the package installed
+ * fine. The Engine is a direct dep, so it lives at the consumer's top-level node_modules
+ * (npm's real dir, or pnpm's symlink into the store — `existsSync` follows it). Resolving
+ * the bare specifier would trip the Engine's ESM-only exports map, so check its manifest. */
+function engineResolves(consumerRoot: string): boolean {
+  return existsSync(join(consumerRoot, 'node_modules', '@ai-hero', 'sandcastle', 'package.json'));
+}
+
 function info(msg: string): void {
   console.log(msg);
 }
@@ -293,10 +304,20 @@ function main(): void {
       }
       wiredVia = 'install';
     } catch {
-      // Offline / unknown pm / install failure — link the Engine as a fallback so
-      // adoption still lands. Only @ai-hero can be meaningfully symlinked; tsx/
-      // typescript are left to the consumer (most TS projects already have them).
-      if (linkEngine(FACTORY_ROOT, consumerRoot)) {
+      // A non-zero exit is not always failure — a package manager can exit non-zero on
+      // a benign warning yet still install the package (see `engineResolves`). If the
+      // Engine landed anyway, treat the install as successful; do NOT fall back to
+      // linkEngine, which would overwrite the good install with a Factory symlink (#13).
+      if (engineResolves(consumerRoot)) {
+        wiredVia = 'install';
+        warn(
+          `'${pm} add' exited non-zero but @ai-hero/sandcastle resolves in the consumer — treating as installed\n` +
+            `  (likely a benign ${pm} warning, e.g. ignored build scripts; issue #13).`,
+        );
+      } else if (linkEngine(FACTORY_ROOT, consumerRoot)) {
+        // Offline / unknown pm / genuine install failure — link the Engine as a fallback
+        // so adoption still lands. Only @ai-hero can be meaningfully symlinked; tsx/
+        // typescript are left to the consumer (most TS projects already have them).
         wiredVia = 'symlink';
         const allSpecs = [...missingDepSpecs, ...missingDevSpecs];
         warn(

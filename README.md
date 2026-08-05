@@ -137,10 +137,12 @@ It does four things, none of which touch the consumer's tracked `.gitignore`:
    `tsx` / `typescript` / `@types/node` dev tools. The package manager is detected from
    your lockfile (pnpm/yarn/bun, else npm). Deps you already declare at any version are
    left alone — your versions are yours ([ADR-0003](docs/adr/0003-factory-boundary.md)).
-   If the install fails (offline, unknown manager), it falls back to symlinking the
-   Engine out of the Factory clone and warns — make it permanent with a real `add`
-   later. The saved range follows your package manager's default (npm adds a `^`);
-   pin exact (`@0.12.0`) if you need to.
+   If the install genuinely fails (offline, unknown manager), it falls back to
+   symlinking the Engine out of the Factory clone and warns — make it permanent with a
+   real `add` later. A non-zero exit that still leaves the Engine installed (e.g. pnpm's
+   `ERR_PNPM_IGNORED_BUILDS` warning for unapproved native build scripts such as
+   esbuild) is treated as success, not a failure. The saved range follows your package
+   manager's default (npm adds a `^`); pin exact (`@0.12.0`) if you need to.
 3. **Self-contained ESM** — `main.ts` uses top-level `await`, so `.sandcastle/` ships its
    own `{"type":"module"}` package.json. It lands with the step-1 copy and makes
    `main.ts` transpile regardless of your repo's root `package.json` (issue #8) — CJS or
