@@ -112,6 +112,35 @@ test('DEFAULT_PROJECT_CONFIG.queueLabels accepts sandcastle OR ready-for-agent o
   assert.deepEqual(DEFAULT_PROJECT_CONFIG.queueLabels, ['sandcastle', 'ready-for-agent']);
 });
 
+test('DEFAULT_PROJECT_CONFIG ships no install hook and copies node_modules', () => {
+  // Repo-specific (yarn 4 / npm / pnpm / none): the Factory ships NO install hook and
+  // copies node_modules as the only host→sandbox path (a no-op in a repo that has none).
+  // These are consumer knobs now, so the defaults must be the values main.ts used to
+  // hardcode — a consumer who does nothing gets the same behaviour (issue #19).
+  assert.deepEqual(DEFAULT_PROJECT_CONFIG.hooks, {});
+  assert.deepEqual(DEFAULT_PROJECT_CONFIG.copyToWorktree, ['node_modules']);
+});
+
+test('a DB-backed consumer (setup hook + empty copyToWorktree) is expressible purely in config', () => {
+  // The captable-manager live run (2026-08-05) had to patch main.ts for exactly this
+  // shape: a Postgres/Prisma/Playwright repo needs a `sandbox-setup` hook AND an empty
+  // copyToWorktree (pnpm rejects a host-copied node_modules — ERR_PNPM_ABORTED…). After
+  // issue #19 a consumer sets it in config.ts and never edits main.ts; resolveConfig
+  // must carry both onto the resolved project unchanged.
+  const dbProject: ProjectConfig = {
+    ...DEFAULT_PROJECT_CONFIG,
+    hooks: {
+      sandbox: { onSandboxReady: [{ command: 'sandbox-setup', timeoutMs: 900_000 }] },
+    },
+    copyToWorktree: [],
+  };
+  const c = loadConfig(dbProject, {});
+  assert.deepEqual(c.project.copyToWorktree, []);
+  assert.deepEqual(c.project.hooks.sandbox?.onSandboxReady, [
+    { command: 'sandbox-setup', timeoutMs: 900_000 },
+  ]);
+});
+
 test('human + split → three core roles, reviewer on anthropic', () => {
   const c = resolveConfig(humanProject, loadRunConfig({}));
   assert.deepEqual([...c.roles], ['planner', 'implementer', 'reviewer']);

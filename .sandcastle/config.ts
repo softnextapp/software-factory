@@ -65,6 +65,31 @@ export type CommitStyle = 'ralph' | 'conventional';
 export type GitHost = 'gh' | 'glab' | 'local';
 
 /**
+ * Sandbox lifecycle hooks — a faithful literal mirror of the Engine's `SandboxHooks`
+ * (@ai-hero/sandcastle `createSandbox({ hooks })`, index.d.ts), redeclared here rather
+ * than imported so config.ts stays engine-free and unit-testable with no engine
+ * installed (same rationale as `Effort` above). A consumer sets an install / `sandbox-setup`
+ * hook here instead of editing main.ts (issue #19).
+ *
+ * `host` hooks run on the host (no `sudo`); `sandbox` hooks run inside the sandbox and
+ * may run as root. The asymmetry mirrors the Engine exactly — keep the two in sync if
+ * the Engine's hook shape ever widens.
+ */
+export interface SandboxHooks {
+  readonly host?: {
+    readonly onWorktreeReady?: ReadonlyArray<{ readonly command: string; readonly timeoutMs?: number }>;
+    readonly onSandboxReady?: ReadonlyArray<{ readonly command: string; readonly timeoutMs?: number }>;
+  };
+  readonly sandbox?: {
+    readonly onSandboxReady?: ReadonlyArray<{
+      readonly command: string;
+      readonly sudo?: boolean;
+      readonly timeoutMs?: number;
+    }>;
+  };
+}
+
+/**
  * Static project identity. The part of the Factory a consumer edits to describe
  * *their* repo. Lives in code (or a config file), not in env — a project is on
  * GitHub or GitLab, full stop; that does not change per run.
@@ -88,6 +113,14 @@ export interface ProjectConfig {
   readonly chainableBases: readonly string[];
   /** glab wants a username; gh uses @me. null ⇒ let the host default. */
   readonly assignee: string | null;
+  /** Sandbox lifecycle hooks (install / `sandbox-setup`). Default `{}` — the Factory ships no
+   *  install hook, because the toolchain is repo-specific (yarn 4 / npm / pnpm / none). A consumer
+   *  sets one here instead of editing main.ts (issue #19); main.ts only reads it. */
+  readonly hooks: SandboxHooks;
+  /** Paths copied from the host worktree into each sandbox (e.g. `node_modules`). Default
+   *  `['node_modules']` (a no-op in a repo that has none). A pnpm repo sets `[]` — pnpm rejects a
+   *  host-copied `node_modules` (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY). Issue #19. */
+  readonly copyToWorktree: readonly string[];
 }
 
 /** Per-run knobs, read from env. */
@@ -154,6 +187,11 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   queueLabels: ['sandcastle', 'ready-for-agent'],
   chainableBases: [],
   assignee: null,
+  // No install hook (repo-specific toolchain); copy node_modules when present. Both are
+  // consumer knobs now (issue #19) — these are the values main.ts used to hardcode, so a
+  // consumer who sets neither gets identical behaviour.
+  hooks: {},
+  copyToWorktree: ['node_modules'],
 };
 
 // ---------------------------------------------------------------------------

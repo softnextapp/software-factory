@@ -406,16 +406,23 @@ const effortFor = (role: Role) => cfg.providerFor(role).effort;
 const agentFor = (role: Role) => sandcastle.claudeCode(modelFor(role), { effort: effortFor(role) });
 
 // ---------------------------------------------------------------------------
-// Project toolchain defaults
+// Project toolchain — now config-driven (issue #19)
 //
-// The install hook and the worktree copy are repo-specific (yarn 4 / npm / pnpm /
-// none), so the Factory ships NO install hook and copies node_modules only when
-// present (a harmless no-op in a repo that has none). A consumer edits both after
-// cloning — ADR-0002 (clone-and-own). A yarn-4 repo, for instance, sets:
-//   const hooks = { sandbox: { onSandboxReady: [{ command: 'yarn install --immutable' }] } };
+// The install hook and the worktree-copy list are repo-specific (yarn 4 / npm / pnpm /
+// none), so they live in config.ts as ProjectConfig.hooks / .copyToWorktree and a
+// consumer sets them there — not by editing this file. The Factory still ships NO
+// install hook and copies node_modules only when present (a no-op in a repo that has
+// none); both are the ProjectConfig defaults. A yarn-4 repo sets, in config.ts:
+//   hooks: { sandbox: { onSandboxReady: [{ command: 'yarn install --immutable' }] } }
+// main.ts only READS them off cfg.project below.
+//
+// copyToWorktree is adapted to a mutable string[] here because the Engine's option is
+// typed `string[]` while the config surface stays readonly (like every other ProjectConfig
+// collection); hooks passes through unchanged — config's SandboxHooks and the Engine's
+// are both readonly and structurally identical.
 // ---------------------------------------------------------------------------
-const hooks = {};
-const copyToWorktree = ['node_modules'];
+const { hooks } = cfg.project;
+const copyToWorktree: string[] = [...cfg.project.copyToWorktree];
 
 // ---------------------------------------------------------------------------
 // Chained base (SANDCASTLE_CHAIN=1)
@@ -798,6 +805,11 @@ if (cfg.run.dryRun) {
       mergeStrategy: cfg.project.mergeStrategy,
       commitStyle: cfg.project.commitStyle,
       gitHost: cfg.project.gitHost,
+      // Repo-specific toolchain knobs, now driven from config (issue #19): surfacing them
+      // here lets a consumer confirm their config.ts wiring (e.g. a `sandbox-setup` hook, or
+      // an empty copyToWorktree for pnpm) without launching a single sandbox.
+      hooks: cfg.project.hooks,
+      copyToWorktree: cfg.project.copyToWorktree,
       // The in-sandbox host-CLI credential (issue #17). `local` → not required; gh/glab
       // → the conventionally-named token resolveEnv flows from .env (or the env). A
       // MISSING token is REPORTED here, not thrown — the dry run exits 0 like it does
