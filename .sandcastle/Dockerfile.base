@@ -1,0 +1,64 @@
+# Sandcastle runtime base image — the universal layer every consumer's sandbox is built
+# FROM. This is the only image recipe the Factory ships: the runtime bits common to every
+# project. Provenance: reused from sandcastle-kit/template/Dockerfile.base (already
+# factored, pinned) rather than re-derived from the four source instances — see GitHub
+# issue #1 and ADR-0001 (a build recipe is not Engine code).
+#
+# Two-layer model:
+#   1. THIS file (the Factory base) — built once per host. Universal; never holds a
+#      project-specific dependency.
+#   2. The consumer's .sandcastle/Dockerfile — `FROM <this base>`, adds only THIS
+#      project's build/test deps (including its host CLI — glab or gh), then re-declares
+#      the entrypoint. That is project context (ADR-0003) and stays in the consumer.
+#
+# Build the base (no COPY below, so no build context is needed — pipe it in):
+#   docker build -t sandcastle-base:latest \
+#     --build-arg AGENT_UID=$(id -u) --build-arg AGENT_GID=$(id -g) \
+#     - < .sandcastle/Dockerfile.base
+#
+# The tag is host-local: AGENT_UID/AGENT_GID differ per host, so rebuild on each host and
+# point the consumer Dockerfile's `FROM` at the SAME tag. Then build the project image with
+# the Engine command, which reads .sandcastle/Dockerfile and passes the host UID/GID for you:
+#   npx @ai-hero/sandcastle docker build-image
+#
+# Image naming: main.ts runs `docker()` without an imageName, so the Engine derives the
+# sandbox image name from the repo directory — `sandcastle:<lowercased-repo-basename>`. The
+# project Dockerfile is built into that name; this base is just its FROM target.
+#
+# UID pre-flight check: the Engine inspects the built image's USER and throws a UID mismatch
+# if it differs from the host UID. The AGENT_UID/AGENT_GID args + the node→agent rename
+# below are what make that check pass on any host.
+FROM node:22-bookworm
+
+# System dependencies. No host CLI (glab/gh) here: the v0.1 loop publishes Draft MRs
+# host-side (Phase 3), never from inside the sandbox, and which tracker a project uses is
+# project context (ADR-0003) — a consumer adds theirs in the project Dockerfile (above).
+RUN apt-get update && apt-get install -y \
+  git \
+  curl \
+  jq \
+  && rm -rf /var/lib/apt/lists/*
+
+# Build-args for UID/GID alignment: pass the host user's UID/GID so image-built files and
+# bind-mounted files share an owner without a runtime chown. The Engine's
+# `sandcastle docker build-image` sets these to the host UID/GID for you; a hand-rolled
+# `docker build` must pass them explicitly (see the header).
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+
+# Rename the base image's "node" user to "agent" and align its UID/GID to the host's.
+RUN groupmod -o -g $AGENT_GID -n agent node && usermod -o -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+USER ${AGENT_UID}:${AGENT_GID}
+
+# Claude Code CLI — the agent runtime. Pinned (2.1.195); z.ai accepts >= 2.0.14 for the
+# [1m] suffix used by the GLM provider. Bump → rebuild the base (and any project image
+# FROM it). Install runs as the agent user so the binary lands in /home/agent/.local/bin.
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.195
+
+ENV PATH="/home/agent/.local/bin:$PATH"
+
+WORKDIR /home/agent
+
+# In worktree/head mode the Engine bind-mounts the host working tree at /home/agent/workspace
+# and forces the cwd there at container start — so /home/agent/workspace is the project root.
+ENTRYPOINT ["sleep", "infinity"]

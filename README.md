@@ -22,6 +22,7 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/plan.ts` | Parses the planner's `<plan>` JSON; label → base resolution. |
 | `.sandcastle/chain.ts` | Chained-MR base resolution. |
 | `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/GitLab facts. |
+| `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
 | `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |
 | `.claude/skills/` | The vendored Matt Pocock skills — see [Vendored skills](#vendored-skills). |
@@ -57,6 +58,21 @@ and the `.sandcastle/` config becomes *your* project's, with no ongoing link. Dr
 after cloning is expected; re-sync from the Factory by hand when you want upstream
 improvements.
 
+### Prerequisites
+
+The loop is not pure TypeScript — it drives a container runtime and a host CLI, so a fresh
+machine needs all four. Node's floor matches the base image; the others just need to be
+recent.
+
+| Tool | Version | Why |
+|---|---|---|
+| **Node.js** | ≥ 22 LTS | Runs the Engine and `tsx`; matches the `node:22-bookworm` base image. |
+| **Docker or Podman** | recent (Docker tested 29.x) | The sandbox container runtime. `main.ts` drives the Engine's `docker()` in v0.1; Podman is also Engine-supported and a follow-up to wire. |
+| **git** | any modern | Clone the Factory / your repo; Phase 3 pushes feature branches. |
+| **glab** | ≥ 1.107 | The v0.1 host: Phase 3 runs `glab mr create --draft` **host-side**. (`gh` is fenced.) |
+
+### Setup
+
 ```sh
 # 1. Clone (or use as a GitHub template) and make it yours.
 git clone <this-repo> my-project && cd my-project && rm -rf .git && git init
@@ -76,11 +92,63 @@ $EDITOR .sandcastle/.env.secrets
 $EDITOR .sandcastle/config.ts
 
 # 6. Dry-run first: prints the resolved wiring and validates base branches, launches nothing.
+#    Needs no sandbox image and exits 0 even with both tokens MISSING — a fresh clone is green here.
 SANDCASTLE_DRYRUN=1 npx tsx .sandcastle/main.ts
 
-# 7. Run the loop.
+# 7. Build the sandbox image — see "Sandbox image" below (required before a real run, not for the dry-run).
+
+# 8. Run the loop.
 npx tsx .sandcastle/main.ts
 ```
+
+### Sandbox image
+
+The sandbox is a container the Engine starts per agent. Its image is **two layers**, and
+only the first ships in the Factory:
+
+1. **Runtime base (universal → `.sandcastle/Dockerfile.base`).** Node + system deps
+   (git/curl/jq) + the `agent` user aligned to your host UID/GID + the pinned Claude Code
+   CLI. Built once per host. This is the only image recipe the Factory ships.
+2. **Project layer (consumer → `.sandcastle/Dockerfile`).** `FROM sandcastle-base`, adds
+   *this* project's build/test deps — including its host CLI (`glab` or `gh`) — and
+   re-declares `ENTRYPOINT ["sleep", "infinity"]`. Project context
+   ([ADR-0003](docs/adr/0003-factory-boundary.md)) — yours to write.
+
+```sh
+# (a) Build the universal base (no COPY in it, so no build context is needed — pipe it in).
+docker build -t sandcastle-base:latest \
+  --build-arg AGENT_UID=$(id -u) --build-arg AGENT_GID=$(id -g) \
+  - < .sandcastle/Dockerfile.base
+
+# (b) Write your project layer at .sandcastle/Dockerfile (the name the Engine reads):
+#       FROM sandcastle-base:latest
+#       RUN <your project's build/test deps>
+#       ENTRYPOINT ["sleep", "infinity"]
+
+# (c) Build the sandbox image the loop will use. The Engine reads .sandcastle/Dockerfile,
+#     tags the image, and passes your host UID/GID as AGENT_UID/AGENT_GID for you.
+npx @ai-hero/sandcastle docker build-image
+```
+
+Two Engine mechanics this relies on, so the image you build is the image the loop expects:
+
+- **Image name.** `main.ts` runs `docker()` without an `imageName`, so the Engine derives
+  it from the repo directory — `sandcastle:<lowercased-repo-basename>` (e.g.
+  `sandcastle:my-project`). `build-image` tags it that way automatically; there is nothing
+  to pass. (Hand-rolling `docker build -t sandcastle:my-project …` works too, as long as
+  the tag matches the repo directory.)
+- **UID pre-flight check.** Before starting a sandbox the Engine inspects the image's
+  `USER`, parses the UID, and throws `UID mismatch … Rebuild the image with 'sandcastle
+  docker build-image'` if it differs from your host UID. The `AGENT_UID`/`AGENT_GID`
+  build-args and the `node → agent` rename in `Dockerfile.base` are exactly what make a
+  `build-image`-built image pass on any host.
+
+The four instances this Factory converged from (ccsnoop; omniris/{api, back-office,
+design-system}) each currently inline the *whole* runtime in their own Dockerfile — the
+drift this factoring removes. Their **project layers** are the model for yours: a UI repo
+adds a browser toolchain, an API repo adds its runtime plus a local database, and so on. A
+consumer on the Factory builds `Dockerfile.base` once and keeps only those project-specific
+lines. The base stays free of them — `npm run image:check` guards that.
 
 > **Project context stays in the consumer** ([ADR-0003](docs/adr/0003-factory-boundary.md)):
 > your `CLAUDE.md` sections, your domain `CONTEXT.md`, your testing recipe and audit
@@ -262,9 +330,10 @@ alternatives in ADR-0005.
 ## Developing
 
 ```sh
-npm test          # config + tokens + plan + chain + skills-lock contract tests (84 cases)
+npm test          # config + tokens + plan + chain + skills-lock + dockerfile-base contract tests (104 cases)
 npm run typecheck # tsc --noEmit over .sandcastle/
 npm run skills:check  # verify .claude/skills/ against skills-lock.json
+npm run image:check   # verify .sandcastle/Dockerfile.base against the universal-runtime contract
 ```
 
 Tests are pure (no network, no secrets, no `process.env`) and use `node:assert/strict`
