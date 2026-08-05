@@ -26,6 +26,8 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |
 | `.claude/skills/` | The vendored Matt Pocock skills — see [Vendored skills](#vendored-skills). |
 | `skills-lock.json` | Manifest of record for the vendored skills (source + path + content hash each). |
+| `templates/` | Project-context skeletons a consumer fills in after cloning — see [Project context](#consuming-the-factory-clone-and-own). |
+| `.sandcastle/.env.secrets.example` | Template for the auth-token file `main.ts` reads (copy to `.env.secrets`). |
 | `docs/adr/` | Architecture decision records. |
 
 ## The Orchestration
@@ -65,7 +67,8 @@ npm install
 # 3. Authenticate against your GitLab (glab is the only host wired in v0.1).
 glab auth login
 
-# 4. Create the secrets file — see "Auth token isolation" below.
+# 4. Create the secrets file from the shipped example — see "Auth token isolation" below.
+cp .sandcastle/.env.secrets.example .sandcastle/.env.secrets
 $EDITOR .sandcastle/.env.secrets
 
 # 5. (Optional, recommended) Configure your project identity — see below.
@@ -81,7 +84,17 @@ npx tsx .sandcastle/main.ts
 > **Project context stays in the consumer** ([ADR-0003](docs/adr/0003-factory-boundary.md)):
 > your `CLAUDE.md` sections, your domain `CONTEXT.md`, your testing recipe and audit
 > command, and `settings.local.json` are yours to supply after cloning. The Factory
-> ships only universal orchestration, not project-specific content.
+> ships only universal orchestration, not project-specific content. It does ship
+> **fill-in skeletons** so a loop run on a fresh clone is not flying blind:
+>
+> ```sh
+> # The agents read @CLAUDE.md as the authority for the gate, standards, suites,
+> # commit style, review lane, release tooling, and domain context — fill it in
+> # before the first run.
+> cp templates/CLAUDE.md ./CLAUDE.md
+> cp templates/CONTEXT.md ./CONTEXT.md      # domain glossary (delete if you have none yet)
+> cp .sandcastle/.env.secrets.example .sandcastle/.env.secrets   # then add the tokens
+> ```
 
 ## Configuration reference
 
