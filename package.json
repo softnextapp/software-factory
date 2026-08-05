@@ -4,11 +4,12 @@
   "type": "module",
   "description": "SoftNext shared Sandcastle factory config layer. See CONTEXT.md.",
   "scripts": {
-    "test": "tsx .sandcastle/config.test.ts && tsx .sandcastle/tokens.test.ts && tsx .sandcastle/plan.test.ts && tsx .sandcastle/chain.test.ts && tsx .sandcastle/skills-lock.test.ts && tsx .sandcastle/dockerfile-base.test.ts",
+    "test": "tsx .sandcastle/config.test.ts && tsx .sandcastle/tokens.test.ts && tsx .sandcastle/plan.test.ts && tsx .sandcastle/chain.test.ts && tsx .sandcastle/skills-lock.test.ts && tsx .sandcastle/dockerfile-base.test.ts && tsx .sandcastle/adopt.test.ts",
     "typecheck": "tsc --noEmit -p .sandcastle/tsconfig.json",
     "skills:check": "tsx .sandcastle/skills-lock.ts",
     "skills:lock": "tsx .sandcastle/skills-lock.ts --update",
-    "image:check": "tsx .sandcastle/dockerfile-base.ts"
+    "image:check": "tsx .sandcastle/dockerfile-base.ts",
+    "adopt": "tsx .sandcastle/adopt.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

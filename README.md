@@ -25,6 +25,7 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
 | `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |
+| `.sandcastle/adopt.ts` | One-command in-place adoption into an existing repo — see [Adopt into an existing repo](#adopt-into-an-existing-repo). |
 | `.claude/skills/` | The vendored Matt Pocock skills — see [Vendored skills](#vendored-skills). |
 | `skills-lock.json` | Manifest of record for the vendored skills (source + path + content hash each). |
 | `templates/` | Project-context skeletons a consumer fills in after cloning — see [Project context](#consuming-the-factory-clone-and-own). |
@@ -56,7 +57,9 @@ Consumption is a **clone-and-own template**, not a submodule
 ([ADR-0002](docs/adr/0002-consumption-template-model.md)). You clone, drop `.git`,
 and the `.sandcastle/` config becomes *your* project's, with no ongoing link. Drift
 after cloning is expected; re-sync from the Factory by hand when you want upstream
-improvements.
+improvements. There are two ways in: a **greenfield clone** ([Setup](#setup) below)
+for a brand-new repo, or **[adopting into an existing repo](#adopt-into-an-existing-repo)**
+that already has its own history and remote.
 
 ### Prerequisites
 
@@ -100,6 +103,53 @@ SANDCASTLE_DRYRUN=1 npx tsx .sandcastle/main.ts
 # 8. Run the loop.
 npx tsx .sandcastle/main.ts
 ```
+
+### Adopt into an existing repo
+
+The greenfield path above (`git clone … && rm -rf .git && git init`) erases the
+target's history and assumes the Factory becomes the repo root. For a repo that
+already exists — its own history, its own remote — adopt `.sandcastle/` **in place**
+with one command, run from the Factory root:
+
+```sh
+npx tsx .sandcastle/adopt.ts /path/to/your-repo   # add --force to re-sync from upstream later
+```
+
+It does four things, none of which touch the consumer's tracked `.gitignore`:
+
+1. **Copy `.sandcastle/`** — tracked Factory files only (`git archive HEAD`), so the
+   copy is secret-free by construction. It refuses to clobber an already-adopted
+   `.sandcastle/`; `--force` re-syncs from the Factory HEAD (this overwrites the
+   tracked files, including `config.ts` — back up local edits first).
+2. **Wire the runtime** — installs whatever the Factory's `package.json` declares that
+   your repo does not already have: the Engine (`@ai-hero/sandcastle`) plus the
+   `tsx` / `typescript` / `@types/node` dev tools. The package manager is detected from
+   your lockfile (pnpm/yarn/bun, else npm). Deps you already declare at any version are
+   left alone — your versions are yours ([ADR-0003](docs/adr/0003-factory-boundary.md)).
+   If the install fails (offline, unknown manager), it falls back to symlinking the
+   Engine out of the Factory clone and warns — make it permanent with a real `add`
+   later. The saved range follows your package manager's default (npm adds a `^`);
+   pin exact (`@0.12.0`) if you need to.
+3. **Write an ESM shim** when your repo is CJS (no `"type":"module"`) — `main.ts` uses
+   top-level `await`, so a CJS consumer needs `.sandcastle/package.json =
+   {"type":"module"}` for `tsx` to transpile it (issue #8). ESM repos are skipped.
+4. **Ignore `.sandcastle/` locally** — appends to `.git/info/exclude`, so the Factory
+   config stays untracked without editing your committed `.gitignore`.
+
+After adopting, fill in the project-context skeletons (they ship in the Factory's
+`templates/`, not in the copy) and continue from [Setup](#setup) step 5:
+
+```sh
+cp templates/CLAUDE.md  /path/to/your-repo/CLAUDE.md
+cp templates/CONTEXT.md /path/to/your-repo/CONTEXT.md   # domain glossary (delete if you have none yet)
+$EDITOR /path/to/your-repo/.sandcastle/config.ts
+SANDCASTLE_DRYRUN=1 npx tsx /path/to/your-repo/.sandcastle/main.ts
+```
+
+> **`.sandcastle/` is the whole copy.** Adoption ships only the orchestration layer —
+> the same config-only boundary as a greenfield clone ([ADR-0001](docs/adr/0001-factory-scope-config-only.md)).
+> The project-context skeletons (`templates/CLAUDE.md`, `templates/CONTEXT.md`) and
+> your sandbox project layer (`.sandcastle/Dockerfile`) are yours to add afterward.
 
 ### Sandbox image
 
@@ -330,7 +380,7 @@ alternatives in ADR-0005.
 ## Developing
 
 ```sh
-npm test          # config + tokens + plan + chain + skills-lock + dockerfile-base contract tests (104 cases)
+npm test          # config + tokens + plan + chain + skills-lock + dockerfile-base + adopt contract tests (143 cases)
 npm run typecheck # tsc --noEmit over .sandcastle/
 npm run skills:check  # verify .claude/skills/ against skills-lock.json
 npm run image:check   # verify .sandcastle/Dockerfile.base against the universal-runtime contract
