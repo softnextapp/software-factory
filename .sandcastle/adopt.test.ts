@@ -13,6 +13,7 @@ import {
   engineRuntimeDeps,
   computeMissing,
   toSpecs,
+  shouldClearEngineLink,
   parseArgs,
   type PackageManager,
 } from './adopt.ts';
@@ -185,6 +186,29 @@ test('toSpecs: name@version in insertion order', () => {
 });
 test('toSpecs: empty table → empty list', () => {
   assert.deepEqual(toSpecs({}), []);
+});
+
+// ---------------------------------------------------------------------------
+// shouldClearEngineLink — must adopt clear a stale node_modules/@ai-hero before install?
+// Issue #11: linkEngine (adopt's offline fallback) or a manual workaround leaves a
+// foreign @ai-hero SYMLINK pointing at another tree; a later `<pm> add` then writes
+// *through* it into that tree, leaving the Engine declared yet unresolvable. Clearing
+// the symlink before the install lets the package manager write into the consumer's own
+// node_modules.
+// ---------------------------------------------------------------------------
+
+test('foreign @ai-hero symlink → clear it before install', () => {
+  // The linkEngine fallback (or a manual workaround) symlinks the whole @ai-hero scope
+  // at another tree — lstat sees a symlink, so this entry must be cleared (issue #11).
+  assert.equal(shouldClearEngineLink({ isSymbolicLink: () => true }), true);
+});
+test('package-manager-owned @ai-hero directory → leave it alone', () => {
+  // npm's real dir, or pnpm's @ai-hero scope dir (which itself contains a store
+  // symlink) — lstat sees a directory, not a link; the package manager owns it.
+  assert.equal(shouldClearEngineLink({ isSymbolicLink: () => false }), false);
+});
+test('no @ai-hero entry yet → nothing to clear', () => {
+  assert.equal(shouldClearEngineLink(null), false);
 });
 
 // ---------------------------------------------------------------------------

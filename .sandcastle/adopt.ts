@@ -24,6 +24,7 @@
 import { execFileSync } from 'node:child_process';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -148,6 +149,24 @@ export function toSpecs(table: Record<string, string>): string[] {
   return Object.entries(table).map(([name, ver]) => `${name}@${ver}`);
 }
 
+/**
+ * Should adopt clear the consumer's `node_modules/@ai-hero` before the Engine install?
+ *
+ * Takes the entry's `lstat` fact (or `null` when absent) — NOT a pre-classified enum —
+ * so the load-bearing classification lives in this contract-test seam, not inline in
+ * main(). `lstat` must not follow the link: a foreign `@ai-hero` SYMLINK (left by
+ * `linkEngine`, adopt's offline fallback, or a manual pre-#3 workaround) must read as a
+ * symlink, not as the target tree's directory. Clearing it before `<pm> add` lets the
+ * package manager write into the consumer's own `node_modules`; otherwise the install
+ * writes *through* the link into another tree and the Engine ends up declared yet
+ * unresolvable (issue #11). A real DIRECTORY is the package manager's own layout (npm's
+ * real dir, or pnpm's `@ai-hero` scope dir that itself contains a store symlink) and is
+ * left alone; `null` (absent) needs no clearing.
+ */
+export function shouldClearEngineLink(fact: { isSymbolicLink(): boolean } | null): boolean {
+  return fact !== null && fact.isSymbolicLink();
+}
+
 export type ParsedArgs = { ok: true; consumerPath: string; force: boolean } | { ok: false; error: string };
 
 /** Parse `tsx .sandcastle/adopt.ts <consumer-path> [--force|-f]`. */
@@ -253,6 +272,16 @@ function main(): void {
   let wiredVia: 'install' | 'symlink' | 'present' = 'present';
   if (missingDepSpecs.length || missingDevSpecs.length) {
     const pm = detectPackageManager(readdirSync(consumerRoot));
+    // Clear a stale foreign `@ai-hero` symlink (linkEngine fallback / manual workaround)
+    // BEFORE installing — otherwise `<pm> add` writes through it into another tree and
+    // the Engine ends up declared yet unresolvable (issue #11). A real dir is the
+    // package manager's own layout and is left alone. `lstatSync` (not stat) so a symlink
+    // is seen as a symlink, not the target's dir.
+    const aiHero = join(consumerRoot, 'node_modules', '@ai-hero');
+    if (shouldClearEngineLink(existsSync(aiHero) ? lstatSync(aiHero) : null)) {
+      info('② clear stale @ai-hero symlink (foreign link; issue #11) before install');
+      rmSync(aiHero, { recursive: true, force: true });
+    }
     try {
       if (missingDepSpecs.length) {
         info(`② install runtime deps (${pm}): ${missingDepSpecs.join(', ')}`);
