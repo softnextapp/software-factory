@@ -9,7 +9,6 @@
 // Run: npx tsx .sandcastle/host.test.ts
 import assert from 'node:assert/strict';
 import {
-  planQueueCommand,
   openMrsCommand,
   promptHostArgs,
   parseGlabIssueLabels,
@@ -27,34 +26,103 @@ import {
   createHost,
   inferGitHostFromUrl,
   HOST_TERMS,
+  glabQueueListArgs,
+  ghQueueListArgs,
+  parseGlabQueue,
+  parseGhQueue,
+  dedupeQueue,
+  claimLabels,
 } from './host.ts';
 import { test, throws, finish } from './test-harness.ts';
 
-// --- prompt command builders -----------------------------------------------
-// These strings are fed verbatim into promptArgs, so a regression here is a
-// regression in what the planner/implementer/reviewer agents run. They must keep
-// emitting the SAME normalized JSON shape per field across hosts (the planner's
-// logic does not branch on host).
+// --- work-queue enumeration ------------------------------------------------
+// The queue is enumerated by the ORCHESTRATION (main.ts), not the planner prompt:
+// main.ts lists issues for each configured queue label and unions by number, then
+// hands the planner a single deduped list (issue #15 — a consumer's "ready" label
+// need not be `sandcastle`). These are the pure pieces (argv builders + parsers +
+// dedupe + the claim-label set) the host wrappers compose.
 
-test('planQueueCommand(glab) is the glab issue-list with iid + description', () => {
-  const cmd = planQueueCommand('glab');
-  assert.ok(cmd.startsWith('glab issue list '), cmd);
-  assert.ok(cmd.includes('--label sandcastle'), cmd);
-  // glab issues carry .iid and .description; the planner reads number/body off them.
-  assert.ok(cmd.includes('.iid'), cmd);
-  assert.ok(cmd.includes('.description'), cmd);
+test('ghQueueListArgs: issues for ONE label + the queue fields (no --state: defaults open, symmetric with glab)', () => {
+  assert.deepEqual(ghQueueListArgs('ready-for-agent'), [
+    'issue', 'list', '--label', 'ready-for-agent', '--limit', '100',
+    '--json', 'number,title,body,labels',
+  ]);
 });
 
-test('planQueueCommand(gh) is the gh issue-list selecting number/title/body/labels', () => {
-  const cmd = planQueueCommand('gh');
-  assert.ok(cmd.startsWith('gh issue list '), cmd);
-  assert.ok(cmd.includes('--label sandcastle'), cmd);
-  // gh selects fields with --json; labels are objects, so the jq normalises to names.
-  assert.ok(cmd.includes('--json'), cmd);
-  assert.ok(cmd.includes('.number'), cmd);
-  assert.ok(cmd.includes('.body'), cmd);
-  assert.ok(cmd.includes('[.labels[].name]'), cmd);
+test('glabQueueListArgs: open issues for ONE label, JSON output', () => {
+  assert.deepEqual(glabQueueListArgs('sandcastle'), [
+    'issue', 'list', '--label', 'sandcastle', '--output', 'json', '--per-page', '100',
+  ]);
 });
+
+test('parseGlabQueue: maps iid/description/labels(string[]) → QueueIssue; malformed dropped', () => {
+  const raw = JSON.stringify([
+    { iid: 12, title: 'Do thing', description: 'body', labels: ['bug', 'sandcastle'] },
+    { iid: 'x', title: 'bad' }, // non-numeric iid → dropped
+    null,
+  ]);
+  const out = parseGlabQueue(raw);
+  assert.equal(out.length, 1);
+  assert.equal(out[0]?.number, 12);
+  assert.equal(out[0]?.title, 'Do thing');
+  assert.equal(out[0]?.body, 'body');
+  assert.deepEqual(out[0]?.labels, ['bug', 'sandcastle']);
+});
+
+test('parseGlabQueue: non-array payload is fatal (would silently empty the queue)', () => {
+  throws(() => parseGlabQueue('{"message":"401"}'));
+  throws(() => parseGlabQueue('not json'));
+});
+
+test('parseGhQueue: maps number/body/labels[{name}] → QueueIssue; malformed dropped', () => {
+  const raw = JSON.stringify([
+    { number: 12, title: 'Do thing', body: 'body', labels: [{ name: 'bug' }, { name: 'ready-for-agent' }] },
+    { title: 'no number' }, // dropped
+    {},
+  ]);
+  const out = parseGhQueue(raw);
+  assert.equal(out.length, 1);
+  assert.equal(out[0]?.number, 12);
+  assert.equal(out[0]?.title, 'Do thing');
+  assert.equal(out[0]?.body, 'body');
+  assert.deepEqual(out[0]?.labels, ['bug', 'ready-for-agent']);
+});
+
+test('parseGhQueue: non-array payload is fatal', () => {
+  throws(() => parseGhQueue('{"message":"401"}'));
+  throws(() => parseGhQueue('not json'));
+});
+
+test('dedupeQueue: union by number, first occurrence wins, order preserved', () => {
+  const a = { number: 12, title: 't', body: 'b', labels: ['sandcastle'] };
+  const b = { number: 13, title: 't2', body: 'b2', labels: ['ready-for-agent'] };
+  const dup = { number: 12, title: 't', body: 'b', labels: ['sandcastle'] };
+  assert.deepEqual(dedupeQueue([a, b, dup]), [a, b]);
+  assert.deepEqual(dedupeQueue([]), []);
+});
+
+test('claimLabels: the configured queue labels actually on the issue, in queue order', () => {
+  // captable issue carrying ready-for-agent (not sandcastle) → claims that one.
+  assert.deepEqual(claimLabels(['bug', 'ready-for-agent'], ['sandcastle', 'ready-for-agent']), ['ready-for-agent']);
+  // an issue with both → removes both.
+  assert.deepEqual(claimLabels(['bug', 'sandcastle', 'ready-for-agent'], ['sandcastle', 'ready-for-agent']), ['sandcastle', 'ready-for-agent']);
+  // none → empty (defensive; the issue would not have been queued).
+  assert.deepEqual(claimLabels(['bug'], ['sandcastle', 'ready-for-agent']), []);
+});
+
+test('queue + claim end-to-end (both labels): one issue under two labels is deduped once, claims both', () => {
+  // gh/glab return the issue's FULL label set on every per-label hit, so the same
+  // #12 comes back from both the `sandcastle` and `ready-for-agent` lists.
+  const hit = { number: 12, title: 't', body: 'b', labels: [{ name: 'bug' }, { name: 'sandcastle' }, { name: 'ready-for-agent' }] };
+  const queue = dedupeQueue([...parseGhQueue(JSON.stringify([hit])), ...parseGhQueue(JSON.stringify([hit]))]);
+  assert.equal(queue.length, 1, 'deduped to a single entry');
+  assert.deepEqual(claimLabels(queue[0]!.labels, ['sandcastle', 'ready-for-agent']), ['sandcastle', 'ready-for-agent']);
+});
+
+// --- open-MR/PR prompt command (still run verbatim by the planner) ----------
+// This string is fed verbatim into promptArgs, so a regression here is a regression
+// in what the planner runs. It must keep emitting the SAME normalized JSON shape
+// across hosts (the planner's logic does not branch on host).
 
 test('openMrsCommand(glab) lists MRs with source/target branches', () => {
   const cmd = openMrsCommand('glab');
@@ -375,13 +443,14 @@ test('HOST_TERMS: glab = merge request / GitLab / !N, gh = pull request / GitHub
   assert.equal(HOST_TERMS.gh.ref, '#');
 });
 
-test('createHost: returns the four operations for each host', () => {
+test('createHost: returns the five operations for each host', () => {
   for (const host of ['glab', 'gh'] as const) {
     const h = createHost(host);
     assert.equal(typeof h.labelsOf, 'function', `${host}.labelsOf`);
     assert.equal(typeof h.issueInfoOf, 'function', `${host}.issueInfoOf`);
     assert.equal(typeof h.createDraftChangeRequest, 'function', `${host}.createDraftChangeRequest`);
     assert.equal(typeof h.openChangeRequests, 'function', `${host}.openChangeRequests`);
+    assert.equal(typeof h.queueIssues, 'function', `${host}.queueIssues`);
   }
 });
 

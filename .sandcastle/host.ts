@@ -43,30 +43,14 @@ export const HOST_TERMS: Readonly<Record<GitHost, { cr: string; cli: string; nam
 // `{{...}}` is inserted verbatim and NOT re-scanned. So a command that embeds
 // the issue number is split into a binary/prefix promptArg (`{{ISSUE_CLI}}`,
 // `{{UNLABEL_PREFIX}}`) plus a literal `{{ISSUE_NUMBER}}` that lives at the
-// prompt's top level — both resolve in the one pass. The two Phase-1 commands
-// embed no issue number, so they ride as full command strings.
+// prompt's top level — both resolve in the one pass. The one remaining Phase-1
+// command (the open-MR list below) embeds no issue number, so it rides as a full
+// command string.
 //
-// Both hosts emit the SAME normalized JSON shape per field (number/title/body/
-// labels; iid/source_branch/target_branch/title), so the planner's queue logic
-// does not branch on host.
+// The work QUEUE used to be a Phase-1 command too; issue #15 moved it to the
+// orchestration (main.ts enumerates per configured queue label and unions), so
+// the planner now receives the queue as inline JSON instead of running a command.
 // ---------------------------------------------------------------------------
-
-/**
- * The Phase-1 work-queue command for `plan-prompt.md`: lists `sandcastle`-labelled
- * open issues as `[{number, title, body, labels}]`.
- */
-export function planQueueCommand(host: GitHost): string {
-  if (host === 'gh') {
-    return (
-      'gh issue list --label sandcastle --json number,title,body,labels ' +
-      "--jq '[.[] | {number: .number, title: .title, body: .body, labels: [.labels[].name]}]'"
-    );
-  }
-  return (
-    'glab issue list --label sandcastle -O json ' +
-    "--jq '[.[] | {number: .iid, title, body: .description, labels: .labels}]'"
-  );
-}
 
 /**
  * The open-MR/PR command for `plan-prompt.md`: lists open changes as
@@ -349,6 +333,123 @@ export function parseGhPrList(raw: string): OpenMergeRequest[] {
 }
 
 // ---------------------------------------------------------------------------
+// Work-queue enumeration (issue #15)
+//
+// The queue is no longer a prompt command (see plan-prompt.md): main.ts lists
+// issues for EACH configured queue label and unions by number, so a consumer's
+// "ready" label need not be `sandcastle`. These pure argv builders + parsers +
+// the dedupe are the pieces the host wrappers compose; the wrapper itself
+// (queueIssues) lives in createHost() below.
+// ---------------------------------------------------------------------------
+
+/** A queued issue, normalized across hosts (glab `iid`/`description` ↔ gh `number`/`body`). */
+export interface QueueIssue {
+  readonly number: number;
+  readonly title: string;
+  readonly body: string;
+  readonly labels: readonly string[];
+}
+
+/** glab `issue list --label <l> --output json` argv. */
+export function glabQueueListArgs(label: string): readonly string[] {
+  return ['issue', 'list', '--label', label, '--output', 'json', '--per-page', '100'];
+}
+
+/** gh `issue list --label <l> --json number,title,body,labels` argv.
+ *  No `--state`: gh AND glab both default to OPEN issues, and glab has no `--state`
+ *  flag at all (it uses `--closed`/`--all`), so leaning on the shared default keeps
+ *  the two hosts symmetric (issue #15). */
+export function ghQueueListArgs(label: string): readonly string[] {
+  return ['issue', 'list', '--label', label, '--limit', '100', '--json', 'number,title,body,labels'];
+}
+
+/** Shared skeleton for glab/gh issue-list parsing: both emit a JSON array of issues
+ *  that differ only by the number key (`iid` vs `number`), the body key
+ *  (`description` vs `body`), and the label shape (`string[]` vs `[{name}]`). */
+interface QueueListShape {
+  readonly numberKey: string;
+  readonly bodyKey: string;
+  /** Pull a name-only label list out of the raw `labels` field. */
+  readonly normalizeLabels: (raw: unknown) => readonly string[];
+  /** Host name, for the non-array error message only. */
+  readonly host: string;
+}
+function parseQueueList(raw: string, shape: QueueListShape): QueueIssue[] {
+  const parsed = JSON.parse(raw) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error(`${shape.host} returned a non-array issue list: ${raw.slice(0, 200)}`);
+  }
+  const out: QueueIssue[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const issue = entry as Record<string, unknown>;
+    const number = issue[shape.numberKey];
+    if (typeof number !== 'number') continue;
+    const body = issue[shape.bodyKey];
+    out.push({
+      number,
+      title: typeof issue['title'] === 'string' ? issue['title'] : '',
+      body: typeof body === 'string' ? body : '',
+      labels: shape.normalizeLabels(issue['labels']),
+    });
+  }
+  return out;
+}
+
+/** Parse glab's issue list into QueueIssue[]; rows without a numeric `iid` are dropped, not fatal. */
+export function parseGlabQueue(raw: string): QueueIssue[] {
+  return parseQueueList(raw, {
+    host: 'glab',
+    numberKey: 'iid',
+    bodyKey: 'description',
+    normalizeLabels: (raw) =>
+      Array.isArray(raw) ? raw.filter((label): label is string => typeof label === 'string') : [],
+  });
+}
+
+/** Parse gh's issue list (`labels:[{name}]`) into QueueIssue[]; rows without a numeric `number` are dropped, not fatal. */
+export function parseGhQueue(raw: string): QueueIssue[] {
+  return parseQueueList(raw, {
+    host: 'gh',
+    numberKey: 'number',
+    bodyKey: 'body',
+    normalizeLabels: (raw) =>
+      Array.isArray(raw)
+        ? raw
+            .map((label) => (label && typeof label === 'object' && 'name' in label ? label.name : undefined))
+            .filter((name): name is string => typeof name === 'string')
+        : [],
+  });
+}
+
+/**
+ * Union queued issues by number: an issue with two queue labels appears in two
+ * per-label lists — keep the first occurrence only (gh/glab return the issue's
+ * FULL label set on every hit, so no label information is lost). Order is stable.
+ */
+export function dedupeQueue(issues: readonly QueueIssue[]): QueueIssue[] {
+  const seen = new Set<number>();
+  const out: QueueIssue[] = [];
+  for (const issue of issues) {
+    if (seen.has(issue.number)) continue;
+    seen.add(issue.number);
+    out.push(issue);
+  }
+  return out;
+}
+
+/**
+ * Which configured queue labels an issue actually carries — the set the
+ * implementer must REMOVE to take the issue out of the queue (issue #15: a
+ * captable issue carries `ready-for-agent`, not `sandcastle`). Returns them in
+ * configured order; empty if the issue has none (defensive — it would not have
+ * been queued).
+ */
+export function claimLabels(issueLabels: readonly string[], queueLabels: readonly string[]): string[] {
+  return queueLabels.filter((label) => issueLabels.includes(label));
+}
+
+// ---------------------------------------------------------------------------
 // Origin-host inference — for the startup / dry-run mismatch warning
 //
 // Conservative: only flags a mismatch when the remote's host is recognisably the
@@ -380,6 +481,8 @@ export interface Host {
   createDraftChangeRequest(args: CreateChangeRequestArgs): void;
   /** Every open MR/PR of the current repo (for chained-base resolution). */
   openChangeRequests(): OpenMergeRequest[];
+  /** The work queue: open issues carrying ANY of the given labels, deduped by number. */
+  queueIssues(labels: readonly string[]): QueueIssue[];
 }
 
 export function createHost(host: GitHost): Host {
@@ -403,6 +506,12 @@ export function createHost(host: GitHost): Host {
       },
       openChangeRequests: () =>
         parseGhPrList(execFileSync('gh', ghPrListArgs(), { encoding: 'utf8' })),
+      queueIssues: (labels) =>
+        dedupeQueue(
+          labels.flatMap((label) =>
+            parseGhQueue(execFileSync('gh', ghQueueListArgs(label), { encoding: 'utf8' })),
+          ),
+        ),
     };
   }
 
@@ -436,6 +545,12 @@ export function createHost(host: GitHost): Host {
         execFileSync('glab', ['mr', 'list', '--output', 'json', '--per-page', '100'], {
           encoding: 'utf8',
         }),
+      ),
+    queueIssues: (labels) =>
+      dedupeQueue(
+        labels.flatMap((label) =>
+          parseGlabQueue(execFileSync('glab', glabQueueListArgs(label), { encoding: 'utf8' })),
+        ),
       ),
   };
 }

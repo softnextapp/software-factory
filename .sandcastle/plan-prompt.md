@@ -2,9 +2,9 @@
 
 ## Open issues (the work queue)
 
-!`{{ISSUE_QUEUE_CMD}}`
+{{ISSUE_QUEUE_JSON}}
 
-This list is the **sole source of truth** for what work exists. Do not run your own unfiltered query. If the list is empty, emit an empty plan (see below).
+This list is the **sole source of truth** for what work exists — it is already the deduped union of every queue label this project recognises (e.g. `sandcastle` and `ready-for-agent`), handed to you verbatim. Do **not** run your own issue query. If the list is empty, emit an empty plan (see below).
 
 ## Open merge requests (work already written but not yet merged)
 

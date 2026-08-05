@@ -21,7 +21,7 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/main.ts` | The **Orchestration**: the converged `plan → implement+review → publish` loop. |
 | `.sandcastle/plan.ts` | Parses the planner's `<plan>` JSON; label → base resolution. |
 | `.sandcastle/chain.ts` | Chained-MR base resolution — the pure, host-agnostic stack walk. |
-| `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, and the prompt-time command strings). |
+| `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, work-queue enumeration, and the prompt-time command strings). |
 | `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts. |
 | `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
@@ -37,9 +37,10 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 
 `main.ts` runs the Engine in a three-phase loop, all driven by `loadConfig()`:
 
-1. **Plan** — a throwaway Planner sandbox reads the `sandcastle` issue queue and
-   emits `<plan>{ "issues": [...] }</plan>` choosing the issues for this round and
-   a branch for each.
+1. **Plan** — the queue (open issues carrying any `queueLabels` label — `sandcastle`
+   and `ready-for-agent` by default) is enumerated host-side and handed to a
+   throwaway Planner sandbox, which emits `<plan>{ "issues": [...] }</plan>` choosing
+   the issues for this round and a branch for each.
 2. **Work** — up to **`SANDCASTLE_MAX_PARALLEL`** issues run at once. Per issue, an
    **Implementer** then a **Reviewer** that fixes *in place* (edits + commits
    directly on the branch — no verdict loop). Two *sequential* sandboxes on the
@@ -268,6 +269,7 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 | `gitHost` | `'gh' \| 'glab'` | `'glab'` | Host integration (`gh` = GitHub, `glab` = GitLab). Both are wired in v0.1 — see `host.ts`. |
 | `baseBranch` | `string` | `'main'` | The project trunk. |
 | `labelBases` | `Record<string,string>` | `{}` | Issue label → base branch. Empty ⇒ every issue forks from `baseBranch`. |
+| `queueLabels` | `string[]` | `['sandcastle', 'ready-for-agent']` | Queue trigger labels — an open issue carrying ANY of these is candidate work. Default accepts both so the Factory (`sandcastle`) and captable (`ready-for-agent`) queue with no relabelling; narrow per consumer (#15). |
 | `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Empty ⇒ chaining is inert even with `SANDCASTLE_CHAIN=1`. |
 | `assignee` | `string \| null` | `null` | Host assignee. glab wants a username; gh accepts `@me`. `null` ⇒ leave the MR/PR unassigned. |
 

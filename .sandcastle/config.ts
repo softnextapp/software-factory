@@ -72,6 +72,10 @@ export interface ProjectConfig {
   /** label → base branch (design-system's per-issue base resolution). Contract data consumed by
    *  the orchestration layer's base-resolution (main.ts); empty ⇒ always baseBranch. */
   readonly labelBases: Readonly<Record<string, string>>;
+  /** Queue trigger labels: an open issue carrying ANY of these is candidate work this round.
+   *  Default accepts both `sandcastle` (the Factory's own repo) and `ready-for-agent`
+   *  (captable-manager) so neither consumer relabels; narrow it per consumer. Issue #15. */
+  readonly queueLabels: readonly string[];
   /** Base branches eligible for chained mode. Contract data enforced by the chain module
    *  (main.ts/chain.ts) — NOT by this config layer: effectiveMaxParallel needs only the boolean. */
   readonly chainableBases: readonly string[];
@@ -140,6 +144,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   gitHost: 'glab',
   baseBranch: 'main',
   labelBases: {},
+  queueLabels: ['sandcastle', 'ready-for-agent'],
   chainableBases: [],
   assignee: null,
 };

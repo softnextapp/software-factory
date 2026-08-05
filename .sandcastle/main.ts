@@ -41,11 +41,11 @@ import { resolveChainedBase } from './chain.ts';
 import {
   createHost,
   HOST_TERMS,
-  planQueueCommand,
   openMrsCommand,
   promptHostArgs,
   inferGitHostFromUrl,
   manualCreateHint,
+  claimLabels,
   type Host,
 } from './host.ts';
 import {
@@ -680,9 +680,11 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
       CHAIN_MODE: cfg.run.chain ? 'on' : 'off',
       ONLY: cfg.run.only === null ? 'none' : cfg.run.only.join(', '),
       FORCE: cfg.run.force ? 'on' : 'off',
-      // Host-specific queue/PR-list commands (plan-prompt.md runs them verbatim).
-      // Both emit the same normalized JSON shape, so the planner's logic is host-neutral.
-      ISSUE_QUEUE_CMD: planQueueCommand(cfg.project.gitHost),
+      // Host-specific open-MR command (plan-prompt.md runs it verbatim) plus the
+      // work queue, enumerated host-side over EVERY configured queue label and
+      // deduped (issue #15): the planner no longer runs a queue command, it
+      // receives this list inline as the sole source of truth (see plan-prompt.md).
+      ISSUE_QUEUE_JSON: JSON.stringify(host.queueIssues(cfg.project.queueLabels)),
       OPEN_MRS_CMD: openMrsCommand(cfg.project.gitHost),
     },
   });
@@ -738,10 +740,14 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     }
   }
 
+  // The host's view/unlabel/comment verbs — reused to pre-render the implementer's
+  // claim commands below and spread into its promptArgs.
+  const hostVerbs = promptHostArgs(cfg.project.gitHost);
   // Resolve + validate every base before any sandbox is created, so an unpublished
   // base stops the round here rather than after two agent cycles.
   const issues = planned.map((issue) => {
-    const labelBase = baseForLabels(host.labelsOf(issue.number), cfg.project.labelBases, cfg.project.baseBranch);
+    const labels = host.labelsOf(issue.number);
+    const labelBase = baseForLabels(labels, cfg.project.labelBases, cfg.project.baseBranch);
     if (issue.base !== undefined && issue.base !== labelBase) {
       console.warn(
         `  ⚠ #${issue.number}: planner said base \`${issue.base}\`, labels say \`${labelBase}\` — using the labels.`,
@@ -749,7 +755,13 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     }
     const base = resolveBase(labelBase);
     assertBaseUsable(base);
-    return { ...issue, base };
+    // Pre-render the host's unlabel command for each queue label the issue actually
+    // carries, so the implementer runs them verbatim instead of re-splitting a label
+    // list (issue #15: a captable issue carries `ready-for-agent`, not `sandcastle`).
+    const claimCommands = claimLabels(labels, cfg.project.queueLabels)
+      .map((label) => `${hostVerbs.UNLABEL_PREFIX} ${issue.number} ${hostVerbs.UNLABEL_FLAG} ${label}`)
+      .join('\n');
+    return { ...issue, base, claimCommands };
   });
 
   console.log(`Planned ${issues.length} issue(s) this round:`);
@@ -791,7 +803,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
 
   const settled = await Promise.allSettled(
     issues.map(async (issue) => {
-      // Unique per round. A blocked/no-commit issue keeps its `sandcastle` label and
+      // Unique per round. A blocked/no-commit issue keeps its queue label and
       // is re-planned next round with the same issue.branch; the -r suffix stops
       // createSandbox from colliding with the leftover branch.
       const branch = `${issue.branch}-r${iteration}`;
@@ -807,9 +819,13 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         // Drives the commit-subject format in the implement/review prompts: 'ralph'
         // (RALPH:-prefixed subjects) vs 'conventional' (type(scope): …, commitlint-safe).
         COMMIT_STYLE: cfg.project.commitStyle,
-        // Host verbs the prompts compose to view / unlabel / comment on the issue
-        // (glab vs gh differ past the binary). See promptHostArgs() in host.ts.
-        ...promptHostArgs(cfg.project.gitHost),
+        // Pre-rendered host unlabel command(s) — one per line — that take this issue
+        // out of the queue (`sandcastle` OR `ready-for-agent`; issue #15). The
+        // implementer runs them verbatim, no label-list re-splitting.
+        CLAIM_COMMANDS: issue.claimCommands,
+        // Host verbs the prompts compose to view / comment on the issue (glab vs gh
+        // differ past the binary). See promptHostArgs() in host.ts.
+        ...hostVerbs,
       };
       await acquire();
       try {
@@ -896,7 +912,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
   });
 
   type Completed = {
-    issue: PlannedIssue & { base: string };
+    issue: PlannedIssue & { base: string; claimCommands: string };
     branch: string;
     commits: number;
     implStdout: string;

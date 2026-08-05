@@ -106,6 +106,12 @@ const agentProject: ProjectConfig = {
   },
 };
 
+test('DEFAULT_PROJECT_CONFIG.queueLabels accepts sandcastle OR ready-for-agent out of the box', () => {
+  // The Factory's own repo uses `sandcastle`; captable-manager uses `ready-for-agent`.
+  // Both must queue with zero per-consumer config (issue #15); any consumer can narrow it.
+  assert.deepEqual(DEFAULT_PROJECT_CONFIG.queueLabels, ['sandcastle', 'ready-for-agent']);
+});
+
 test('human + split → three core roles, reviewer on anthropic', () => {
   const c = resolveConfig(humanProject, loadRunConfig({}));
   assert.deepEqual([...c.roles], ['planner', 'implementer', 'reviewer']);
