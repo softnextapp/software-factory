@@ -200,6 +200,14 @@ docker build -t sandcastle-base:latest \
 npx @ai-hero/sandcastle docker build-image
 ```
 
+**Missing image → actionable abort.** Before the loop starts, `main.ts` probes
+`sandcastle:<repo>` and, if the daemon is up but the image is missing, aborts
+with the two build steps above (plus a Claude-Code-pasteable prompt) instead of
+letting the planner sandbox die on a `WorktreeError` mid-round. A daemon that
+can't be reached is left for the Engine's own error — never reported as "missing".
+The dry run (`SANDCASTLE_DRYRUN=1`) surfaces it as
+`sandboxImage: <name> (built | MISSING | docker daemon unreachable)`.
+
 Two Engine mechanics this relies on, so the image you build is the image the loop expects:
 
 - **Image name.** `main.ts` runs `docker()` without an `imageName`, so the Engine derives

@@ -66,6 +66,13 @@ import {
   assertNoTokenKeyInDotEnv,
   type ResolvedToken,
 } from './tokens.ts';
+import {
+  sandboxImageName,
+  decideImageStatus,
+  describeImageStatus,
+  buildMissingImageMessage,
+  type SandboxImageStatus,
+} from './image.ts';
 
 type Sandbox = Awaited<ReturnType<typeof sandcastle.createSandbox>>;
 type RunResult = Awaited<ReturnType<Sandbox['run']>>;
@@ -260,6 +267,51 @@ const validateTokens = (): void => {
       `Profile \`${cfg.run.profile}\` requires ${missing.map((m) => m.key).join(', ')} — ` +
         `not set in the environment or in ${SECRETS_PATH}.`,
     );
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Sandbox-image pre-flight (issue #16)
+//
+// The Engine tags the sandbox `sandcastle:<lowercased-repo-basename>`. If that
+// image isn't built, the planner sandbox dies with a raw WorktreeError mid-loop.
+// Probe it here — before any agent burns tokens — and turn a missing image into
+// an actionable build prompt. The pure name/decision/message logic lives in
+// image.ts (unit-tested in image.test.ts); only the docker IO is here.
+const SANDBOX_IMAGE = sandboxImageName(process.cwd());
+
+// `docker info` first: a dead daemon makes `docker image inspect` fail for EVERY
+// image, so probing the image while the daemon is down would cry "missing" and
+// mislead. decideImageStatus (image.ts) makes that guard explicit.
+const sandboxImageStatus = (): SandboxImageStatus => {
+  let daemonUp = true;
+  try {
+    execFileSync('docker', ['info'], { stdio: 'ignore' });
+  } catch {
+    daemonUp = false;
+  }
+  let imageExists = false;
+  if (daemonUp) {
+    try {
+      execFileSync('docker', ['image', 'inspect', SANDBOX_IMAGE], { stdio: 'ignore' });
+      imageExists = true;
+    } catch {
+      imageExists = false;
+    }
+  }
+  return decideImageStatus({ daemonUp, imageExists });
+};
+
+/**
+ * Abort the round with an actionable message when the sandbox image is missing.
+ * `daemon-down` and `built` both fall through: the former lets the Engine surface
+ * docker's own daemon error (never claim "image missing" when we couldn't even
+ * reach docker), the latter is the happy path. The call site catches the throw
+ * and renders the message cleanly, so the operator sees guidance — not a stack.
+ */
+const preflightSandboxImage = (): void => {
+  if (sandboxImageStatus() === 'missing') {
+    throw new Error(buildMissingImageMessage(SANDBOX_IMAGE, cfg.project.gitHost));
   }
 };
 
@@ -706,6 +758,7 @@ if (cfg.run.dryRun) {
           }
         }),
       ),
+      sandboxImage: describeImageStatus(SANDBOX_IMAGE, sandboxImageStatus()),
     },
     { depth: null },
   );
@@ -713,6 +766,16 @@ if (cfg.run.dryRun) {
 }
 
 validateTokens();
+
+// Missing sandbox image → abort NOW with the actionable build prompt from
+// image.ts, caught here (not at top level) so the operator sees guidance, not a
+// Node stack trace. A built image or an unreachable daemon both fall through.
+try {
+  preflightSandboxImage();
+} catch (error) {
+  console.error(`\n${(error as Error).message}\n`);
+  process.exit(1);
+}
 
 // Surface a gitHost-vs-origin mismatch before any agent runs (the dry-run block
 // above ran the same check into its structured report).
