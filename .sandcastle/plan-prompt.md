@@ -2,13 +2,13 @@
 
 ## Open issues (the work queue)
 
-!`glab issue list --label sandcastle -O json --jq '[.[] | {number: .iid, title, body: .description, labels: .labels}]'`
+!`{{ISSUE_QUEUE_CMD}}`
 
 This list is the **sole source of truth** for what work exists. Do not run your own unfiltered query. If the list is empty, emit an empty plan (see below).
 
 ## Open merge requests (work already written but not yet merged)
 
-!`glab mr list --output json --per-page 100 --jq '[.[] | {iid, source_branch, target_branch, title}]'`
+!`{{OPEN_MRS_CMD}}`
 
 ## Chained mode
 
@@ -41,7 +41,7 @@ You are the **planner**. You do **not** write code, run tests, or touch issues. 
 ## How to choose
 
 1. Prefer higher-priority issues: **bug fixes > tracer bullets > polish > refactors**.
-2. Respect the **`Blocked by:`** line at the top of each issue description. This GitLab instance has no native blocking links, so that line — and nothing else — is what declares a dependency. `Blocked by: aucun` (or no such line) means the issue can start. An issue blocked by another **still-open** issue must be skipped this round — **with one exception, and only when chained mode is `on`**: if the blocker's work is delivered by one of the open MRs listed above, the blocked issue **is** workable. The stack puts that MR's branch under the new one, so the blocker's code is already there. Recognise it by the MR title or source branch naming the blocking issue (`sandcastle/issue-<blocker>-…`). If chained mode is `off`, or no open MR delivers the blocker, skip the issue as usual.
+2. Respect the **`Blocked by:`** line at the top of each issue description. This project declares dependencies through that line — not through a native blocking link the planner can rely on — so that line is what declares a dependency. `Blocked by: aucun` (or no such line) means the issue can start. An issue blocked by another **still-open** issue must be skipped this round — **with one exception, and only when chained mode is `on`**: if the blocker's work is delivered by one of the open MRs listed above, the blocked issue **is** workable. The stack puts that MR's branch under the new one, so the blocker's code is already there. Recognise it by the MR title or source branch naming the blocking issue (`sandcastle/issue-<blocker>-…`). If chained mode is `off`, or no open MR delivers the blocker, skip the issue as usual.
 3. Only include issues that can be worked **independently and in parallel**:
    - Skip issues that would obviously collide (edit the same files / same feature). Pick one of a colliding set now; the rest come next round.
    - Some repos collide easily — a shared barrel export, a token or theme sheet, a single routing file. Two issues that both rewrite the same file are a collision even if their titles sound unrelated. When in doubt, plan one and leave the other.

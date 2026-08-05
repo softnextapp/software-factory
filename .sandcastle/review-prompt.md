@@ -16,7 +16,7 @@ You are an expert reviewer. Unlike a gate, you **may edit and commit directly on
 
 ## The issue
 
-!`glab issue view {{ISSUE_NUMBER}}`
+!`{{ISSUE_CLI}} issue view {{ISSUE_NUMBER}}`
 
 ## Repo conventions
 

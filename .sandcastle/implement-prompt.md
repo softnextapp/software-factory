@@ -10,7 +10,7 @@ The planner already chose this issue for you; do not look for others.
 
 ## The issue
 
-!`glab issue view {{ISSUE_NUMBER}}`
+!`{{ISSUE_CLI}} issue view {{ISSUE_NUMBER}}`
 
 ## Recent commits by RALPH (last 10)
 
@@ -46,7 +46,7 @@ The planner already chose this issue for you; do not look for others.
 
    Pick the type that matches what you actually did: `feat` for a new capability, `fix` for a defect, `refactor` for a behaviour-preserving cleanup, `test` when you only added tests.
 
-6. **Close** — move the issue out of the queue: `glab issue update {{ISSUE_NUMBER}} --unlabel sandcastle`. If this project uses a review-lane label, apply it as `CLAUDE.md` describes. Add a comment explaining what was done: `glab issue note {{ISSUE_NUMBER}} -m "..."`.
+6. **Close** — move the issue out of the queue: `{{UNLABEL_PREFIX}} {{ISSUE_NUMBER}} {{UNLABEL_FLAG}} sandcastle`. If this project uses a review-lane label, apply it as `CLAUDE.md` describes. Add a comment explaining what was done: `{{NOTE_PREFIX}} {{ISSUE_NUMBER}} {{NOTE_FLAG}} "..."`.
 
 # Rules
 

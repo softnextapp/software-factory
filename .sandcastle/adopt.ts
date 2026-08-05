@@ -382,7 +382,8 @@ function main(): void {
   info('      cp <factory>/templates/CLAUDE.md   <consumer>/CLAUDE.md');
   info('      cp <factory>/templates/CONTEXT.md  <consumer>/CONTEXT.md   # domain glossary (delete if you have none yet)');
   info('  - Configure identity:    $EDITOR <consumer>/.sandcastle/config.ts');
-  info('  - Authenticate the host: glab auth login   (glab is the only host wired in v0.1)');
+  info('  - Authenticate the host: glab auth login   # or: gh auth login (GitLab vs GitHub)');
+  info('      then set `gitHost` in config.ts to match — the loop warns if it disagrees with origin.');
   info('  - Dry-run first:         SANDCASTLE_DRYRUN=1 npx tsx <consumer>/.sandcastle/main.ts');
 }
 

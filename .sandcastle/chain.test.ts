@@ -1,12 +1,11 @@
 // Tests for the chained-MR base-resolution module.
 //
-// Ports design-system's chain.test.ts. chain.ts is ported verbatim, so its pure stack
-// walk (resolveChainedBase) and glab parser (parseOpenMergeRequests) are exercised
-// unchanged — only the harness differs. Pure: no network, no glab, no process.env.
-// Run: npx tsx .sandcastle/chain.test.ts
+// chain.ts owns only the pure, host-agnostic stack walk now (the glab/gh list
+// parsers moved to host.ts — see host.test.ts). Pure: no network, no CLI, no
+// process.env. Run: npx tsx .sandcastle/chain.test.ts
 import assert from 'node:assert/strict';
-import { parseOpenMergeRequests, resolveChainedBase, type OpenMergeRequest } from './chain.ts';
-import { test, throws, finish } from './test-harness.ts';
+import { resolveChainedBase, type OpenMergeRequest } from './chain.ts';
+import { test, finish } from './test-harness.ts';
 
 const ROOT = 'epic/rgaa-accessibilite';
 
@@ -87,38 +86,6 @@ test('a hand-made cycle terminates (does not hang the round)', () => {
   const loop = mr('branch-a', 'branch-b', '2026-07-29T10:00:00Z');
   const r = resolveChainedBase([a, b, loop], ROOT);
   assert.equal(r.base, 'branch-b');
-});
-
-// --- parseOpenMergeRequests -------------------------------------------------
-
-test('maps real glab snake_case fields to camelCase', () => {
-  const [parsed] = parseOpenMergeRequests(
-    JSON.stringify([
-      {
-        iid: 59,
-        source_branch: 'fix/rgaa-lang-viewport',
-        target_branch: 'main',
-        created_at: '2026-07-28T12:11:47.229Z',
-        title: 'Draft: fix(a11y)',
-        web_url: 'https://gitlab.example.com/x/-/merge_requests/59',
-        state: 'opened',
-      },
-    ]),
-  );
-  assert.equal(parsed?.iid, 59);
-  assert.equal(parsed?.sourceBranch, 'fix/rgaa-lang-viewport');
-  assert.equal(parsed?.targetBranch, 'main');
-});
-
-test('rows missing branch fields are dropped, not fatal', () => {
-  assert.deepEqual(parseOpenMergeRequests('[{"iid":1},null,3]'), []);
-  assert.deepEqual(parseOpenMergeRequests('[]'), []);
-});
-
-test('non-array payload is fatal (would otherwise silently un-chain the round)', () => {
-  // A 401 body or garbage must NOT read as "no open MR".
-  throws(() => parseOpenMergeRequests('{"message":"401 Unauthorized"}'));
-  throws(() => parseOpenMergeRequests('not json'));
 });
 
 finish();

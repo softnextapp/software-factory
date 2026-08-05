@@ -30,24 +30,25 @@
 //   - A rejected ticket poisons everything stacked above it. Bottom-up review
 //     order is what keeps that cheap.
 //
-// Everything in this module is pure except fetchOpenMergeRequests, so the stack
-// walk can be unit-tested (chain.test.ts) without a GitLab instance.
+// Everything in this module is pure. host.ts owns the host IO — fetching the
+// open MR/PR list from glab or gh and parsing each host's JSON into the
+// `OpenMergeRequest` shape below; this module owns only the host-agnostic stack
+// walk over that shape. So the walk is unit-tested (chain.test.ts) with no CLI,
+// no network, and no GitLab or GitHub instance.
 
-import { execFileSync } from 'node:child_process';
-
-/** The subset of a GitLab MR the stack walk needs. */
+/** The subset of an open MR/PR the stack walk needs (host-agnostic). */
 export interface OpenMergeRequest {
   iid: number;
   sourceBranch: string;
   targetBranch: string;
-  /** ISO 8601, as GitLab returns it. Only ever compared, never parsed. */
+  /** ISO 8601, as the host returns it. Only ever compared, never parsed. */
   createdAt: string;
   title: string;
   webUrl: string;
 }
 
 export interface ChainResolution {
-  /** Branch to fork from AND to pass to `glab mr create --target-branch`. */
+  /** Branch to fork from AND to target the host's draft change request against. */
   base: string;
   /** True when `base` is a previous ticket's branch rather than the root. */
   chained: boolean;
@@ -138,51 +139,4 @@ function orderedPath(
     current = bySource.get(current.targetBranch);
   }
   return path;
-}
-
-/**
- * Normalise `glab mr list --output json`.
- *
- * Fail-closed on a non-array payload: the alternative is an empty stack, which
- * reads as "nothing open" and silently un-chains the round. Individual entries
- * missing the branch fields are dropped rather than fatal — GitLab keeps adding
- * MR kinds, and one odd row should not stop the loop.
- */
-export function parseOpenMergeRequests(raw: string): OpenMergeRequest[] {
-  const parsed = JSON.parse(raw) as unknown;
-  if (!Array.isArray(parsed)) {
-    throw new Error(`glab returned a non-array MR list: ${raw.slice(0, 200)}`);
-  }
-  const out: OpenMergeRequest[] = [];
-  for (const entry of parsed) {
-    if (typeof entry !== 'object' || entry === null) continue;
-    const mr = entry as Record<string, unknown>;
-    const sourceBranch = mr.source_branch;
-    const targetBranch = mr.target_branch;
-    const iid = mr.iid;
-    if (typeof sourceBranch !== 'string' || sourceBranch === '') continue;
-    if (typeof targetBranch !== 'string' || targetBranch === '') continue;
-    if (typeof iid !== 'number') continue;
-    out.push({
-      iid,
-      sourceBranch,
-      targetBranch,
-      createdAt: typeof mr.created_at === 'string' ? mr.created_at : '',
-      title: typeof mr.title === 'string' ? mr.title : '',
-      webUrl: typeof mr.web_url === 'string' ? mr.web_url : '',
-    });
-  }
-  return out;
-}
-
-/**
- * Every open MR of the current repo. `glab mr list` defaults to opened, and
- * --per-page 100 covers a stack far deeper than one anybody should review.
- */
-export function fetchOpenMergeRequests(): OpenMergeRequest[] {
-  return parseOpenMergeRequests(
-    execFileSync('glab', ['mr', 'list', '--output', 'json', '--per-page', '100'], {
-      encoding: 'utf8',
-    })
-  );
 }

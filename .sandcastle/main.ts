@@ -15,14 +15,16 @@
 //                      re-implement loop). Two *sequential* sandboxes per issue on
 //                      the same branch, because the provider env is baked at sandbox
 //                      level — see "Model profiles" below.
-//   Phase 3 (Publish): host-side `git push` + `glab mr create --draft` for every
-//                      branch that got commits. Never auto-merged (MERGE_STRATEGY=human,
-//                      the Omniris majority): a human reviews and merges.
+//   Phase 3 (Publish): host-side `git push` + a Draft MR/PR (glab or gh, via the
+//                      host module) for every branch that got commits. Never
+//                      auto-merged (MERGE_STRATEGY=human, the Omniris majority):
+//                      a human reviews and merges.
 //
-// v0.1 scope: the split regime + human-merge + GitLab shape, out of the box. The
-// Merger role (MERGE_STRATEGY=agent, ccsnoop's auto-merging 4th agent) and the GitHub
-// host (gitHost='gh') land as follow-up modules — see the guards below. Opus is just
-// another profile in config.ts and works mechanically; it is not specially tested here.
+// v0.1 scope: the split regime + human-merge + BOTH host shapes (GitLab/glab and
+// GitHub/gh), out of the box — see host.ts. The Merger role (MERGE_STRATEGY=agent,
+// ccsnoop's auto-merging 4th agent) remains a follow-up module — see the guard
+// below. Opus is just another profile in config.ts and works mechanically; it is
+// not specially tested here.
 //
 // Usage (from the repo root — promptFile and SECRETS_PATH are CWD-relative):
 //   npx tsx .sandcastle/main.ts                          # profile `split` (default)
@@ -35,7 +37,17 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import * as sandcastle from '@ai-hero/sandcastle';
 import { docker } from '@ai-hero/sandcastle/sandboxes/docker';
-import { fetchOpenMergeRequests, resolveChainedBase } from './chain.ts';
+import { resolveChainedBase } from './chain.ts';
+import {
+  createHost,
+  HOST_TERMS,
+  planQueueCommand,
+  openMrsCommand,
+  promptHostArgs,
+  inferGitHostFromUrl,
+  manualCreateHint,
+  type Host,
+} from './host.ts';
 import {
   buildMrDescription,
   buildMrTitle,
@@ -43,7 +55,6 @@ import {
   extractReviewLedger,
   type CommitInfo,
   type DiffStat,
-  type IssueInfo,
 } from './mr-body.ts';
 import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.ts';
 import { loadConfig, type Provider, type Role } from './config.ts';
@@ -83,13 +94,20 @@ type RunResult = Awaited<ReturnType<Sandbox['run']>>;
 
 const cfg = loadConfig();
 
-// v0.1 wires the GitLab host only. GitHub (gitHost='gh', ccsnoop's gh/pr-create
-// shape) is a follow-up module; failing here, loudly and early, keeps gitHost
-// truthful instead of a silent no-op on the glab code paths below.
-if (cfg.project.gitHost !== 'glab') {
+// The host module owns every glab-vs-gh difference (issue view/labels, draft MR/PR
+// creation, open-MR/PR listing, and the prompt-time command strings). main.ts never
+// spells `glab` or `gh` itself; it goes through `host` below. See host.ts.
+const host: Host = createHost(cfg.project.gitHost);
+const hostTerms = HOST_TERMS[cfg.project.gitHost];
+
+// v0.1 wires BOTH host shapes (GitLab/glab and GitHub/gh). config.ts constrains
+// gitHost to that union, so a future host added there would silently fall through
+// createHost's glab default — fail loudly here instead of no-op'ing on the host
+// code paths below, the same fence the mergeStrategy guard uses.
+if (cfg.project.gitHost !== 'glab' && cfg.project.gitHost !== 'gh') {
   throw new Error(
-    `gitHost=${cfg.project.gitHost} is reserved: v0.1 ships the GitLab (glab) host only. ` +
-      `GitHub support lands as a follow-up module. Set gitHost: 'glab' in config.ts for now.`,
+    `gitHost=${cfg.project.gitHost} is not wired. v0.1 ships the GitLab (glab) and ` +
+      `GitHub (gh) hosts only. Add the host to host.ts and this guard.`,
   );
 }
 
@@ -311,69 +329,31 @@ const copyToWorktree = ['node_modules'];
 // ---------------------------------------------------------------------------
 // Base branch resolution
 //
-// Authoritative source is the issue's GitLab labels, read here on the host — not the
-// planner's `base` field, which is only cross-checked. A base ends up as a worktree
-// fork point AND a `--target-branch`; neither should depend on an agent.
+// Authoritative source is the issue's labels, read on the host via
+// `host.labelsOf` — not the planner's `base` field, which is only cross-checked.
+// A base ends up as a worktree fork point AND the draft change request's target
+// branch; neither should depend on an agent. The host layer (host.ts) owns the
+// glab-vs-gh detail of that label read; this file just consumes `string[]`.
 // ---------------------------------------------------------------------------
 
-// execFileSync, not execSync: the issue number is interpolated into an argv slot,
-// never into a shell string.
-const labelsOf = (issueNumber: number): string[] => {
-  const raw = execFileSync(
-    'glab',
-    ['issue', 'view', String(issueNumber), '--output', 'json', '--jq', '.labels'],
-    { encoding: 'utf8' },
-  );
-  const parsed = JSON.parse(raw) as unknown;
-  if (!Array.isArray(parsed)) {
-    throw new Error(`glab returned a non-array label list for #${issueNumber}: ${raw}`);
-  }
-  return parsed.filter((label): label is string => typeof label === 'string');
-};
-
 // ---------------------------------------------------------------------------
-// MR body inputs — the host-derived half of the Draft-MR description
+// MR body inputs — the host-derived half of the Draft-MR/PR description
 //
-// These are facts about the issue and the branch, read from GitLab and git rather
-// than from an agent, so they render even when an agent says nothing useful. Each
-// collector is best-effort: a Draft MR with a thinner description is a nuisance, a
-// round that dies in Phase 3 after two agent cycles is a loss. See mr-body.ts.
+// These are facts about the issue and the branch, read from the host and git
+// rather than from an agent, so they render even when an agent says nothing
+// useful. Each collector is best-effort: a Draft MR/PR with a thinner description
+// is a nuisance, a round that dies in Phase 3 after two agent cycles is a loss.
+// `host.issueInfoOf` (host.ts) supplies the issue half; commitsOn/diffstatOf
+// below supply the git half. See mr-body.ts.
 //
-// The repo-specific half — "what do I run to see this branch work?" (Storybook, make
-// targets, etc.) and the audit command — is project context the consumer supplies by
-// editing main.ts after cloning (ADR-0002). It is omitted here on purpose: a
-// Factory-default MR body rests on the agents' own words and the derived facts, and
-// says so (see mr-body.ts's optional `testing` / `auditCommand`).
+// The repo-specific half — "what do I run to see this branch work?" (Storybook,
+// make targets, etc.) and the audit command — is project context the consumer
+// supplies by editing main.ts after cloning (ADR-0002). It is omitted here on
+// purpose: a Factory-default MR body rests on the agents' own words and the
+// derived facts, and says so (see mr-body.ts's optional `testing` / `auditCommand`).
 // ---------------------------------------------------------------------------
 
 const MR_FILE_CAP = 25;
-
-const issueInfoOf = (issueNumber: number, fallbackTitle: string): IssueInfo => {
-  try {
-    const raw = execFileSync('glab', ['issue', 'view', String(issueNumber), '--output', 'json'], {
-      encoding: 'utf8',
-    });
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const labels = Array.isArray(parsed['labels'])
-      ? parsed['labels'].filter((label): label is string => typeof label === 'string')
-      : undefined;
-    const milestone = parsed['milestone'];
-    const milestoneTitle =
-      milestone && typeof milestone === 'object' && 'title' in milestone
-        ? String((milestone as { title: unknown }).title)
-        : null;
-    return {
-      number: issueNumber,
-      title: typeof parsed['title'] === 'string' ? parsed['title'] : fallbackTitle,
-      url: typeof parsed['web_url'] === 'string' ? parsed['web_url'] : undefined,
-      labels,
-      milestone: milestoneTitle,
-    };
-  } catch (error) {
-    console.error(`  ⚠ #${issueNumber}: could not read the issue for the MR body — ${error}`);
-    return { number: issueNumber, title: fallbackTitle };
-  }
-};
 
 // Newest first, which is what buildMrTitle relies on to find the implementer's
 // (oldest) commit rather than the reviewer's (newest).
@@ -429,9 +409,9 @@ const diffstatOf = (base: string, branch: string): DiffStat => {
 };
 
 // A base must exist BOTH locally (git worktree forks from the local ref) and on
-// origin (`glab mr create --target-branch` 404s otherwise). Checked once per base per
-// run, before any sandbox is created: discovering it at publish time would mean
-// throwing away a full implement+review cycle.
+// origin (the host's draft-create `--target-branch`/`--base` 404s otherwise).
+// Checked once per base per run, before any sandbox is created: discovering it at
+// publish time would mean throwing away a full implement+review cycle.
 const verifiedBases = new Set<string>();
 const assertBaseUsable = (base: string): void => {
   if (verifiedBases.has(base)) return;
@@ -449,8 +429,9 @@ const assertBaseUsable = (base: string): void => {
     });
   } catch {
     throw new Error(
-      `Base branch \`${base}\` is not published on origin, so \`glab mr create ` +
-        `--target-branch ${base}\` would fail after a full implement+review cycle.\n` +
+      `Base branch \`${base}\` is not published on origin, so the host's ` +
+        `\`${manualCreateHint(cfg.project.gitHost, '<branch>', base)}\` would fail ` +
+        `after a full implement+review cycle.\n` +
         `  git push -u origin ${base}`,
     );
   }
@@ -505,21 +486,21 @@ const ensureLocalRef = (branch: string): void => {
 const resolveBase = (labelBase: string): string => {
   if (!cfg.run.chain || !cfg.project.chainableBases.includes(labelBase)) return labelBase;
 
-  const resolution = resolveChainedBase(fetchOpenMergeRequests(), labelBase);
+  const resolution = resolveChainedBase(host.openChangeRequests(), labelBase);
   if (!resolution.chained) {
     console.log(`  ⛓ chain: no open MR on \`${labelBase}\` — starting a new stack from it.`);
     return labelBase;
   }
 
-  console.log(`  ⛓ chain: ${resolution.stack.length} unmerged MR(s) stacked on \`${labelBase}\`:`);
+  console.log(`  ⛓ chain: ${resolution.stack.length} unmerged ${hostTerms.cr}(s) stacked on \`${labelBase}\`:`);
   for (const [index, mr] of resolution.stack.entries()) {
-    console.log(`      ${index + 1}. !${mr.iid} ${mr.sourceBranch} → ${mr.targetBranch}`);
+    console.log(`      ${index + 1}. ${hostTerms.ref}${mr.iid} ${mr.sourceBranch} → ${mr.targetBranch}`);
   }
   for (const rival of resolution.rivals) {
-    // Not an error: two MRs on one branch is a legal shape. But the loser's work is
+    // Not an error: two MRs/PRs on one branch is a legal shape. But the loser's work is
     // invisible to the ticket about to start, and that surprises people.
     console.warn(
-      `  ⚠ chain: !${rival.iid} (${rival.sourceBranch}) also builds on this stack but is ` +
+      `  ⚠ chain: ${hostTerms.ref}${rival.iid} (${rival.sourceBranch}) also builds on this stack but is ` +
         `NOT the head — its work will not be visible to this round.`,
     );
   }
@@ -536,7 +517,7 @@ const chainDryRun = (): Record<string, unknown> => {
   const bases = cfg.project.chainableBases;
   if (bases.length === 0) return { chainableBases: [] };
   try {
-    const openMrs = fetchOpenMergeRequests();
+    const openMrs = host.openChangeRequests();
     return {
       chainableBases: bases.map((root) => {
         const resolution = resolveChainedBase(openMrs, root);
@@ -544,8 +525,8 @@ const chainDryRun = (): Record<string, unknown> => {
           root,
           wouldForkFrom: resolution.base,
           chained: resolution.chained,
-          stack: resolution.stack.map((mr) => `!${mr.iid} ${mr.sourceBranch} → ${mr.targetBranch}`),
-          rivals: resolution.rivals.map((mr) => `!${mr.iid} ${mr.sourceBranch}`),
+          stack: resolution.stack.map((mr) => `${hostTerms.ref}${mr.iid} ${mr.sourceBranch} → ${mr.targetBranch}`),
+          rivals: resolution.rivals.map((mr) => `${hostTerms.ref}${mr.iid} ${mr.sourceBranch}`),
         };
       }),
     };
@@ -558,6 +539,32 @@ const chainDryRun = (): Record<string, unknown> => {
 // semantic-release) and may squash the MR title into a commit, so the title must stay
 // a valid Conventional Commit header. `ralph` repos have no such constraint.
 const titleStyle = cfg.project.commitStyle === 'conventional' ? 'conventional' : 'plain';
+
+// Best-effort host-mismatch warning: a `gitHost` that disagrees with the actual
+// `origin` remote is the most likely misconfiguration on a fresh adopt (a GitHub
+// repo cloned with the Factory's default gitHost='glab'). Surfacing it here —
+// before a real, token-burning run hits the first glab/gh call — turns a confusing
+// mid-loop failure into a one-line "set gitHost: 'gh'". Advisory only: a missing or
+// unrecognised origin emits nothing (the operator may know better than the heuristic).
+const warnHostMismatch = (): { configured: string; originHost: string | null; ok: boolean } => {
+  let originUrl: string;
+  try {
+    originUrl = execFileSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim();
+  } catch {
+    return { configured: cfg.project.gitHost, originHost: null, ok: true };
+  }
+  const originHost = inferGitHostFromUrl(originUrl);
+  const ok = originHost === null || originHost === cfg.project.gitHost;
+  if (!ok) {
+    const other = HOST_TERMS[originHost as 'glab' | 'gh'];
+    console.warn(
+      `  ⚠ gitHost is \`${cfg.project.gitHost}\` but origin points at a ${other.name} remote ` +
+        `(${originUrl}). The loop will talk to ${hostTerms.name} (${hostTerms.cli}); set ` +
+        `gitHost: '${originHost}' in config.ts if origin is the host you mean.`,
+    );
+  }
+  return { configured: cfg.project.gitHost, originHost, ok };
+};
 
 // ---------------------------------------------------------------------------
 // Dry run — validate the active profile's wiring without launching a single agent.
@@ -604,6 +611,7 @@ if (cfg.run.dryRun) {
       mergeStrategy: cfg.project.mergeStrategy,
       commitStyle: cfg.project.commitStyle,
       gitHost: cfg.project.gitHost,
+      hostMismatch: warnHostMismatch(),
       chain: cfg.run.chain
         ? { enabled: true, ...chainDryRun() }
         : { enabled: false, hint: 'SANDCASTLE_CHAIN=1 to stack MRs instead of fanning out' },
@@ -634,6 +642,10 @@ if (cfg.run.dryRun) {
 }
 
 validateTokens();
+
+// Surface a gitHost-vs-origin mismatch before any agent runs (the dry-run block
+// above ran the same check into its structured report).
+warnHostMismatch();
 
 // ---------------------------------------------------------------------------
 // Main loop
@@ -668,6 +680,10 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
       CHAIN_MODE: cfg.run.chain ? 'on' : 'off',
       ONLY: cfg.run.only === null ? 'none' : cfg.run.only.join(', '),
       FORCE: cfg.run.force ? 'on' : 'off',
+      // Host-specific queue/PR-list commands (plan-prompt.md runs them verbatim).
+      // Both emit the same normalized JSON shape, so the planner's logic is host-neutral.
+      ISSUE_QUEUE_CMD: planQueueCommand(cfg.project.gitHost),
+      OPEN_MRS_CMD: openMrsCommand(cfg.project.gitHost),
     },
   });
 
@@ -725,7 +741,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
   // Resolve + validate every base before any sandbox is created, so an unpublished
   // base stops the round here rather than after two agent cycles.
   const issues = planned.map((issue) => {
-    const labelBase = baseForLabels(labelsOf(issue.number), cfg.project.labelBases, cfg.project.baseBranch);
+    const labelBase = baseForLabels(host.labelsOf(issue.number), cfg.project.labelBases, cfg.project.baseBranch);
     if (issue.base !== undefined && issue.base !== labelBase) {
       console.warn(
         `  ⚠ #${issue.number}: planner said base \`${issue.base}\`, labels say \`${labelBase}\` — using the labels.`,
@@ -791,6 +807,9 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         // Drives the commit-subject format in the implement/review prompts: 'ralph'
         // (RALPH:-prefixed subjects) vs 'conventional' (type(scope): …, commitlint-safe).
         COMMIT_STYLE: cfg.project.commitStyle,
+        // Host verbs the prompts compose to view / unlabel / comment on the issue
+        // (glab vs gh differ past the binary). See promptHostArgs() in host.ts.
+        ...promptHostArgs(cfg.project.gitHost),
       };
       await acquire();
       try {
@@ -900,21 +919,22 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
   // Phase 3: Publish (host-side) — push + Draft MR per completed branch.
   //
   // main.ts runs on the host and branch commits live in the bind-mounted .git, so we
-  // push + open a Draft MR from here (host git/glab are already authed). Never
-  // auto-merged (MERGE_STRATEGY=human) — a human reviews and merges. We do NOT use
-  // `glab --fill` (it would push the host's *current* branch, not the worktree branch).
+  // push + open a Draft MR/PR from here (host git + the host CLI are already authed).
+  // Never auto-merged (MERGE_STRATEGY=human) — a human reviews and merges. We do NOT
+  // let the host CLI push (it would push the host's *current* branch, not the worktree
+  // branch); we push the worktree branch ourselves, then ask the host to open the MR/PR.
   // -------------------------------------------------------------------------
-  // Everything here goes through argv (execFileSync), never a shell string: `branch`,
-  // `mrTitle` and `mrDesc` are agent-authored — the branch comes from the planner's
-  // JSON, the title and body from the implementer's and reviewer's own words. plan.ts
-  // constrains the branch shape, but the title and the description are free text
-  // (multi-line markdown, backticks, quotes) and quoting that by hand is how
-  // injections happen.
+  // Everything here goes through argv (execFileSync / host.createDraftChangeRequest),
+  // never a shell string: `branch`, `mrTitle` and `mrDesc` are agent-authored — the
+  // branch comes from the planner's JSON, the title and body from the implementer's
+  // and reviewer's own words. plan.ts constrains the branch shape, but the title and
+  // the description are free text (multi-line markdown, backticks, quotes) and quoting
+  // that by hand is how injections happen.
   //
-  // Per-branch try/catch: a transient `git push` or `glab` failure on one branch must
-  // not skip the branches after it, and must not end the run. Their work is committed
-  // and their MR can be opened by hand — losing the report of what happened is the
-  // expensive part.
+  // Per-branch try/catch: a transient `git push` or host-CLI failure on one branch
+  // must not skip the branches after it, and must not end the run. Their work is
+  // committed and their MR/PR can be opened by hand — losing the report of what
+  // happened is the expensive part.
   for (const { issue, branch, implStdout, reviewStdout, reviewed, logs } of completed) {
     console.log(`\nPublishing #${issue.number} → ${branch} (target ${issue.base})`);
     try {
@@ -922,15 +942,15 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
 
       // Title and description are built here, not left to `git log -1` and a constant:
       // the reviewer's cost is dominated by reconstructing intent, and the run already
-      // knows it. Agent-authored halves ride in on stdout; the rest is read from
-      // GitLab and git. A mute or malformed agent block degrades the body and is
+      // knows it. Agent-authored halves ride in on stdout; the rest is read from the
+      // host and git. A mute or malformed agent block degrades the body and is
       // REPORTED in it — never fails the publish. See mr-body.ts.
       const { summary, error: summaryError } = extractMrSummary(implStdout);
       if (summaryError) {
         console.error(`  ⚠ #${issue.number}: ${summaryError} — MR body will say so.`);
       }
       const commits = commitsOn(issue.base, branch);
-      const issueInfo = issueInfoOf(issue.number, issue.title);
+      const issueInfo = host.issueInfoOf(issue.number, issue.title);
       const mrTitle = buildMrTitle({
         style: titleStyle,
         issue: { number: issue.number, title: issue.title },
@@ -958,30 +978,21 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           logs,
         },
       });
-      const mrArgs = [
-        'mr',
-        'create',
-        '--source-branch',
-        branch,
-        '--target-branch',
-        issue.base,
-        '--draft',
-        '--yes',
-        '--no-editor',
-        '--title',
-        mrTitle,
-        '--description',
-        mrDesc,
-      ];
-      // glab wants a username; null ⇒ leave the MR unassigned (host default).
-      if (cfg.project.assignee) mrArgs.push('--assignee', cfg.project.assignee);
-      execFileSync('glab', mrArgs, { stdio: 'inherit' });
+      // Open the Draft MR/PR through the host layer — glab mr create / gh pr create,
+      // argv only. assignee null ⇒ leave it unassigned (host default).
+      host.createDraftChangeRequest({
+        sourceBranch: branch,
+        targetBranch: issue.base,
+        title: mrTitle,
+        description: mrDesc,
+        assignee: cfg.project.assignee,
+      });
     } catch (error) {
       console.error(
         `  ✗ #${issue.number}: publish failed for \`${branch}\` — the commits are on the ` +
-          `branch, open the MR by hand:\n` +
-          `    git push -u origin ${branch} && glab mr create --source-branch ${branch} ` +
-          `--target-branch ${issue.base} --draft\n    ${String(error)}`,
+          `${hostTerms.cr} by hand:\n` +
+          `    git push -u origin ${branch} && ${manualCreateHint(cfg.project.gitHost, branch, issue.base)}\n` +
+          `    ${String(error)}`,
       );
     }
   }

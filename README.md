@@ -20,8 +20,9 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/config.ts` | The canonical config surface — `RunConfig` × `ProjectConfig` → `FactoryConfig`. |
 | `.sandcastle/main.ts` | The **Orchestration**: the converged `plan → implement+review → publish` loop. |
 | `.sandcastle/plan.ts` | Parses the planner's `<plan>` JSON; label → base resolution. |
-| `.sandcastle/chain.ts` | Chained-MR base resolution. |
-| `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/GitLab facts. |
+| `.sandcastle/chain.ts` | Chained-MR base resolution — the pure, host-agnostic stack walk. |
+| `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, and the prompt-time command strings). |
+| `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts. |
 | `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
 | `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |
@@ -43,8 +44,9 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
    **Implementer** then a **Reviewer** that fixes *in place* (edits + commits
    directly on the branch — no verdict loop). Two *sequential* sandboxes on the
    same branch, because the provider env is baked at sandbox level.
-3. **Publish** — host-side `git push` + `glab mr create --draft` for every branch
-   that got commits. **Never auto-merged** (`MERGE_STRATEGY=human`): a human
+3. **Publish** — host-side `git push` + a Draft MR/PR (`glab mr create` or `gh pr
+   create`, via `host.ts`) for every branch that got commits. **Never auto-merged**
+   (`MERGE_STRATEGY=human`): a human
    reviews and merges.
 
 The **Agent roles** are Planner, Implementer, Reviewer — plus an optional Merger
@@ -72,7 +74,7 @@ recent.
 | **Node.js** | ≥ 22 LTS | Runs the Engine and `tsx`; matches the `node:22-bookworm` base image. |
 | **Docker or Podman** | recent (Docker tested 29.x) | The sandbox container runtime. `main.ts` drives the Engine's `docker()` in v0.1; Podman is also Engine-supported and a follow-up to wire. |
 | **git** | any modern | Clone the Factory / your repo; Phase 3 pushes feature branches. |
-| **glab** | ≥ 1.107 | The v0.1 host: Phase 3 runs `glab mr create --draft` **host-side**. (`gh` is fenced.) |
+| **glab** *or* **gh** | glab ≥ 1.107 / gh ≥ 2.40 | The host CLI: Phase 3 opens the Draft MR/PR **host-side**. Install the one matching your `gitHost` (`glab` for GitLab, `gh` for GitHub). |
 
 ### Setup
 
@@ -81,11 +83,10 @@ recent.
 git clone <this-repo> my-project && cd my-project && rm -rf .git && git init
 
 # 2. Point it at your repo and seed the trunk. `rm -rf .git` wiped the remote AND the
-#    history, so add `origin` back (at the configured host — GitLab in v0.1, since glab
-#    is the only host wired), make the initial commit on `main` (the Factory's default
-#    base branch), and publish it. Phase 3 (`git push -u origin`) and the startup
-#    base-branch check both need an `origin` with your trunk on it — without this step
-#    both fail, silently, at the first run.
+#    history, so add `origin` back (at your host — GitLab or GitHub), make the initial
+#    commit on `main` (the Factory's default base branch), and publish it. Phase 3
+#    (`git push -u origin`) and the startup base-branch check both need an `origin`
+#    with your trunk on it — without this step both fail, silently, at the first run.
 git remote add origin <your-repo-url>
 git add -A && git commit -m "Initial commit from Software Factory"
 git branch -M main
@@ -94,8 +95,10 @@ git push -u origin main
 # 3. Install — this pulls the Engine (@ai-hero/sandcastle, pinned).
 npm install
 
-# 4. Authenticate against your GitLab (glab is the only host wired in v0.1).
-glab auth login
+# 4. Authenticate against your host (GitLab or GitHub). Then set `gitHost` in
+#    config.ts to match — the default is 'glab'; a GitHub repo sets 'gh'. The loop
+#    warns at startup if gitHost disagrees with the `origin` remote's host.
+glab auth login   # or: gh auth login
 
 # 5. Provide auth tokens — env-first (preferred) or a secrets file. See "Auth token isolation" below.
 #    Plug-and-play: export the two tokens in your shell profile (~/.bashrc) and skip the file.
@@ -262,11 +265,11 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 | `profiles` | `Profiles` | see below | Per-profile role → provider bindings. |
 | `mergeStrategy` | `'agent' \| 'human'` | `'human'` | Who merges. `human` = Draft MRs await review (v0.1). `agent` = a Merger auto-merges (fenced). |
 | `commitStyle` | `'ralph' \| 'conventional'` | `'ralph'` | MR title style. `conventional` keeps titles valid Conventional Commit headers. |
-| `gitHost` | `'gh' \| 'glab'` | `'glab'` | Host integration. v0.1 ships `glab` only; `gh` is fenced. |
+| `gitHost` | `'gh' \| 'glab'` | `'glab'` | Host integration (`gh` = GitHub, `glab` = GitLab). Both are wired in v0.1 — see `host.ts`. |
 | `baseBranch` | `string` | `'main'` | The project trunk. |
 | `labelBases` | `Record<string,string>` | `{}` | Issue label → base branch. Empty ⇒ every issue forks from `baseBranch`. |
 | `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Empty ⇒ chaining is inert even with `SANDCASTLE_CHAIN=1`. |
-| `assignee` | `string \| null` | `null` | glab `--assignee` username. `null` ⇒ leave the MR unassigned. |
+| `assignee` | `string \| null` | `null` | Host assignee. glab wants a username; gh accepts `@me`. `null` ⇒ leave the MR/PR unassigned. |
 
 A **provider** is the quadruplet `{ model, baseUrl, tokenKey, effort }`:
 
@@ -293,9 +296,10 @@ profiles: {
 }
 ```
 
-A consumer on GitHub with agent-merge (the ccsnoop shape) overrides `gitHost: 'gh'`,
-`mergeStrategy: 'agent'`, and adds a `merger` binding to each profile (see
-`config.test.ts`) — both overrides are **fenced** in v0.1 until their modules land.
+A consumer on GitHub sets `gitHost: 'gh'` (the GitHub host ships in v0.1 — see
+`host.ts`). The ccsnoop shape adds agent-merge: `mergeStrategy: 'agent'` plus a
+`merger` binding on each profile (see `config.test.ts`) — **that** override is still
+fenced in v0.1 until the Merger module lands.
 
 ### Modes
 
@@ -380,23 +384,26 @@ alternatives in ADR-0005.
 
 ## v0.1 scope
 
-**Served out of the box:** the **Split** profile + **human-merge** (`glab mr create
---draft`) + the **GitLab** (`glab`) host. This is the Omniris majority shape.
+**Served out of the box:** the **Split** profile + **human-merge** (draft MR/PR,
+awaiting review) + **both** host shapes — **GitLab** (`glab`) and **GitHub** (`gh`),
+via `host.ts`. The GitLab shape is the default (the Omniris majority); a GitHub
+project flips `gitHost: 'gh'` in `config.ts`.
 
-**Fenced with loud, early guards** (they throw at startup, not silently no-op):
+**Fenced with a loud, early guard** (it throws at startup, not silently no-op):
 
 | Capability | Guard | Status |
 |---|---|---|
-| `gitHost: 'gh'` (GitHub / `gh pr create`) | `main.ts` throws if `gitHost !== 'glab'` | Follow-up module. |
 | `mergeStrategy: 'agent'` (the auto-merging Merger role) | `main.ts` throws if `mergeStrategy !== 'human'` | Follow-up module. |
 
+`gitHost: 'gh'` is **no longer fenced** — the GitHub host landed in `host.ts`, and the
+loop warns at startup when `gitHost` disagrees with the `origin` remote's host.
 `SANDCASTLE_PROFILE=opus` is **not fenced**; it works but is not specially tested (see
 [Modes](#modes)).
 
 ## Developing
 
 ```sh
-npm test          # config + tokens + plan + chain + skills-lock + dockerfile-base + adopt + esm-shim contract tests (147 cases)
+npm test          # config + tokens + plan + chain + host + skills-lock + dockerfile-base + adopt + esm-shim contract tests
 npm run typecheck # tsc --noEmit over .sandcastle/
 npm run skills:check  # verify .claude/skills/ against skills-lock.json
 npm run image:check   # verify .sandcastle/Dockerfile.base against the universal-runtime contract
