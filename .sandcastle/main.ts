@@ -47,6 +47,14 @@ import {
 } from './mr-body.ts';
 import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.ts';
 import { loadConfig, type Provider, type Role } from './config.ts';
+import {
+  parseEnvFile,
+  resolveToken,
+  resolveTokens,
+  tokenStatus,
+  assertNoTokenKeyInDotEnv,
+  type ResolvedToken,
+} from './tokens.ts';
 
 type Sandbox = Awaited<ReturnType<typeof sandcastle.createSandbox>>;
 type RunResult = Awaited<ReturnType<Sandbox['run']>>;
@@ -110,65 +118,68 @@ const ALLOWED_BASES: readonly string[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Auth-token isolation
+// Auth-token isolation (env-first)
 //
-// sandcastle's resolveEnv merges ALL of .sandcastle/.env into every sandbox, and
-// docker({ env }) can only ADD keys, never remove them. Two auth tokens in .env
-// would both leak into every sandbox → claude-code picks whichever it prefers and
-// sends it to the wrong base URL → 401. So .env keeps only what every agent needs,
-// and the auth tokens live in .env.secrets — gitignored, never read by resolveEnv,
-// and baked one-per-sandbox below.
+// A required token resolves as process.env[key] ?? .env.secrets[key] — environment
+// FIRST, the gitignored .sandcastle/.env.secrets file as fallback. A consumer who
+// exports the two tokens once in their shell profile (~/.bashrc) can therefore run
+// any Factory instance with NO per-instance secret file (plug-and-play). The pure
+// precedence lives in tokens.ts; this file does the file IO, masking, and logging.
 //
-// Path is CWD-relative like the promptFile paths: the loop is always run from inside
-// the repo (`cd <repo> && npx tsx .sandcastle/main.ts`).
+// Why tokens stay out of .env (unchanged by env-first): sandcastle's resolveEnv
+// merges ALL of .sandcastle/.env into every sandbox, and docker({ env }) can only
+// ADD keys, never remove them. Two auth tokens in .env would both leak into every
+// sandbox → claude-code picks whichever it prefers and sends it to the wrong base
+// URL → 401. Env-first puts real tokens in process.env; combined with resolveEnv's
+// per-key fallback to process.env, a token key accidentally placed in .env would
+// leak the same way. So a startup guard below throws if .env declares any active
+// provider's tokenKey, and the per-instance file is .env.secrets — gitignored,
+// never read by resolveEnv, baked one-per-sandbox.
+//
+// Paths are CWD-relative like the promptFile paths: the loop is always run from
+// inside the repo (`cd <repo> && npx tsx .sandcastle/main.ts`).
 // ---------------------------------------------------------------------------
 
 const SECRETS_PATH = path.join(process.cwd(), '.sandcastle', '.env.secrets');
+const DOTENV_PATH = path.join(process.cwd(), '.sandcastle', '.env');
 
+// .env.secrets is OPTIONAL under env-first: tokens may come entirely from the
+// environment. A missing file → empty record, and validateTokens()/need() decide
+// whether a required token is actually missing (neither env nor file sets it).
 function loadSecrets(dryRun: boolean): Record<string, string> {
   let raw: string;
   try {
     raw = readFileSync(SECRETS_PATH, 'utf8');
   } catch {
-    // A dry run is exactly what you reach for on a fresh checkout, before the secrets
-    // file exists: crashing here would hide everything else it checks (profile wiring,
-    // base branches). It reports the tokens as <MISSING> instead.
     if (dryRun) {
-      console.warn(`[dryrun] no ${SECRETS_PATH} yet — tokens will report as <MISSING>.`);
-      return {};
+      console.warn(
+        `[dryrun] no ${SECRETS_PATH} — tokens resolve from the environment or report <MISSING>.`,
+      );
     }
-    throw new Error(
-      `Missing ${SECRETS_PATH}. Create it from .env.secrets.example with the auth tokens ` +
-        `the active profile's providers need.\n` +
-        'Auth tokens must NOT live in .sandcastle/.env — resolveEnv merges all of .env into ' +
-        'every sandbox, so two tokens there leak to every sandbox → 401.',
-    );
+    return {};
   }
-  const secrets: Record<string, string> = {};
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '' || trimmed.startsWith('#')) continue;
-    const separator = trimmed.indexOf('=');
-    if (separator === -1) continue;
-    const key = trimmed.slice(0, separator).trim();
-    let value = trimmed.slice(separator + 1).trim();
-    const first = value[0];
-    if (value.length >= 2 && (first === '"' || first === "'") && value.endsWith(first)) {
-      value = value.slice(1, -1);
-    }
-    secrets[key] = value;
-  }
-  return secrets;
+  return parseEnvFile(raw);
 }
 
 const secrets = loadSecrets(cfg.run.dryRun);
 
+// Bind the two token sources (env-first) once. Every lookup below goes through one of
+// these so call sites don't repeat (process.env, secrets) and the precedence lives in
+// exactly one place — the pure resolveToken/resolveTokens in tokens.ts.
+const resolveKey = (key: string): ResolvedToken => resolveToken(key, process.env, secrets);
+const resolveKeys = (keys: readonly string[]): ResolvedToken[] => resolveTokens(keys, process.env, secrets);
+
+// need() routes through resolveToken so a token present in the environment satisfies
+// a role even when .env.secrets omits it. Throws on MISSING (neither env nor file).
 const need = (key: string): string => {
-  const value = secrets[key];
-  if (value === undefined || value === '') {
-    throw new Error(`Profile \`${cfg.run.profile}\` requires ${key}, missing in ${SECRETS_PATH}.`);
+  const t = resolveKey(key);
+  if (t.source === 'MISSING') {
+    throw new Error(
+      `Profile \`${cfg.run.profile}\` requires ${key}, but it is not set in the environment ` +
+        `or in ${SECRETS_PATH}.`,
+    );
   }
-  return value;
+  return t.value;
 };
 
 // Distinct providers bound to the active profile's roles. Only these tokens are
@@ -176,9 +187,62 @@ const need = (key: string): string => {
 const requiredProviders: readonly string[] = [
   ...new Set(cfg.roles.map((role) => cfg.activeProfile[role]).filter((n): n is string => typeof n === 'string')),
 ];
+const requiredTokenKeys: readonly string[] = [
+  ...new Set(requiredProviders.map((name) => cfg.project.providers[name].tokenKey)),
+];
 
+// .env token-key guard (startup fence, like gitHost / mergeStrategy above). A token
+// key in .env leaks into every sandbox under env-first → 401; fail loudly before any
+// agent runs. No .env file → nothing to guard. See tokens.ts.
+{
+  let dotEnvRaw: string | undefined;
+  try {
+    dotEnvRaw = readFileSync(DOTENV_PATH, 'utf8');
+  } catch {
+    // No .env — the common case on a fresh checkout.
+  }
+  if (dotEnvRaw !== undefined) assertNoTokenKeyInDotEnv(dotEnvRaw, requiredTokenKeys);
+}
+
+// Warn when a token is set in BOTH the environment and .env.secrets with different
+// values — env still wins; this just surfaces "why is it using the wrong token".
+// Shared by reportTokens (startup) and the dry-run block so the wording is identical.
+const warnConflicts = (resolved: readonly ResolvedToken[]): void => {
+  for (const t of resolved) {
+    if (t.conflict) {
+      console.warn(
+        `  ⚠ ${t.key} is set in both the environment and ${SECRETS_PATH} with different ` +
+          `values — using the environment value.`,
+      );
+    }
+  }
+};
+
+// Startup report: resolve every required token env-first, print each one's source
+// (env / .env.secrets / MISSING) with the value masked, and warn on env-vs-file
+// conflicts. No throw — validateTokens() throws on MISSING after this returns. The
+// dry-run block builds its own structured report but reuses warnConflicts() so the
+// conflict wording stays identical across modes.
+const reportTokens = (): ResolvedToken[] => {
+  const resolved = resolveKeys(requiredTokenKeys);
+  for (const t of resolved) {
+    const status = tokenStatus(t);
+    console.log(`  • ${t.key}: ${status.source} (${status.value})`);
+  }
+  warnConflicts(resolved);
+  return resolved;
+};
+
+// Startup validation: report, then fail if any required token resolves to MISSING.
 const validateTokens = (): void => {
-  for (const name of requiredProviders) need(cfg.project.providers[name].tokenKey);
+  const resolved = reportTokens();
+  const missing = resolved.filter((t) => t.source === 'MISSING');
+  if (missing.length > 0) {
+    throw new Error(
+      `Profile \`${cfg.run.profile}\` requires ${missing.map((m) => m.key).join(', ')} — ` +
+        `not set in the environment or in ${SECRETS_PATH}.`,
+    );
+  }
 };
 
 // Per-sandbox provider env, baked on docker({ env }) — layered ON TOP of resolvedEnv.
@@ -499,14 +563,19 @@ const titleStyle = cfg.project.commitStyle === 'conventional' ? 'conventional' :
 // Dry run — validate the active profile's wiring without launching a single agent.
 //   SANDCASTLE_DRYRUN=1 npx tsx .sandcastle/main.ts
 // Prints, per role, the exact env object buildEnv() bakes into the sandbox (token
-// masked) — not a hand-written copy of it.
-// Note: this only checks .env.secrets. It cannot see .sandcastle/.env, so it will NOT
-// catch a leftover CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL in
-// there — which is exactly what would 401 the impl sandbox. It DOES check that every
-// configured base branch is usable, since that is cheap and local.
+// masked) — not a hand-written copy of it. Tokens resolve env-first, so each
+// required token reports its SOURCE (env / .env.secrets / MISSING), and a
+// fresh-checkout dry run with the tokens exported in the shell reports env without
+// needing .env.secrets. The .env token-key guard above has already run, so an
+// active tokenKey accidentally placed in .env stops the dry run here too. It DOES
+// check that every configured base branch is usable, since that is cheap and local.
 // ---------------------------------------------------------------------------
 if (cfg.run.dryRun) {
-  console.log('[dryrun] Factory config (does NOT validate .sandcastle/.env):');
+  // Resolve once: feed the structured report below and warn on env-vs-file conflicts
+  // (same warnConflicts() the startup report uses).
+  const resolvedTokens = resolveKeys(requiredTokenKeys);
+  warnConflicts(resolvedTokens);
+  console.log('[dryrun] Factory config:');
   // console.dir with depth null: console.log collapses past depth 2 and would print
   // the per-role env as [Object], defeating the point.
   console.dir(
@@ -515,25 +584,21 @@ if (cfg.run.dryRun) {
       roles: Object.fromEntries(
         cfg.roles.map((role) => {
           const provider = cfg.providerFor(role);
+          const resolved = resolveKey(provider.tokenKey);
           return [
             role,
             {
               provider: cfg.activeProfile[role],
               model: modelFor(role),
               effort: effortFor(role),
-              // Stand-in reports presence, so a role whose token is missing does not
-              // print a healthy-looking env.
-              env: buildEnv(provider, secrets[provider.tokenKey] ? '<set>' : '<MISSING>'),
+              // Stand-in reports the resolved source, so a role whose token is missing
+              // does not print a healthy-looking env.
+              env: buildEnv(provider, resolved.source === 'MISSING' ? '<MISSING>' : '<set>'),
             },
           ];
         }),
       ),
-      requiredTokens: Object.fromEntries(
-        requiredProviders.map((name) => {
-          const key = cfg.project.providers[name].tokenKey;
-          return [key, secrets[key] ? '<set>' : '<MISSING>'];
-        }),
-      ),
+      requiredTokens: Object.fromEntries(resolvedTokens.map((t) => [t.key, tokenStatus(t)])),
       maxIterations: cfg.run.maxIterations,
       maxParallel: cfg.effectiveMaxParallel,
       mergeStrategy: cfg.project.mergeStrategy,

@@ -67,8 +67,9 @@ npm install
 # 3. Authenticate against your GitLab (glab is the only host wired in v0.1).
 glab auth login
 
-# 4. Create the secrets file from the shipped example — see "Auth token isolation" below.
-cp .sandcastle/.env.secrets.example .sandcastle/.env.secrets
+# 4. Provide auth tokens — env-first (preferred) or a secrets file. See "Auth token isolation" below.
+#    Plug-and-play: export the two tokens in your shell profile (~/.bashrc) and skip the file.
+cp .sandcastle/.env.secrets.example .sandcastle/.env.secrets   # optional fallback
 $EDITOR .sandcastle/.env.secrets
 
 # 5. (Optional, recommended) Configure your project identity — see below.
@@ -93,7 +94,7 @@ npx tsx .sandcastle/main.ts
 > # before the first run.
 > cp templates/CLAUDE.md ./CLAUDE.md
 > cp templates/CONTEXT.md ./CONTEXT.md      # domain glossary (delete if you have none yet)
-> cp .sandcastle/.env.secrets.example .sandcastle/.env.secrets   # then add the tokens
+> cp .sandcastle/.env.secrets.example .sandcastle/.env.secrets   # optional — or export the tokens in your shell
 > ```
 
 ## Configuration reference
@@ -180,18 +181,34 @@ and a sandbox env can only *add* keys, never remove them. Two auth tokens in `.e
 would both leak into every sandbox → claude-code sends the wrong token to the wrong
 base URL → **401**.
 
-So the Factory keeps **auth tokens out of `.env`**, in a separate gitignored file
-`.sandcastle/.env.secrets`, read only by `main.ts` and baked one-per-sandbox:
+So the Factory keeps **auth tokens out of `.env`**, resolving each one **env-first**:
+`process.env[key] ?? .sandcastle/.env.secrets[key]`. Export the tokens once in your
+shell profile and any Factory instance runs with **no per-instance secret file**
+(plug-and-play):
 
 ```sh
-# .sandcastle/.env.secrets  (gitignored — never committed)
+# ~/.bashrc (or ~/.zshrc) — export once, reuse across every Factory instance
+export ANTHROPIC_AUTH_TOKEN=...      # the z.ai / GLM token (provider "zai")
+export CLAUDE_CODE_OAUTH_TOKEN=...   # the Anthropic token (provider "anthropic")
+```
+
+The gitignored `.sandcastle/.env.secrets` file is the **fallback** for machines where
+you'd rather not export the tokens in the shell — same keys, read only by `main.ts`
+and baked one-per-sandbox, optional when the env vars above are set:
+
+```sh
+# .sandcastle/.env.secrets  (gitignored — never committed; optional when exported above)
 ANTHROPIC_AUTH_TOKEN=...      # the z.ai / GLM token (provider "zai")
 CLAUDE_CODE_OAUTH_TOKEN=...   # the Anthropic token (provider "anthropic")
 ```
 
-Only the tokens the **active profile's** providers need are required; `main.ts`
-validates them at startup, not at the first sandbox. `.env` keeps only what *every*
-agent needs.
+`main.ts` resolves each required token env-first, prints its **source** at startup and
+in `SANDCASTLE_DRYRUN` (`env` / `.env.secrets` / `MISSING`, value masked — never the
+token itself), warns when the env and the file carry *different* values (the env value
+wins), and **throws at startup if `.sandcastle/.env` declares any active provider's
+`tokenKey`** — the exact leak the `.env` / `.env.secrets` split exists to stop. Only
+the tokens the **active profile's** providers need are required; `.env` keeps only what
+*every* agent needs.
 
 ## Vendored skills
 
@@ -245,7 +262,7 @@ alternatives in ADR-0005.
 ## Developing
 
 ```sh
-npm test          # config + plan + chain + skills-lock contract tests (59 cases)
+npm test          # config + tokens + plan + chain + skills-lock contract tests (84 cases)
 npm run typecheck # tsc --noEmit over .sandcastle/
 npm run skills:check  # verify .claude/skills/ against skills-lock.json
 ```
