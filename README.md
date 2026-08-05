@@ -80,27 +80,38 @@ recent.
 # 1. Clone (or use as a GitHub template) and make it yours.
 git clone <this-repo> my-project && cd my-project && rm -rf .git && git init
 
-# 2. Install — this pulls the Engine (@ai-hero/sandcastle, pinned).
+# 2. Point it at your repo and seed the trunk. `rm -rf .git` wiped the remote AND the
+#    history, so add `origin` back (at the configured host — GitLab in v0.1, since glab
+#    is the only host wired), make the initial commit on `main` (the Factory's default
+#    base branch), and publish it. Phase 3 (`git push -u origin`) and the startup
+#    base-branch check both need an `origin` with your trunk on it — without this step
+#    both fail, silently, at the first run.
+git remote add origin <your-repo-url>
+git add -A && git commit -m "Initial commit from Software Factory"
+git branch -M main
+git push -u origin main
+
+# 3. Install — this pulls the Engine (@ai-hero/sandcastle, pinned).
 npm install
 
-# 3. Authenticate against your GitLab (glab is the only host wired in v0.1).
+# 4. Authenticate against your GitLab (glab is the only host wired in v0.1).
 glab auth login
 
-# 4. Provide auth tokens — env-first (preferred) or a secrets file. See "Auth token isolation" below.
+# 5. Provide auth tokens — env-first (preferred) or a secrets file. See "Auth token isolation" below.
 #    Plug-and-play: export the two tokens in your shell profile (~/.bashrc) and skip the file.
 cp .sandcastle/.env.secrets.example .sandcastle/.env.secrets   # optional fallback
 $EDITOR .sandcastle/.env.secrets
 
-# 5. (Optional, recommended) Configure your project identity — see below.
+# 6. (Optional, recommended) Configure your project identity — see below.
 $EDITOR .sandcastle/config.ts
 
-# 6. Dry-run first: prints the resolved wiring and validates base branches, launches nothing.
+# 7. Dry-run first: prints the resolved wiring and validates base branches, launches nothing.
 #    Needs no sandbox image and exits 0 even with both tokens MISSING — a fresh clone is green here.
 SANDCASTLE_DRYRUN=1 npx tsx .sandcastle/main.ts
 
-# 7. Build the sandbox image — see "Sandbox image" below (required before a real run, not for the dry-run).
+# 8. Build the sandbox image — see "Sandbox image" below (required before a real run, not for the dry-run).
 
-# 8. Run the loop.
+# 9. Run the loop.
 npx tsx .sandcastle/main.ts
 ```
 
@@ -137,7 +148,9 @@ It does four things, none of which touch the consumer's tracked `.gitignore`:
    config stays untracked without editing your committed `.gitignore`.
 
 After adopting, fill in the project-context skeletons (they ship in the Factory's
-`templates/`, not in the copy) and continue from [Setup](#setup) step 5:
+`templates/`, not in the copy) and then follow [Setup](#setup) from the **Authenticate**
+step onward (the adopt path already installed the runtime and your existing repo already
+has its `origin` — so steps 1-3 above do not apply):
 
 ```sh
 cp templates/CLAUDE.md  /path/to/your-repo/CLAUDE.md
