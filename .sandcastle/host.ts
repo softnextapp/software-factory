@@ -24,7 +24,7 @@
 // argv builders and parsers are unit-tested (host.test.ts) with no CLI / no
 // network — exactly the seam chain.ts established.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import type { GitHost } from './config.ts';
 import { type OpenMergeRequest } from './chain.ts';
 import type { IssueInfo } from './mr-body.ts';
@@ -308,6 +308,66 @@ export function manualCreateHint(host: GitHost, sourceBranch: string, targetBran
 }
 
 // ---------------------------------------------------------------------------
+// Draft change-request OUTPUT (issue #21)
+//
+// `gh pr create` (and, defensively, `glab mr create`) prints the new MR/PR URL to
+// stdout but ALSO emits, to stderr, a line like "Warning: 2 uncommitted changes".
+// That warning is about the HOST working tree — the consumer's main checkout that
+// main.ts runs from, which carries the adopt-time `@ai-hero/sandcastle` runtime dep
+// in `package.json`/lockfile and is therefore never clean. It is NEVER about the
+// agent's work: the implementer committed to the worktree branch and Phase 3 pushed
+// it before this call, so the agent's changes are already on the remote branch, not
+// sitting uncommitted in the host tree. Printed bare between `git push` and the PR
+// URL, it reads exactly like "the implementer left work behind" — the same cosmetic
+// noise #20 was filed for, but a different cause (#20 traced it to the agent
+// worktree's `.pnpm-store/`; the live captable run pinned it here, on gh).
+//
+// So the publish phase CAPTURES the host CLI's output instead of inheriting its
+// stdio, drops that one misleading line, and prints the URL + any real stderr (auth
+// errors, other warnings) verbatim. The filter is surgical — only the exact host-tree
+// uncommitted-changes warning is removed, never stderr at large (acceptance #2: a
+// genuine signal still surfaces). Pure, unit-tested in host.test.ts.
+// ---------------------------------------------------------------------------
+
+/** Matches gh's "Warning: N uncommitted changes" — the host-tree false positive we drop. */
+const UNCOMMITTED_CHANGES_WARNING = /^\s*warning:\s+\d+\s+uncommitted\s+change/i;
+
+/** True for the host-tree "Warning: N uncommitted changes" line only (real signal is left alone). */
+export function isUncommittedChangesWarning(line: string): boolean {
+  return UNCOMMITTED_CHANGES_WARNING.test(line);
+}
+
+/** Remove the uncommitted-changes warning line(s) from a stream, leaving every other line. */
+function dropUncommittedChangesWarning(text: string): string {
+  return text
+    .split('\n')
+    .filter((line) => !isUncommittedChangesWarning(line))
+    .join('\n');
+}
+
+/** The host CLI's `create` output, classified for the publish phase. */
+export interface DraftCreateOutput {
+  /** Stdout with the warning line removed — the MR/PR URL rides here (printed verbatim). */
+  readonly out: string;
+  /** Filtered stderr — the warning line removed, trimmed. Real signal; surfaced if non-empty. */
+  readonly advisory: string;
+}
+
+/**
+ * Split captured `gh pr create` / `glab mr create` output into the success output
+ * (printed — the URL) and advisory stderr (surfaced unless empty). The host-tree
+ * "Warning: N uncommitted changes" line is dropped from BOTH streams; every other
+ * line — the URL, "Creating pull request for …", a DIFFERENT warning, an auth error
+ * — is preserved. Pure: no CLI, no process, unit-tested in host.test.ts.
+ */
+export function classifyDraftCreateOutput(stdout: string, stderr: string): DraftCreateOutput {
+  return {
+    out: dropUncommittedChangesWarning(stdout),
+    advisory: dropUncommittedChangesWarning(stderr).trim(),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Open MR / PR list (for chained-base resolution — see chain.ts)
 // ---------------------------------------------------------------------------
 
@@ -524,10 +584,35 @@ export function inferGitHostFromUrl(url: string): GitHost | null {
   return null;
 }
 
+/**
+ * Run a host CLI's draft-MR/PR `create`, CAPTURING its output (not inheriting
+ * stdio) so the publish phase can drop the host-tree "Warning: N uncommitted
+ * changes" false positive and print the URL + real stderr itself (issue #21).
+ * Throws on non-zero exit with the CLI's stderr in the message, so main.ts's
+ * per-branch catch renders the manual-create hint with useful diagnostics — the
+ * same shape `execFileSync`'s exception gave before this captured the stream.
+ * The `\`gh pr create\`` / `\`glab mr create\`` prefix in the message is read off
+ * the argv so it names the exact command that failed.
+ */
+function runDraftCreate(cli: 'gh' | 'glab', argv: readonly string[]): void {
+  const result = spawnSync(cli, argv, { encoding: 'utf8' });
+  if (result.status !== 0) {
+    const signal = result.signal ? ` (signal ${result.signal})` : '';
+    const stderr = (result.stderr ?? '').trim();
+    const detail = stderr !== '' ? stderr : 'no stderr captured';
+    const subcommand = argv.slice(0, 2).join(' '); // 'pr create' | 'mr create'
+    throw new Error(`\`${cli} ${subcommand}\` failed (exit ${result.status}${signal}):\n${detail}`);
+  }
+  const { out, advisory } = classifyDraftCreateOutput(result.stdout ?? '', result.stderr ?? '');
+  if (out !== '') process.stdout.write(out.endsWith('\n') ? out : `${out}\n`);
+  if (advisory !== '') console.warn(advisory);
+}
+
 // ---------------------------------------------------------------------------
 // Factory — bind the host's executing wrappers. Each is a thin shell over
-// execFileSync using the pure builders/parsers above; the host decision lives in
-// one branch per CLI, and main.ts never spells `glab` or `gh` itself.
+// execFileSync (or spawnSync, for the captured-output create above) using the pure
+// builders/parsers; the host decision lives in one branch per CLI, and main.ts
+// never spells `glab` or `gh` itself.
 // ---------------------------------------------------------------------------
 
 export interface Host {
@@ -559,9 +644,7 @@ export function createHost(host: GitHost): Host {
           return { number: issueNumber, title: fallbackTitle };
         }
       },
-      createDraftChangeRequest: (args) => {
-        execFileSync('gh', ghPrCreateArgs(args), { stdio: 'inherit' });
-      },
+      createDraftChangeRequest: (args) => runDraftCreate('gh', ghPrCreateArgs(args)),
       openChangeRequests: () =>
         parseGhPrList(execFileSync('gh', ghPrListArgs(), { encoding: 'utf8' })),
       queueIssues: (labels) =>
@@ -602,9 +685,7 @@ export function createHost(host: GitHost): Host {
         return { number: issueNumber, title: fallbackTitle };
       }
     },
-    createDraftChangeRequest: (args) => {
-      execFileSync('glab', glabMrCreateArgs(args), { stdio: 'inherit' });
-    },
+    createDraftChangeRequest: (args) => runDraftCreate('glab', glabMrCreateArgs(args)),
     openChangeRequests: () =>
       parseOpenMergeRequests(
         execFileSync('glab', ['mr', 'list', '--output', 'json', '--per-page', '100'], {

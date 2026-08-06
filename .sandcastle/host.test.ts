@@ -34,6 +34,8 @@ import {
   claimLabels,
   hostTokenKey,
   hostTokenMissingMessage,
+  isUncommittedChangesWarning,
+  classifyDraftCreateOutput,
 } from './host.ts';
 import { test, throws, finish } from './test-harness.ts';
 
@@ -335,6 +337,67 @@ test('manualCreateHint: gh uses pr create --head/--base', () => {
     manualCreateHint('gh', 'feat/x', 'main'),
     'gh pr create --head feat/x --base main --draft',
   );
+});
+
+// --- draft-create OUTPUT classification (issue #21) ------------------------
+// `gh pr create` prints the new PR URL to stdout but ALSO warns "Warning: N
+// uncommitted changes" — about the HOST working tree (the repo main.ts runs from,
+// which carries the adopt-time `@ai-hero/sandcastle` runtime dep), NEVER the agent's
+// work (committed to the pushed branch before this call). Printed bare between
+// `git push` and the URL it reads like left-behind agent work, so the publish phase
+// captures the CLI output and drops that one line via classifyDraftCreateOutput.
+// The filter is surgical: only that exact warning goes; the URL and any other
+// stderr (a different warning, an auth error) survive — no blanket stderr drop.
+
+test('isUncommittedChangesWarning: matches gh\'s exact host-tree warning (any count, plural/singular)', () => {
+  assert.equal(isUncommittedChangesWarning('Warning: 2 uncommitted changes'), true);
+  assert.equal(isUncommittedChangesWarning('Warning: 1 uncommitted change'), true);
+  assert.equal(isUncommittedChangesWarning('warning: 0 uncommitted changes'), true);
+  // gh indents the warning under a banner in some flows; leading whitespace is tolerated.
+  assert.equal(isUncommittedChangesWarning('  Warning: 2 uncommitted changes'), true);
+});
+
+test('isUncommittedChangesWarning: leaves the URL, banners and OTHER warnings alone (real signal)', () => {
+  assert.equal(isUncommittedChangesWarning('https://github.com/owner/repo/pull/42'), false);
+  assert.equal(isUncommittedChangesWarning('Creating pull request for feat/x into main in owner/repo'), false);
+  // A DIFFERENT warning has no "<digits> uncommitted" → kept.
+  assert.equal(isUncommittedChangesWarning('Warning: unpushed commits on origin'), false);
+  assert.equal(isUncommittedChangesWarning('Warning: 2 files differ from the base'), false);
+  assert.equal(isUncommittedChangesWarning(''), false);
+});
+
+test('classifyDraftCreateOutput: keeps the URL, drops only the uncommitted-changes warning', () => {
+  const out = classifyDraftCreateOutput(
+    'https://github.com/owner/repo/pull/42\n',
+    'Warning: 2 uncommitted changes\n\nCreating pull request for feat/x into main in owner/repo\n',
+  );
+  // The URL rides on stdout, verbatim.
+  assert.equal(out.out, 'https://github.com/owner/repo/pull/42\n');
+  // Real advisory stderr survives; the warning is gone, no stray "uncommitted" token.
+  assert.equal(out.advisory, 'Creating pull request for feat/x into main in owner/repo');
+  assert.ok(!out.advisory.includes('uncommitted'), `notice must not carry the warning: ${out.advisory}`);
+});
+
+test('classifyDraftCreateOutput: a clean host tree (no warning) passes stderr through unchanged', () => {
+  const out = classifyDraftCreateOutput(
+    'https://github.com/o/r/pull/7\n',
+    'Creating pull request for feat/x into main in o/r\n',
+  );
+  assert.equal(out.out, 'https://github.com/o/r/pull/7\n');
+  assert.equal(out.advisory, 'Creating pull request for feat/x into main in o/r');
+});
+
+test('classifyDraftCreateOutput: a DIFFERENT warning is NOT suppressed (no blanket drop)', () => {
+  // This is the acceptance guardrail: the filter must not eat arbitrary stderr.
+  const out = classifyDraftCreateOutput('https://github.com/o/r/pull/7\n', 'Warning: unpushed commits on origin\n');
+  assert.equal(out.advisory, 'Warning: unpushed commits on origin');
+});
+
+test('classifyDraftCreateOutput: drops the warning from stdout too (defensive — which stream gh uses)', () => {
+  // gh emits the warning on stderr, but should a version move it to stdout it must
+  // not survive next to the URL. Only the warning line goes; the URL stays.
+  const out = classifyDraftCreateOutput('Warning: 2 uncommitted changes\nhttps://github.com/o/r/pull/7\n', '');
+  assert.equal(out.out, 'https://github.com/o/r/pull/7\n');
 });
 
 // --- open MR / PR list -----------------------------------------------------
