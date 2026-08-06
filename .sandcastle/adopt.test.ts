@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import {
   detectPackageManager,
+  hasPnpmWorkspace,
   pmAddArgs,
   consumerRootIsCjs,
   buildExcludePatch,
@@ -52,6 +53,26 @@ test('mixed lockfiles resolve to the non-npm one (npm is checked last)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// hasPnpmWorkspace — does the consumer root declare a pnpm workspace?
+// Issue #23: pnpm v10 reads workspace config from `pnpm-workspace.yaml`, so its mere
+// presence at the consumer root makes the root a workspace root. A `pnpm add` in a
+// subdir (adopt installs the Engine with cwd:.sandcastle/) then adopts that subdir as a
+// workspace member and writes into the SHARED root `pnpm-lock.yaml` — the lockfile leak
+// #22's out-of-tree install was meant to prevent. Detecting the file gates the
+// `--ignore-workspace` flag that makes .sandcastle/ a standalone install instead.
+// ---------------------------------------------------------------------------
+
+test('pnpm-workspace.yaml at the consumer root → true', () => {
+  assert.equal(hasPnpmWorkspace(['pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml']), true);
+});
+test('no pnpm-workspace.yaml → false (the common non-workspace pnpm consumer)', () => {
+  assert.equal(hasPnpmWorkspace(['pnpm-lock.yaml', 'package.json', 'src']), false);
+});
+test('an empty directory listing → false', () => {
+  assert.equal(hasPnpmWorkspace([]), false);
+});
+
+// ---------------------------------------------------------------------------
 // pmAddArgs — the install argv (subcommand + flags + specs, NO binary) for execFileSync(pm, …)
 // ---------------------------------------------------------------------------
 
@@ -69,6 +90,43 @@ test('pnpm/yarn/bun use `add`', () => {
 });
 test('multiple specs are passed through in order', () => {
   assert.deepEqual(pmAddArgs('pnpm', ['a@1', 'b@2', 'c@3'], true), ['add', '-D', 'a@1', 'b@2', 'c@3']);
+});
+test('opts omitted → unchanged argv (backward compatible — existing call sites)', () => {
+  // main() step 2a (dev tools at root) and any pre-#23 caller pass no opts.
+  assert.deepEqual(pmAddArgs('pnpm', ['tsx@4'], true), ['add', '-D', 'tsx@4']);
+  assert.deepEqual(pmAddArgs('pnpm', ['@ai-hero/sandcastle@0.12.0'], false), [
+    'add',
+    '@ai-hero/sandcastle@0.12.0',
+  ]);
+});
+test('pnpm + ignoreWorkspace → --ignore-workspace flag (.sandcastle/ standalone install; #23)', () => {
+  assert.deepEqual(pmAddArgs('pnpm', ['@ai-hero/sandcastle@0.12.0'], false, { ignoreWorkspace: true }), [
+    'add',
+    '--ignore-workspace',
+    '@ai-hero/sandcastle@0.12.0',
+  ]);
+});
+test('pnpm + dev + ignoreWorkspace → -D then --ignore-workspace', () => {
+  assert.deepEqual(pmAddArgs('pnpm', ['tsx@4'], true, { ignoreWorkspace: true }), [
+    'add',
+    '-D',
+    '--ignore-workspace',
+    'tsx@4',
+  ]);
+});
+test('pnpm + ignoreWorkspace:false → no flag (the gated-off non-workspace case)', () => {
+  assert.deepEqual(pmAddArgs('pnpm', ['@ai-hero/sandcastle@0.12.0'], false, { ignoreWorkspace: false }), [
+    'add',
+    '@ai-hero/sandcastle@0.12.0',
+  ]);
+});
+test('--ignore-workspace is pnpm-only: npm with ignoreWorkspace:true gets NO flag', () => {
+  // `--ignore-workspace` is a pnpm concept; npm/yarn/bun never receive it.
+  assert.deepEqual(pmAddArgs('npm', ['@ai-hero/sandcastle@0.12.0'], false, { ignoreWorkspace: true }), [
+    'install',
+    '@ai-hero/sandcastle@0.12.0',
+  ]);
+  assert.deepEqual(pmAddArgs('yarn', ['tsx@4'], false, { ignoreWorkspace: true }), ['add', 'tsx@4']);
 });
 
 // ---------------------------------------------------------------------------
@@ -361,6 +419,39 @@ test('end-to-end decision: an npm ESM greenfield-style consumer needs nothing in
   assert.deepEqual(toSpecs(missing.deps), []);
   assert.deepEqual(toSpecs(missing.devDeps), []);
   assert.equal(consumerRootIsCjs(consumer), false);
+});
+
+test('end-to-end decision: a pnpm-WORKSPACE consumer installs the Engine standalone (#23)', () => {
+  // captable-manager: pnpm + a root pnpm-workspace.yaml. Without --ignore-workspace,
+  // `pnpm add` run with cwd:.sandcastle/ adopts .sandcastle/ as a workspace member and
+  // writes the @ai-hero/sandcastle dep into the SHARED root pnpm-lock.yaml — the leak.
+  // Detection of pnpm-workspace.yaml must arm --ignore-workspace on the Engine argv so
+  // the install stays scoped to .sandcastle/ (its own .sandcastle/pnpm-lock.yaml), and
+  // the root lockfile stays byte-identical. (Dev tools at root, step 2a, are unaffected —
+  // they keep the plain argv since they SHOULD land at the workspace root.)
+  const rootEntries = ['pnpm-lock.yaml', 'package.json', 'pnpm-workspace.yaml', 'src'];
+  const pm: PackageManager = detectPackageManager(rootEntries);
+  assert.equal(pm, 'pnpm');
+  const ignoreWorkspace = hasPnpmWorkspace(rootEntries);
+  assert.equal(ignoreWorkspace, true);
+  const engineArgv = pmAddArgs(pm, ['@ai-hero/sandcastle@0.12.0'], false, { ignoreWorkspace });
+  assert.deepEqual(engineArgv, ['add', '--ignore-workspace', '@ai-hero/sandcastle@0.12.0']);
+  // Dev tools (step 2a, cwd:consumerRoot) keep the plain argv — they belong at the root.
+  assert.deepEqual(pmAddArgs(pm, ['tsx@^4.23.0'], true), ['add', '-D', 'tsx@^4.23.0']);
+});
+
+test('end-to-end decision: a pnpm NON-workspace consumer keeps the plain argv (#23)', () => {
+  // No pnpm-workspace.yaml → no leak vector → --ignore-workspace stays off. This is the
+  // #22 scratch-consumer case: argv unchanged, root lockfile clean, .sandcastle/pnpm-lock.yaml.
+  const rootEntries = ['pnpm-lock.yaml', 'package.json', 'src'];
+  const pm: PackageManager = detectPackageManager(rootEntries);
+  assert.equal(hasPnpmWorkspace(rootEntries), false);
+  assert.deepEqual(
+    pmAddArgs(pm, ['@ai-hero/sandcastle@0.12.0'], false, {
+      ignoreWorkspace: hasPnpmWorkspace(rootEntries),
+    }),
+    ['add', '@ai-hero/sandcastle@0.12.0'],
+  );
 });
 
 finish();

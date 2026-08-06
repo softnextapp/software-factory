@@ -17,7 +17,7 @@
 // The Factory is config-only (ADR-0001) and clone-and-own (ADR-0002): adoption
 // copies the `.sandcastle/` config layer ONCE and leaves the consumer owning it.
 //
-// Pure helpers (detectPackageManager, pmAddArgs, consumerRootIsCjs,
+// Pure helpers (detectPackageManager, hasPnpmWorkspace, pmAddArgs, consumerRootIsCjs,
 // buildExcludePatch, engineRuntimeDeps, computeMissing, toSpecs, parseArgs) are
 // exported for the contract test; main() does the fs/spawn side effects and runs
 // only when the file is invoked directly (see the guard at the bottom).
@@ -61,12 +61,39 @@ export function detectPackageManager(dirEntries: string[]): PackageManager {
   return 'npm';
 }
 
+/** Does the consumer root declare a pnpm workspace? pnpm v10 reads workspace config from
+ * `pnpm-workspace.yaml`, so its mere presence at the consumer root — even a file holding
+ * only `allowBuilds:` with no `packages:` — makes the root a workspace root. That matters
+ * for adopt's out-of-tree Engine install (#22): `<pm> add` run with `cwd: .sandcastle/`
+ * then adopts `.sandcastle/` as a workspace member and writes its `@ai-hero/sandcastle`
+ * dep into the SHARED root `pnpm-lock.yaml` — exactly the uncommitted-lockfile leak #22
+ * was meant to eliminate (issue #23). Detecting the file gates `--ignore-workspace` on
+ * the Engine argv so `.sandcastle/` installs standalone (its own lockfile) instead.
+ * Non-pnpm managers don't share this hazard, so this is asked only alongside pnpm. */
+export function hasPnpmWorkspace(dirEntries: string[]): boolean {
+  return dirEntries.includes('pnpm-workspace.yaml');
+}
+
+/** Options for {@link pmAddArgs}. `ignoreWorkspace` arms pnpm's `--ignore-workspace` so
+ * the install is scoped to its `cwd` (used for the out-of-tree `.sandcastle/` Engine
+ * install on a workspace consumer, issue #23); omitted/false leaves the argv unchanged. */
+export type PmAddOptions = { ignoreWorkspace?: boolean };
+
 /** The `add` argv (subcommand + flags + specs) for `execFileSync(pm, …)`. The binary
  * name is NOT included — the caller passes it as the command. `npm` uses `install`;
- * pnpm/yarn/bun use `add`. `dev` → `-D` (devDependency). */
-export function pmAddArgs(pm: PackageManager, specs: string[], dev: boolean): string[] {
+ * pnpm/yarn/bun use `add`. `dev` → `-D` (devDependency). `opts.ignoreWorkspace` arms
+ * pnpm's `--ignore-workspace` (a standalone install under the given `cwd`); it is a
+ * pnpm-only flag — even when armed it is never emitted for npm/yarn/bun (issue #23). */
+export function pmAddArgs(
+  pm: PackageManager,
+  specs: string[],
+  dev: boolean,
+  opts: PmAddOptions = {},
+): string[] {
   const sub = pm === 'npm' ? 'install' : 'add';
-  const flags = dev ? ['-D'] : [];
+  const flags: string[] = [];
+  if (dev) flags.push('-D');
+  if (opts.ignoreWorkspace && pm === 'pnpm') flags.push('--ignore-workspace');
   return [sub, ...flags, ...specs];
 }
 
@@ -377,7 +404,15 @@ function main(): void {
   let wiredVia: 'install' | 'symlink' | 'present' = 'present';
   let devToolsFailed = false; // surfaced in the summary: a failed dev-tool install leaves main.ts unrunnable
   if (missingDevSpecs.length || engineSpecs.length) {
-    const pm = detectPackageManager(readdirSync(consumerRoot));
+    const rootEntries = readdirSync(consumerRoot);
+    const pm = detectPackageManager(rootEntries);
+    // Issue #23: a pnpm-WORKSPACE consumer leaks the out-of-tree `.sandcastle/` Engine
+    // install into the shared root `pnpm-lock.yaml` (pnpm adopts `.sandcastle/` as a
+    // workspace member). `--ignore-workspace` makes the install standalone — scoped to
+    // cwd:.sandcastle/, writing its own `.sandcastle/pnpm-lock.yaml`. Armed ONLY for the
+    // Engine install (step 2b); dev tools (step 2a) keep the plain argv since they belong
+    // at the root. pnpm-only (npm/yarn/bun don't share the hazard).
+    const ignoreWorkspace = pm === 'pnpm' && hasPnpmWorkspace(rootEntries);
 
     // 2a. Dev tools → consumer root. A failure here is not fatal to the Engine wiring —
     //     dev tools are general-purpose and consumer-owned; most TS projects already
@@ -385,6 +420,10 @@ function main(): void {
     if (missingDevSpecs.length) {
       try {
         info(`② install dev tools (${pm} -D, root): ${missingDevSpecs.join(', ')}`);
+        // Plain argv (NO opts): dev tools belong at the consumer ROOT, so --ignore-workspace
+        // must NOT apply here — that flag scopes an install to .sandcastle/ and is for the
+        // Engine's out-of-tree install (step 2b) only (issue #23). Adding opts here would
+        // mis-route a workspace consumer's dev tools under .sandcastle/.
         execFileSync(pm, pmAddArgs(pm, missingDevSpecs, true), { cwd: consumerRoot, stdio: 'inherit' });
         wiredVia = 'install';
       } catch {
@@ -409,8 +448,14 @@ function main(): void {
         rmSync(engineScope, { recursive: true, force: true });
       }
       try {
-        info(`② install Engine (${pm}, .sandcastle/ out-of-tree): ${engineSpecs.join(', ')}`);
-        execFileSync(pm, pmAddArgs(pm, engineSpecs, false), { cwd: consumerSandcastle, stdio: 'inherit' });
+        info(
+          `② install Engine (${pm}, .sandcastle/ out-of-tree${ignoreWorkspace ? ', --ignore-workspace' : ''}): ${engineSpecs.join(', ')}`,
+        );
+        execFileSync(
+          pm,
+          pmAddArgs(pm, engineSpecs, false, { ignoreWorkspace }),
+          { cwd: consumerSandcastle, stdio: 'inherit' },
+        );
         wiredVia = 'install';
       } catch {
         // A non-zero exit is not always failure — a package manager can exit non-zero on
