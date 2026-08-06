@@ -287,6 +287,7 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 | `queueLabels` | `string[]` | `['sandcastle', 'ready-for-agent']` | Queue trigger labels — an open issue carrying ANY of these is candidate work. Default accepts both so the Factory (`sandcastle`) and captable (`ready-for-agent`) queue with no relabelling; narrow per consumer (#15). |
 | `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Empty ⇒ chaining is inert even with `SANDCASTLE_CHAIN=1`. |
 | `assignee` | `string \| null` | `null` | Host assignee. glab wants a username; gh accepts `@me`. `null` ⇒ leave the MR/PR unassigned. |
+| `worktreeExclude` | `string[]` | `['.pnpm-store/']` | Gitignore patterns for generated artifacts (package-manager stores, …) the Engine's "uncommitted changes" check would otherwise flag in an agent worktree. Written to the shared `.git/info/exclude`, so a tracked-but-uncommitted change still warns (#20). |
 
 A **provider** is the quadruplet `{ model, baseUrl, tokenKey, effort }`:
 

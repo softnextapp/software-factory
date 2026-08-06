@@ -121,6 +121,14 @@ export interface ProjectConfig {
    *  `['node_modules']` (a no-op in a repo that has none). A pnpm repo sets `[]` — pnpm rejects a
    *  host-copied `node_modules` (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY). Issue #19. */
   readonly copyToWorktree: readonly string[];
+  /** Gitignore patterns for generated artifacts the Engine's post-run "uncommitted changes"
+   *  check would otherwise flag in an agent worktree (issue #20). A pnpm consumer's
+   *  `pnpm install` materializes a local `.pnpm-store/`; untracked, it makes the Engine
+   *  preserve the worktree and warn — cosmetic noise that reads like left-behind work.
+   *  main.ts writes these into the repo's shared `.git/info/exclude` (honored by every
+   *  linked worktree; the tracked `.gitignore` is untouched), so a genuinely uncommitted
+   *  TRACKED change still warns. Default: the pnpm local store; extend per consumer. */
+  readonly worktreeExclude: readonly string[];
 }
 
 /** Per-run knobs, read from env. */
@@ -192,6 +200,10 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   // consumer who sets neither gets identical behaviour.
   hooks: {},
   copyToWorktree: ['node_modules'],
+  // The pnpm local store, materialized by `pnpm install` in a sandbox-setup hook and the
+  // observed cause of the spurious "uncommitted changes" warning (issue #20). See
+  // worktree-exclude.ts; extend here for yarn/npm build caches without editing main.ts.
+  worktreeExclude: ['.pnpm-store/'],
 };
 
 // ---------------------------------------------------------------------------

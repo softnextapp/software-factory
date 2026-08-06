@@ -121,6 +121,22 @@ test('DEFAULT_PROJECT_CONFIG ships no install hook and copies node_modules', () 
   assert.deepEqual(DEFAULT_PROJECT_CONFIG.copyToWorktree, ['node_modules']);
 });
 
+test('DEFAULT_PROJECT_CONFIG ignores the pnpm local store in worktrees', () => {
+  // A pnpm consumer's `pnpm install` materializes `.pnpm-store/`; untracked it trips the
+  // Engine's "uncommitted changes" check (issue #20). The Factory ships the pnpm store as
+  // the default worktree-exclude list so a consumer who does nothing is covered, and
+  // resolveConfig carries a consumer's override through unchanged.
+  assert.deepEqual(DEFAULT_PROJECT_CONFIG.worktreeExclude, ['.pnpm-store/']);
+  const yarnConsumer: ProjectConfig = {
+    ...DEFAULT_PROJECT_CONFIG,
+    worktreeExclude: ['.pnpm-store/', '.yarn/cache/'],
+  };
+  assert.deepEqual(loadConfig(yarnConsumer, {}).project.worktreeExclude, [
+    '.pnpm-store/',
+    '.yarn/cache/',
+  ]);
+});
+
 test('a DB-backed consumer (setup hook + empty copyToWorktree) is expressible purely in config', () => {
   // The captable-manager live run (2026-08-05) had to patch main.ts for exactly this
   // shape: a Postgres/Prisma/Playwright repo needs a `sandbox-setup` hook AND an empty

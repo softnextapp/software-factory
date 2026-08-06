@@ -60,6 +60,7 @@ import {
 } from './mr-body.ts';
 import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.ts';
 import { loadConfig, type Provider, type Role } from './config.ts';
+import { ensureWorktreeExclude } from './worktree-exclude.ts';
 import {
   parseEnvFile,
   resolveToken,
@@ -868,6 +869,13 @@ try {
 // Surface a gitHost-vs-origin mismatch before any agent runs (the dry-run block
 // above ran the same check into its structured report).
 warnHostMismatch();
+
+// Ensure generated artifacts (`.pnpm-store/`, …) do not trip the Engine's post-run
+// "uncommitted changes" check in the agent worktrees forked below (issue #20). Idempotent
+// and host-side: writes the patterns into the repo's shared `.git/info/exclude`, honored
+// by every linked worktree. A genuinely uncommitted TRACKED change still warns. Best-effort
+// — a non-git cwd warns and continues.
+ensureWorktreeExclude(process.cwd(), cfg.project.worktreeExclude);
 
 // ---------------------------------------------------------------------------
 // Main loop
