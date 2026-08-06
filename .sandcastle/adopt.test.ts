@@ -15,6 +15,8 @@ import {
   toSpecs,
   shouldClearEngineLink,
   parseArgs,
+  isConsumerRuntimeFile,
+  engineManifestPath,
   type PackageManager,
 } from './adopt.ts';
 
@@ -248,13 +250,91 @@ test('parseArgs: two positional paths → usage error', () => {
 });
 
 // ---------------------------------------------------------------------------
+// isConsumerRuntimeFile — should this `.sandcastle/` file ship to a consumer?
+// Issue #22: step 1's `git archive HEAD -- .sandcastle/` copied the Factory's OWN
+// contract tests (*.test.ts) + their harness into the consumer. A consumer's test
+// runner (vitest/jest, default glob `**/*.test.ts`) then collects and runs them in
+// the wrong context → 11 red files that look like the implementer left work behind.
+// Runtime files (sources, prompts, Dockerfiles, the ESM shim, tsconfig) always ship.
+// ---------------------------------------------------------------------------
+
+test('a Factory contract test does NOT ship — *.test.ts', () => {
+  assert.equal(isConsumerRuntimeFile('.sandcastle/host.test.ts'), false);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/adopt.test.ts'), false);
+});
+test('a *.test.tsx contract test does NOT ship either', () => {
+  assert.equal(isConsumerRuntimeFile('.sandcastle/foo.test.tsx'), false);
+});
+test('a *.spec.ts / *.spec.tsx contract test does NOT ship (vitest/jest default glob)', () => {
+  // The Factory has none today, but the consumer's runner would collect them just like
+  // *.test.ts — match the spec's stated intent (the runner's default glob), not just
+  // today's layout (issue #22).
+  assert.equal(isConsumerRuntimeFile('.sandcastle/host.spec.ts'), false);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/foo.spec.tsx'), false);
+});
+test('the shared test harness does NOT ship — only tests import it', () => {
+  assert.equal(isConsumerRuntimeFile('.sandcastle/test-harness.ts'), false);
+});
+test('runtime sources DO ship', () => {
+  assert.equal(isConsumerRuntimeFile('.sandcastle/main.ts'), true);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/host.ts'), true);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/config.ts'), true);
+});
+test('prompts, Dockerfiles, the ESM shim and tsconfig all ship', () => {
+  assert.equal(isConsumerRuntimeFile('.sandcastle/plan-prompt.md'), true);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/Dockerfile'), true);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/Dockerfile.base'), true);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/package.json'), true);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/tsconfig.json'), true);
+});
+test('a nested *.test.ts / harness (future layout) is still caught — basename match', () => {
+  assert.equal(isConsumerRuntimeFile('.sandcastle/sub/foo.test.ts'), false);
+  assert.equal(isConsumerRuntimeFile('.sandcastle/sub/test-harness.ts'), false);
+});
+test('a name merely ending in "test.ts" without the .test. delimiter DOES ship', () => {
+  // `latest.ts` must not be caught by a naive /test\.ts$/ regex.
+  assert.equal(isConsumerRuntimeFile('.sandcastle/latest.ts'), true);
+});
+test('a name containing "test-harness" as a substring still ships (exact match only)', () => {
+  assert.equal(isConsumerRuntimeFile('.sandcastle/test-harness-config.ts'), true);
+});
+
+// ---------------------------------------------------------------------------
+// engineManifestPath — WHERE the Engine resolves in an adopted consumer
+// Issue #22: the Engine installs OUT-OF-TREE under .sandcastle/node_modules (its
+// manifest is the .sandcastle/package.json ESM shim), NOT the consumer's root, so
+// `<pm> add` never touches the consumer's tracked package.json / lockfile. This path
+// is the single source of truth for engineResolves / linkEngine.
+// ---------------------------------------------------------------------------
+
+test('the Engine resolves under .sandcastle/node_modules, not the consumer root', () => {
+  const p = engineManifestPath('/home/me/app');
+  assert.equal(p, '/home/me/app/.sandcastle/node_modules/@ai-hero/sandcastle/package.json');
+});
+test('it does NOT point at the consumer root node_modules (the pre-#22 location)', () => {
+  const p = engineManifestPath('/home/me/app');
+  assert.ok(!p.endsWith('/app/node_modules/@ai-hero/sandcastle/package.json'));
+  assert.ok(p.includes('.sandcastle/node_modules'));
+});
+test('no trailing slash on the consumer root is tolerated', () => {
+  assert.equal(
+    engineManifestPath('/home/me/app/'),
+    '/home/me/app/.sandcastle/node_modules/@ai-hero/sandcastle/package.json',
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Integration of the helpers — one full "what would we install?" decision
 // ---------------------------------------------------------------------------
 
 test('end-to-end decision: a pnpm CJS consumer missing only the engine', () => {
-  // Mirrors the captable-manager case: has tsx/typescript/@types/node already,
-  // CJS (no "type":"module"), pnpm. Only @ai-hero/sandcastle should be installed;
-  // the CJS root also arms the shim-repair gate (the shim itself ships in step 1).
+  // A fresh consumer (tsx/typescript/@types/node already present, CJS, pnpm) that
+  // resolves the Engine nowhere. Only @ai-hero/sandcastle is installed — OUT-OF-TREE
+  // at .sandcastle/ now (issue #22), so these specs run with `cwd: .sandcastle/`, not
+  // at the root; the argv shape below is unchanged. main() takes the spec from
+  // `runtime.deps` (the Factory's declared version), gated on `engineResolves` — which
+  // for this consumer is false, so it coincides with `missing.deps` here. The CJS root
+  // also arms the shim-repair gate (the shim itself ships in step 1).
   const consumer = JSON.stringify({
     name: 'captable-manager',
     devDependencies: { tsx: '^4.19.0', typescript: '^5.6.0', '@types/node': '^22.0.0' },

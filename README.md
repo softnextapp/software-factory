@@ -137,23 +137,37 @@ with one command, run from the Factory root:
 npx tsx .sandcastle/adopt.ts /path/to/your-repo   # add --force to re-sync from upstream later
 ```
 
-It does four things, none of which touch the consumer's tracked `.gitignore`:
+It does four things, none of which touch the consumer's tracked `.gitignore` or its
+root `package.json` / lockfile:
 
 1. **Copy `.sandcastle/`** — tracked Factory files only (`git archive HEAD`), so the
-   copy is secret-free by construction. It refuses to clobber an already-adopted
-   `.sandcastle/`; `--force` re-syncs from the Factory HEAD (this overwrites the
-   tracked files, including `config.ts` — back up local edits first).
-2. **Wire the runtime** — installs whatever the Factory's `package.json` declares that
-   your repo does not already have: the Engine (`@ai-hero/sandcastle`) plus the
-   `tsx` / `typescript` / `@types/node` dev tools. The package manager is detected from
-   your lockfile (pnpm/yarn/bun, else npm). Deps you already declare at any version are
-   left alone — your versions are yours ([ADR-0003](docs/adr/0003-factory-boundary.md)).
-   If the install genuinely fails (offline, unknown manager), it falls back to
-   symlinking the Engine out of the Factory clone and warns — make it permanent with a
-   real `add` later. A non-zero exit that still leaves the Engine installed (e.g. pnpm's
-   `ERR_PNPM_IGNORED_BUILDS` warning for unapproved native build scripts such as
-   esbuild) is treated as success, not a failure. The saved range follows your package
-   manager's default (npm adds a `^`); pin exact (`@0.12.0`) if you need to.
+   copy is secret-free by construction. The Factory's own contract tests
+   (`*.test.ts` / `*.spec.ts`) and test harness are stripped from the copy, so a
+   consumer's test runner (vitest/jest) doesn't collect them as red files (issue #22).
+   It refuses to clobber an already-adopted `.sandcastle/`; `--force` re-syncs from the
+   Factory HEAD (this overwrites the tracked files, including `config.ts` — back up
+   local edits first).
+2. **Wire the runtime** — two locations, chosen so the consumer's tracked root manifest
+   stays clean (issue #22):
+   - **Dev tools** (`tsx` / `typescript` / `@types/node`) → your repo's **root**. These
+     are general-purpose and `npx tsx` resolves them from the root `node_modules/.bin`;
+     only what your repo doesn't already declare is added (your versions are yours,
+     [ADR-0003](docs/adr/0003-factory-boundary.md)).
+   - **Engine** (`@ai-hero/sandcastle`) → **out-of-tree** under `.sandcastle/node_modules`,
+     declared in the `.sandcastle/package.json` ESM shim. The install (`<pm> add` with
+     `cwd: .sandcastle/`) never touches your root `package.json` or lockfile, so there is
+     no uncommitted `@ai-hero/sandcastle` dep for a reviewer to flag. `main.ts` resolves
+     it via `.sandcastle/node_modules` before the root.
+
+   The package manager is detected from your lockfile (pnpm/yarn/bun, else npm). If the
+   Engine install genuinely fails (offline, unknown manager), it falls back to symlinking
+   the Engine from the Factory clone into `.sandcastle/` and warns — make it permanent
+   with a real `add` (run inside `.sandcastle/`) later. A non-zero exit that still leaves
+   the Engine installed (e.g. pnpm's `ERR_PNPM_IGNORED_BUILDS` warning for unapproved
+   native build scripts such as esbuild) is treated as success, not a failure. A repo
+   adopted before this change may still carry a stale root `@ai-hero/sandcastle` entry —
+   adopt never removes a dep you declared ([ADR-0003](docs/adr/0003-factory-boundary.md));
+   drop it yourself to go fully clean.
 3. **Self-contained ESM** — `main.ts` uses top-level `await`, so `.sandcastle/` ships its
    own `{"type":"module"}` package.json. It lands with the step-1 copy and makes
    `main.ts` transpile regardless of your repo's root `package.json` (issue #8) — CJS or

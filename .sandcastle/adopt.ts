@@ -34,7 +34,7 @@ import {
   statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
@@ -167,6 +167,27 @@ export function shouldClearEngineLink(fact: { isSymbolicLink(): boolean } | null
   return fact !== null && fact.isSymbolicLink();
 }
 
+/**
+ * Where the Engine (`@ai-hero/sandcastle`) resolves in an adopted consumer: under
+ * `.sandcastle/node_modules`, NOT the consumer's root. Installing it out-of-tree — its
+ * manifest is the `.sandcastle/package.json` ESM shim, so `<pm> add` runs with
+ * `cwd: .sandcastle/` — keeps the consumer's tracked root `package.json` and lockfile
+ * pristine: no uncommitted `@ai-hero/sandcastle` dep for a reviewer to flag as noise
+ * (issue #22). `engineResolves`, `linkEngine`, and `engineScopeDir` all key off this
+ * single path so the out-of-tree location has one source of truth.
+ */
+export function engineManifestPath(consumerRoot: string): string {
+  return join(consumerRoot, '.sandcastle', 'node_modules', '@ai-hero', 'sandcastle', 'package.json');
+}
+
+/** The `@ai-hero` scope dir under `.sandcastle/node_modules` — the out-of-tree home of
+ * the Engine. Derived from `engineManifestPath` (two `dirname`s up from the manifest)
+ * so `linkEngine`'s link target and main's pre-install clear both anchor here instead of
+ * re-typing the path. Internal — covered transitively by the `engineManifestPath` tests. */
+function engineScopeDir(consumerRoot: string): string {
+  return dirname(dirname(engineManifestPath(consumerRoot)));
+}
+
 export type ParsedArgs = { ok: true; consumerPath: string; force: boolean } | { ok: false; error: string };
 
 /** Parse `tsx .sandcastle/adopt.ts <consumer-path> [--force|-f]`. */
@@ -180,6 +201,27 @@ export function parseArgs(argv: string[]): ParsedArgs {
   return { ok: true, consumerPath: positional[0]!, force };
 }
 
+/**
+ * Should a `.sandcastle/` file ship to a consumer? The Factory's OWN dev tooling —
+ * contract tests (`*.test.ts(x)` / `*.spec.ts(x)`) and their harness (`test-harness.ts`,
+ * imported by nothing but the tests) — must NOT: step 1's `git archive HEAD -- .sandcastle/`
+ * would otherwise land them in the consumer, where the consumer's test runner
+ * (vitest/jest, whose default glob matches `*.test.ts` / `*.spec.ts`) collects and runs
+ * them in the wrong context — red files that read like the implementer left work behind
+ * (issue #22). Every runtime file — sources, prompts, Dockerfiles, the ESM shim, tsconfig
+ * — ships.
+ *
+ * Takes the path relative to the consumer root (`.sandcastle/…`); matches on the
+ * basename so a future nested layout is still caught. The `.test.`/`.spec.` delimiter
+ * avoids false positives like `latest.ts`; the harness check is exact-name only so
+ * `test-harness-config.ts` still ships.
+ */
+export function isConsumerRuntimeFile(relPath: string): boolean {
+  const base = relPath.split('/').pop() ?? relPath;
+  if (base === 'test-harness.ts') return false;
+  return !/\.(test|spec)\.tsx?$/.test(base);
+}
+
 // ---------------------------------------------------------------------------
 // Side-effecting helpers (used by main only)
 // ---------------------------------------------------------------------------
@@ -190,12 +232,13 @@ function readPkg(root: string): string | null {
 }
 
 /** Fallback used only when `<pm> add` fails: link the Engine out of the Factory clone
- * so adoption still succeeds offline. Returns false if the Factory has no installed
- * `node_modules/@ai-hero` to link (operator must `npm install` the Factory first). */
+ * into `.sandcastle/node_modules/@ai-hero` (out-of-tree, issue #22) so adoption still
+ * succeeds offline. Returns false if the Factory has no installed `node_modules/@ai-hero`
+ * to link (operator must `npm install` the Factory first). */
 function linkEngine(factoryRoot: string, consumerRoot: string): boolean {
   const src = join(factoryRoot, 'node_modules', '@ai-hero');
-  const destParent = join(consumerRoot, 'node_modules');
-  const dest = join(destParent, '@ai-hero');
+  const dest = engineScopeDir(consumerRoot);
+  const destParent = dirname(dest);
   if (!existsSync(src)) return false;
   try {
     mkdirSync(destParent, { recursive: true });
@@ -207,15 +250,47 @@ function linkEngine(factoryRoot: string, consumerRoot: string): boolean {
   }
 }
 
-/** Does the Engine resolve in the consumer's OWN tree? Used to tell a benign non-zero
- * install exit from a genuine failure, so adopt does not clobber a good install with the
- * linkEngine fallback (issue #13): pnpm v11 exits non-zero on ERR_PNPM_IGNORED_BUILDS
- * (unapproved native build scripts, e.g. esbuild via tsx) even when the package installed
- * fine. The Engine is a direct dep, so it lives at the consumer's top-level node_modules
- * (npm's real dir, or pnpm's symlink into the store — `existsSync` follows it). Resolving
- * the bare specifier would trip the Engine's ESM-only exports map, so check its manifest. */
+/** Does the Engine resolve in the consumer's tree? Used both to decide whether to
+ * install (issue #22) and to tell a benign non-zero install exit from a genuine failure
+ * (issue #13: pnpm v11 exits non-zero on ERR_PNPM_IGNORED_BUILDS even when the package
+ * installed fine). True when the Engine lives out-of-tree under `.sandcastle/node_modules`
+ * (the canonical location since #22) OR at the consumer's root (a prior adopt, or the
+ * consumer's own root declaration — left alone, ADR-0002). Resolving the bare specifier
+ * would trip the Engine's ESM-only exports map, so check its manifest (`existsSync`
+ * follows pnpm's symlink into the store). */
 function engineResolves(consumerRoot: string): boolean {
-  return existsSync(join(consumerRoot, 'node_modules', '@ai-hero', 'sandcastle', 'package.json'));
+  return (
+    existsSync(engineManifestPath(consumerRoot)) ||
+    existsSync(join(consumerRoot, 'node_modules', '@ai-hero', 'sandcastle', 'package.json'))
+  );
+}
+
+/**
+ * Remove the Factory's dev-only files (contract tests + harness) the `git archive`
+ * copy just landed, so they don't ship to the consumer (issue #22). Walks the
+ * extracted `.sandcastle/` recursively; a file is dropped when
+ * `isConsumerRuntimeFile` says it must not ship. Returns the paths removed (for
+ * logging). Best-effort: a missing dir is a no-op, mirroring adopt's other fs helpers.
+ */
+function stripDevOnlyFiles(consumerRoot: string): string[] {
+  const sandcastle = join(consumerRoot, '.sandcastle');
+  if (!existsSync(sandcastle)) return [];
+  const removed: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(p);
+        continue;
+      }
+      if (!isConsumerRuntimeFile(relative(consumerRoot, p))) {
+        rmSync(p, { force: true });
+        removed.push(relative(consumerRoot, p));
+      }
+    }
+  };
+  walk(sandcastle);
+  return removed;
 }
 
 function info(msg: string): void {
@@ -274,64 +349,96 @@ function main(): void {
   } finally {
     rmSync(archivePath, { force: true });
   }
+  // Strip the Factory's dev-only files (contract tests + harness) the copy just
+  // landed — a consumer's test runner would otherwise collect them (issue #22).
+  const devOnly = stripDevOnlyFiles(consumerRoot);
+  if (devOnly.length) {
+    info(`① strip ${devOnly.length} Factory dev-only file(s) (contract tests + harness; issue #22)`);
+  }
 
-  // 2. Wire the Factory runtime (Engine + dev tools) into the consumer.
+  // 2. Wire the Factory runtime into the consumer.
+  //    Dev tools (tsx/typescript/@types/node) → consumer ROOT. These are general-purpose
+  //    (not Factory-specific) and the consumer runs `npx tsx`, which resolves from the
+  //    ROOT node_modules/.bin — so they belong at root, where the consumer already owns
+  //    them (ADR-0002/0003); only what's missing is added. The Engine (@ai-hero/sandcastle)
+  //    is Factory-specific → OUT-OF-TREE under .sandcastle/node_modules: its manifest is
+  //    the .sandcastle/package.json ESM shim, so `<pm> add` runs with cwd:.sandcastle/ and
+  //    never touches the consumer's tracked root package.json / lockfile — no uncommitted
+  //    @ai-hero/sandcastle dep for a reviewer to flag (issue #22). A consumer that already
+  //    resolves the Engine (its own root install, or a prior pre-#22 adopt that left it at
+  //    root) is left alone: adopt never removes a dep the consumer declared (ADR-0002) —
+  //    such a consumer drops the stale root entry itself to go fully clean. Resolution
+  //    from .sandcastle/*.ts still finds the out-of-tree copy first (Node hits
+  //    .sandcastle/node_modules before the root).
   const consumerPkg = readPkg(consumerRoot);
   const missing = computeMissing(runtime, consumerPkg);
-  const missingDepSpecs = toSpecs(missing.deps);
-  const missingDevSpecs = toSpecs(missing.devDeps);
+  const missingDevSpecs = toSpecs(missing.devDeps); // dev tools → root
+  const engineSpecs = engineResolves(consumerRoot) ? [] : toSpecs(runtime.deps); // Engine → .sandcastle/
   let wiredVia: 'install' | 'symlink' | 'present' = 'present';
-  if (missingDepSpecs.length || missingDevSpecs.length) {
+  let devToolsFailed = false; // surfaced in the summary: a failed dev-tool install leaves main.ts unrunnable
+  if (missingDevSpecs.length || engineSpecs.length) {
     const pm = detectPackageManager(readdirSync(consumerRoot));
-    // Clear a stale foreign `@ai-hero` symlink (linkEngine fallback / manual workaround)
-    // BEFORE installing — otherwise `<pm> add` writes through it into another tree and
-    // the Engine ends up declared yet unresolvable (issue #11). A real dir is the
-    // package manager's own layout and is left alone. `lstatSync` (not stat) so a symlink
-    // is seen as a symlink, not the target's dir.
-    const aiHero = join(consumerRoot, 'node_modules', '@ai-hero');
-    if (shouldClearEngineLink(existsSync(aiHero) ? lstatSync(aiHero) : null)) {
-      info('② clear stale @ai-hero symlink (foreign link; issue #11) before install');
-      rmSync(aiHero, { recursive: true, force: true });
-    }
-    try {
-      if (missingDepSpecs.length) {
-        info(`② install runtime deps (${pm}): ${missingDepSpecs.join(', ')}`);
-        execFileSync(pm, pmAddArgs(pm, missingDepSpecs, false), { cwd: consumerRoot, stdio: 'inherit' });
-      }
-      if (missingDevSpecs.length) {
-        info(`② install runtime devDeps (${pm} -D): ${missingDevSpecs.join(', ')}`);
+
+    // 2a. Dev tools → consumer root. A failure here is not fatal to the Engine wiring —
+    //     dev tools are general-purpose and consumer-owned; most TS projects already
+    //     have tsx & co. Warn, record it for the summary, and press on.
+    if (missingDevSpecs.length) {
+      try {
+        info(`② install dev tools (${pm} -D, root): ${missingDevSpecs.join(', ')}`);
         execFileSync(pm, pmAddArgs(pm, missingDevSpecs, true), { cwd: consumerRoot, stdio: 'inherit' });
-      }
-      wiredVia = 'install';
-    } catch {
-      // A non-zero exit is not always failure — a package manager can exit non-zero on
-      // a benign warning yet still install the package (see `engineResolves`). If the
-      // Engine landed anyway, treat the install as successful; do NOT fall back to
-      // linkEngine, which would overwrite the good install with a Factory symlink (#13).
-      if (engineResolves(consumerRoot)) {
         wiredVia = 'install';
+      } catch {
+        devToolsFailed = true;
         warn(
-          `'${pm} add' exited non-zero but @ai-hero/sandcastle resolves in the consumer — treating as installed\n` +
-            `  (likely a benign ${pm} warning, e.g. ignored build scripts; issue #13).`,
+          `'${pm} add -D' for dev tools (${missingDevSpecs.join(', ')}) failed; install them in the consumer yourself.`,
         );
-      } else if (linkEngine(FACTORY_ROOT, consumerRoot)) {
-        // Offline / unknown pm / genuine install failure — link the Engine as a fallback
-        // so adoption still lands. Only @ai-hero can be meaningfully symlinked; tsx/
-        // typescript are left to the consumer (most TS projects already have them).
-        wiredVia = 'symlink';
-        const allSpecs = [...missingDepSpecs, ...missingDevSpecs];
-        warn(
-          `'${pm} add' failed — linked @ai-hero/sandcastle from the Factory clone as a fallback.\n` +
-            `  This breaks if the Factory clone moves or is removed; make it permanent with:\n` +
-            `    ${pm === 'npm' ? 'npm install' : pm + ' add'}${missingDevSpecs.length ? ' -D' : ''} ${allSpecs.join(' ')}`,
-        );
-      } else {
-        console.error(
-          `Package-manager install failed and the Engine symlink fallback could not be created\n` +
-            `(no node_modules/@ai-hero in the Factory — run \`npm install\` there first).\n` +
-            `Install the runtime in the consumer manually, then re-run with --force.`,
-        );
-        process.exit(1);
+      }
+    }
+
+    // 2b. Engine → .sandcastle/ (out-of-tree, issue #22).
+    if (engineSpecs.length) {
+      // Clear a stale foreign @ai-hero symlink under .sandcastle/ (a prior linkEngine
+      // fallback) BEFORE installing — the same hazard as issue #11, relocated
+      // out-of-tree: `<pm> add` would otherwise write through the link into another tree
+      // and the Engine ends up declared yet unresolvable. A real dir is the package
+      // manager's own layout and is left alone. `lstatSync` (not stat) so a symlink is
+      // seen as a symlink, not the target's dir.
+      const engineScope = engineScopeDir(consumerRoot);
+      if (shouldClearEngineLink(existsSync(engineScope) ? lstatSync(engineScope) : null)) {
+        info('② clear stale @ai-hero symlink under .sandcastle/ before install (issue #11)');
+        rmSync(engineScope, { recursive: true, force: true });
+      }
+      try {
+        info(`② install Engine (${pm}, .sandcastle/ out-of-tree): ${engineSpecs.join(', ')}`);
+        execFileSync(pm, pmAddArgs(pm, engineSpecs, false), { cwd: consumerSandcastle, stdio: 'inherit' });
+        wiredVia = 'install';
+      } catch {
+        // A non-zero exit is not always failure — a package manager can exit non-zero on
+        // a benign warning yet still install the package (see `engineResolves`). If the
+        // Engine landed anyway, treat the install as successful; do NOT fall back to
+        // linkEngine, which would overwrite the good install with a Factory symlink (#13).
+        if (engineResolves(consumerRoot)) {
+          warn(
+            `'${pm} add' exited non-zero but @ai-hero/sandcastle resolves under .sandcastle/ — treating as installed\n` +
+              `  (likely a benign ${pm} warning, e.g. ignored build scripts; issue #13).`,
+          );
+        } else if (linkEngine(FACTORY_ROOT, consumerRoot)) {
+          // Offline / unknown pm / genuine install failure — link the Engine as a fallback
+          // so adoption still lands.
+          wiredVia = 'symlink';
+          warn(
+            `'${pm} add' failed — linked @ai-hero/sandcastle from the Factory clone into .sandcastle/ as a fallback.\n` +
+              `  This breaks if the Factory clone moves or is removed; make it permanent with:\n` +
+              `    ${pm === 'npm' ? 'npm install' : pm + ' add'} ${engineSpecs.join(' ')}    # run inside .sandcastle/`,
+          );
+        } else {
+          console.error(
+            `Engine install failed and the symlink fallback could not be created\n` +
+              `(no node_modules/@ai-hero in the Factory — run \`npm install\` there first).\n` +
+              `Install @ai-hero/sandcastle in .sandcastle/ manually, then re-run with --force.`,
+          );
+          process.exit(1);
+        }
       }
     }
   } else {
@@ -376,7 +483,13 @@ function main(): void {
   info('\nAdoption complete.');
   info(`  Factory : ${FACTORY_ROOT}`);
   info(`  Consumer: ${consumerRoot}`);
-  info(`  Engine  : ${wiredVia === 'symlink' ? 'symlinked from the Factory clone (fallback)' : wiredVia === 'install' ? 'installed into the consumer' : 'already present in the consumer'}`);
+  info(`  Engine  : ${wiredVia === 'symlink' ? 'symlinked from the Factory clone into .sandcastle/ (fallback)' : wiredVia === 'install' ? 'installed under .sandcastle/ (out-of-tree; root package.json untouched)' : 'already resolvable in the consumer'}`);
+  if (devToolsFailed) {
+    warn(
+      '  Dev tools: install FAILED — `npx tsx .sandcastle/main.ts` will not run until you\n' +
+        '    install the missing tsx/typescript/@types/node in the consumer.',
+    );
+  }
   info('\nNext:');
   info('  - Fill in project context (skeletons live in the Factory, not the copy):');
   info('      cp <factory>/templates/CLAUDE.md   <consumer>/CLAUDE.md');
