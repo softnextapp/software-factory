@@ -10,7 +10,10 @@ import {
   hasPnpmWorkspace,
   pmAddArgs,
   consumerRootIsCjs,
-  buildExcludePatch,
+  wholeSandcastleLine,
+  findWholeDirIgnores,
+  wholeDirIgnoreWarning,
+  gitFailureReason,
   engineRuntimeDeps,
   computeMissing,
   toSpecs,
@@ -155,36 +158,160 @@ test('malformed package.json → treated as CJS (a redundant repair is harmless)
 });
 
 // ---------------------------------------------------------------------------
-// buildExcludePatch — idempotent append of `.sandcastle/` to .git/info/exclude
+// wholeSandcastleLine + findWholeDirIgnores + wholeDirIgnoreWarning — the
+// pre-#29 legacy rule adoption must DETECT instead of writing. A consumer
+// adopted before #29 carries a whole-dir `.sandcastle/` line in its local
+// `.git/info/exclude` (or its tracked .gitignore); left in place it silently
+// undoes the new posture: `git add .sandcastle/` refuses the config, and the
+// operator cannot see why. Adoption never edits the file behind the user's
+// back (a LOCAL exclude is someone's machine, not ours) — it names the exact
+// line to drop. Detection is exact-line on the trimmed line, never a substring
+// match: a comment mentioning `.sandcastle/` is not an ignore rule.
+//
+// The rule is looked for in TWO files (the local exclude and the tracked root
+// .gitignore), and adopt wrote only the first of them — so the spelling in the
+// second is whoever typed it. Every form that ignores the whole layer counts:
+// the bare `.sandcastle/`, git's root anchor `/.sandcastle/`, and the wildcards
+// `.sandcastle/*` / `.sandcastle/**`. Missing one means silence where the issue
+// demands a warning.
 // ---------------------------------------------------------------------------
 
-test('null exclude → append ".sandcastle/"', () => {
-  const p = buildExcludePatch(null);
-  assert.equal(p.append, true);
-  assert.equal(p.content, '.sandcastle/\n');
+test('wholeSandcastleLine: both spellings of the whole-dir rule are recognized', () => {
+  assert.equal(wholeSandcastleLine('.sandcastle/'), true);
+  assert.equal(wholeSandcastleLine('.sandcastle'), true);
 });
-test('empty exclude → append ".sandcastle/"', () => {
-  assert.deepEqual(buildExcludePatch(''), { append: true, content: '.sandcastle/\n' });
+test('wholeSandcastleLine: git\'s root-anchored spellings count too', () => {
+  // `/.sandcastle/` is at least as idiomatic as the bare form in a hand-written
+  // root .gitignore, and it ignores the layer just as completely.
+  assert.equal(wholeSandcastleLine('/.sandcastle/'), true);
+  assert.equal(wholeSandcastleLine('/.sandcastle'), true);
+  assert.equal(wholeSandcastleLine('  /.sandcastle/  '), true);
 });
-test('exclude already listing ".sandcastle/" → do not append', () => {
-  assert.deepEqual(buildExcludePatch('node_modules\n.sandcastle/\n'), { append: false, content: '' });
+test('wholeSandcastleLine: the wildcard spellings swallow the layer, so they count', () => {
+  assert.equal(wholeSandcastleLine('.sandcastle/*'), true);
+  assert.equal(wholeSandcastleLine('.sandcastle/**'), true);
+  assert.equal(wholeSandcastleLine('/.sandcastle/**'), true);
 });
-test('exclude listing ".sandcastle" (no slash) → treated as present, do not append', () => {
-  assert.deepEqual(buildExcludePatch('.sandcastle'), { append: false, content: '' });
+test('wholeSandcastleLine: a NEGATION re-includes, so it is not a whole-dir ignore', () => {
+  // `!.sandcastle/` is the opposite gesture — flagging it would send the operator
+  // to delete the very line keeping the config trackable.
+  assert.equal(wholeSandcastleLine('!.sandcastle/'), false);
+  assert.equal(wholeSandcastleLine('!/.sandcastle'), false);
 });
-test('a line merely containing ".sandcastle/" as a substring is NOT treated as the ignore (no false negative)', () => {
-  // e.g. a comment "# keep .sandcastle/ local" must not suppress the real append.
-  const p = buildExcludePatch('# keep .sandcastle/ local\n');
-  assert.equal(p.append, true);
-  assert.equal(p.content, '.sandcastle/\n');
+test('wholeSandcastleLine: a blank line is not a rule', () => {
+  assert.equal(wholeSandcastleLine(''), false);
+  assert.equal(wholeSandcastleLine('   '), false);
 });
-test('content ending without a newline gets a leading separator (no glueing onto an existing line)', () => {
-  const p = buildExcludePatch('node_modules');
-  assert.equal(p.content, '\n.sandcastle/\n');
+test('wholeSandcastleLine: a neighbouring path that merely starts the same is NOT the rule', () => {
+  // No prefix matching: these are different directories entirely.
+  assert.equal(wholeSandcastleLine('.sandcastle-old/'), false);
+  assert.equal(wholeSandcastleLine('.sandcastle.bak'), false);
+  assert.equal(wholeSandcastleLine('vendor/.sandcastle/'), false);
 });
-test('content ending with a newline gets NO extra leading separator', () => {
-  const p = buildExcludePatch('node_modules\n');
-  assert.equal(p.content, '.sandcastle/\n');
+test('wholeSandcastleLine: a subpath rule is NOT the whole-dir rule', () => {
+  // The #29 boundary's own lines — `.env*`, `logs/`, … — are scoped, so they
+  // must not read as "the whole dir is ignored".
+  assert.equal(wholeSandcastleLine('.sandcastle/.env*'), false);
+  assert.equal(wholeSandcastleLine('.sandcastle/logs/'), false);
+  assert.equal(wholeSandcastleLine('node_modules/'), false);
+});
+test('wholeSandcastleLine: a comment or free-text mention is NOT a rule', () => {
+  assert.equal(wholeSandcastleLine('# keep .sandcastle/ local'), false);
+  assert.equal(wholeSandcastleLine('see .sandcastle/README'), false);
+});
+test('wholeSandcastleLine: surrounding whitespace is trimmed away', () => {
+  assert.equal(wholeSandcastleLine('  .sandcastle/  '), true);
+  assert.equal(wholeSandcastleLine('\t.sandcastle\t'), true);
+});
+
+test('findWholeDirIgnores: a pre-#29 exclude file yields the offending line', () => {
+  // The exact shape adoption used to write (and only ever appended) — plus
+  // unrelated rules that must be left alone.
+  const text = 'node_modules\n.sandcastle/\ndist/\n';
+  assert.deepEqual(findWholeDirIgnores(text), ['.sandcastle/']);
+});
+test('findWholeDirIgnores: both spellings are found, in file order', () => {
+  // A consumer that worked around the exclusion twice keeps BOTH lines; the
+  // operator should see every one to remove.
+  assert.deepEqual(findWholeDirIgnores('.sandcastle\n.sandcastle/\n'), ['.sandcastle', '.sandcastle/']);
+});
+test('findWholeDirIgnores: the #29 artifact boundary yields NOTHING (scoped rules only)', () => {
+  // This is the shipped `.sandcastle/.gitignore`'s own content — re-detecting
+  // it as a whole-dir ignore would be a false positive on our own boundary.
+  const text = '.env*\n!.env*.example\nlogs/\nworktrees/\nnode_modules/\n';
+  assert.deepEqual(findWholeDirIgnores(text), []);
+});
+test('findWholeDirIgnores: null (no exclude file) → empty, never throws', () => {
+  assert.deepEqual(findWholeDirIgnores(null), []);
+});
+test('findWholeDirIgnores: comments mentioning .sandcastle/ are not flagged', () => {
+  assert.deepEqual(findWholeDirIgnores('# config lives in .sandcastle/ now\nlogs/\n'), []);
+});
+test('findWholeDirIgnores: the anchored and wildcard forms are reported verbatim', () => {
+  // Reported as written, not normalized: the operator has to FIND the line in
+  // their file, so the warning must quote the text that is actually there.
+  assert.deepEqual(findWholeDirIgnores('dist/\n/.sandcastle/\n'), ['/.sandcastle/']);
+  assert.deepEqual(findWholeDirIgnores('.sandcastle/**\n'), ['.sandcastle/**']);
+});
+test('findWholeDirIgnores: a CRLF ignore file still yields the line (trimmed)', () => {
+  // A consumer edited on Windows: `\r` must not hide the rule behind an
+  // equality check that never matches.
+  assert.deepEqual(findWholeDirIgnores('node_modules\r\n.sandcastle/\r\n'), ['.sandcastle/']);
+});
+// (The same assertion against the REAL shipped file — rather than this
+// hard-coded copy of it — lives in consumer-ignore.test.ts, which owns the
+// on-disk reads; this file stays pure by construction.)
+
+// ---------------------------------------------------------------------------
+// gitFailureReason — step 4's staging warning has to name why git refused. The
+// child's diagnosis is on `err.stderr`; `err.message` merely repeats the argv,
+// so reading the message's first line reports a tautology.
+// ---------------------------------------------------------------------------
+
+test('gitFailureReason prefers stderr over the "Command failed" message line', () => {
+  const reason = gitFailureReason({
+    message: 'Command failed: git -C /repo add -- .sandcastle/\nThe following paths are ignored...',
+    stderr: 'The following paths are ignored by one of your .gitignore files:\n.sandcastle\n',
+  });
+  assert.ok(reason.includes('ignored by one of your .gitignore files'), 'names git\'s reason');
+  assert.ok(!reason.includes('Command failed'), 'does not echo back the argv we already printed');
+});
+test('gitFailureReason drops git\'s hint: lines (the top one advises the forbidden add -f)', () => {
+  const reason = gitFailureReason({
+    stderr: 'paths are ignored:\n.sandcastle\nhint: Use -f if you really want to add them.\n',
+  });
+  assert.ok(!/hint:/.test(reason), 'no hint: line survives');
+  assert.ok(!/-f\b/.test(reason), 'the add -f advice never reaches the operator');
+});
+test('gitFailureReason falls back to the message when stderr is empty', () => {
+  assert.equal(
+    gitFailureReason({ message: 'Command failed: git add\nsecond line', stderr: '' }),
+    'Command failed: git add',
+  );
+});
+test('gitFailureReason accepts a Buffer stderr (execFileSync without an encoding)', () => {
+  assert.equal(gitFailureReason({ stderr: Buffer.from('fatal: index.lock exists\n') }), 'fatal: index.lock exists');
+});
+test('gitFailureReason never throws and never returns empty on junk input', () => {
+  for (const junk of [null, undefined, {}, 'a string', 42, { stderr: 'hint: only hints\n' }]) {
+    const reason = gitFailureReason(junk);
+    assert.equal(typeof reason, 'string');
+    assert.ok(reason.length > 0, `empty reason for ${JSON.stringify(junk)}`);
+  }
+});
+
+test('wholeDirIgnoreWarning names the file and the exact closing gesture', () => {
+  // The acceptance criterion: warned, with the exact gesture to close the gap —
+  // not fixed behind the user's back. The message must carry the file path (so
+  // the operator knows WHERE) and the line(s) to remove (WHAT).
+  const msg = wholeDirIgnoreWarning('/home/me/app', ['.sandcastle/']);
+  assert.ok(msg.includes('/home/me/app'), 'names the offending file');
+  assert.ok(msg.includes('.sandcastle/'), 'quotes the line to remove');
+  assert.ok(/remove|delete|drop/i.test(msg), 'says to remove it');
+});
+test('wholeDirIgnoreWarning lists every offending line', () => {
+  const msg = wholeDirIgnoreWarning('/repo', ['.sandcastle', '.sandcastle/']);
+  assert.ok(msg.includes('.sandcastle') && msg.includes('.sandcastle/'));
 });
 
 // ---------------------------------------------------------------------------

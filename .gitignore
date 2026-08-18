@@ -1,14 +1,11 @@
 # Dependencies
 node_modules/
 
-# Runtime artifacts a consumer creates locally — never part of the Factory source.
-# (.sandcastle/*.ts, *.test.ts, tsconfig.json and package.json ARE tracked; only these
-#  subpaths are not. The tracked .sandcastle/package.json is the self-contained ESM shim
-#  — { "type": "module" } — so main.ts transpiles regardless of the consumer's root pkg.)
-.sandcastle/.env
-.sandcastle/.env.secrets
-.sandcastle/logs/
-.sandcastle/worktrees/
+# The .sandcastle/ artifact boundary lives in .sandcastle/.gitignore — the same
+# tracked file adoption ships to a consumer (issue #29): the config layer IS
+# tracked there (config.ts and friends are project decisions), and only what a
+# run materializes locally (.env*, logs/, worktrees/, the Engine install) is
+# ignored. One boundary file, shared by the Factory and every instance.
 
 # Local Claude settings (per-developer)
 .claude/settings.local.json
