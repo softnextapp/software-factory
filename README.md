@@ -98,8 +98,9 @@ git push -u origin main
 npm install
 
 # 4. Authenticate against your host (GitLab or GitHub). Then set `gitHost` in
-#    config.ts to match — the default is 'glab'; a GitHub repo sets 'gh'. The loop
-#    warns at startup if gitHost disagrees with the `origin` remote's host.
+#    config.ts to match — the default is 'gh' (the Factory's own host); a GitLab
+#    repo sets 'glab'. The loop warns at startup if gitHost disagrees with the
+#    `origin` remote's host.
 glab auth login   # or: gh auth login
 
 # 5. Provide auth tokens — env-first (preferred) or a secrets file. See "Auth token isolation" below.
@@ -111,7 +112,7 @@ $EDITOR .sandcastle/.env.secrets
 #     run is authed. resolveEnv merges .env into every sandbox — no main.ts patch needed.
 #     Set the var matching your gitHost: GH_TOKEN (gh) / GITLAB_TOKEN (glab). Skip for `local`.
 cp .sandcastle/.env.example .sandcastle/.env                    # optional fallback
-echo "GITLAB_TOKEN=$(glab auth token)" >> .sandcastle/.env      # or GH_TOKEN=$(gh auth token)
+echo "GH_TOKEN=$(gh auth token)" >> .sandcastle/.env            # or GITLAB_TOKEN=$(glab auth token)
 
 # 6. (Optional, recommended) Configure your project identity — see below.
 $EDITOR .sandcastle/config.ts
@@ -294,13 +295,13 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 | `providers` | `ProviderTable` | see below | Named providers — the `{model, baseUrl, tokenKey, effort}` quadruplets. |
 | `profiles` | `Profiles` | see below | Per-profile role → provider bindings. |
 | `mergeStrategy` | `'agent' \| 'human'` | `'human'` | Who merges. `human` = Draft MRs await review (v0.1). `agent` = a Merger auto-merges (fenced). |
-| `commitStyle` | `'ralph' \| 'conventional'` | `'ralph'` | MR title style. `conventional` keeps titles valid Conventional Commit headers. |
-| `gitHost` | `'gh' \| 'glab'` | `'glab'` | Host integration (`gh` = GitHub, `glab` = GitLab). Both are wired in v0.1 — see `host.ts`. |
+| `commitStyle` | `'ralph' \| 'conventional'` | `'conventional'` | MR title style. `conventional` keeps titles valid Conventional Commit headers. |
+| `gitHost` | `'gh' \| 'glab'` | `'gh'` | Host integration (`gh` = GitHub, `glab` = GitLab). Both are wired in v0.1 — see `host.ts`. |
 | `baseBranch` | `string` | `'main'` | The project trunk. A live run fast-forwards each base to `origin` before agents fork, so a round never builds on stale code; a base curated locally ahead of origin is kept as-is (#14). |
 | `labelBases` | `Record<string,string>` | `{}` | Issue label → base branch. Empty ⇒ every issue forks from `baseBranch`. |
 | `queueLabels` | `string[]` | `['sandcastle', 'ready-for-agent']` | Queue trigger labels — an open issue carrying ANY of these is candidate work. Default accepts both so the Factory (`sandcastle`) and captable (`ready-for-agent`) queue with no relabelling; narrow per consumer (#15). |
 | `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Empty ⇒ chaining is inert even with `SANDCASTLE_CHAIN=1`. |
-| `assignee` | `string \| null` | `null` | Host assignee. glab wants a username; gh accepts `@me`. `null` ⇒ leave the MR/PR unassigned. |
+| `assignee` | `string \| null` | `'@me'` | Host assignee. gh accepts `@me`; a GitLab consumer gives a real username (glab wants one). `null` ⇒ leave the MR/PR unassigned. |
 | `worktreeExclude` | `string[]` | `['.pnpm-store/']` | Gitignore patterns for generated artifacts (package-manager stores, …) the Engine's "uncommitted changes" check would otherwise flag in an agent worktree. Written to the shared `.git/info/exclude`, so a tracked-but-uncommitted change still warns (#20). |
 
 A **provider** is the quadruplet `{ model, baseUrl, tokenKey, effort }`:
@@ -314,7 +315,7 @@ A **provider** is the quadruplet `{ model, baseUrl, tokenKey, effort }`:
   `'low' | 'medium' | 'high' | 'xhigh' | 'max'`. Effort follows the **provider**, not
   the role — so `SANDCASTLE_PROFILE=opus` drops the GLM ceiling on its own.
 
-### Defaults (the v0.1 baseline — Omniris / GitLab / human-merge)
+### Defaults (the self-hosted baseline — GitHub / human-merge)
 
 ```ts
 providers: {
@@ -328,8 +329,9 @@ profiles: {
 }
 ```
 
-A consumer on GitHub sets `gitHost: 'gh'` (the GitHub host ships in v0.1 — see
-`host.ts`). The ccsnoop shape adds agent-merge: `mergeStrategy: 'agent'` plus a
+A GitLab consumer flips `gitHost: 'glab'` and gives `assignee` a real username
+(`@me` is gh-only); both host shapes ship in v0.1 — see `host.ts`. The ccsnoop
+shape adds agent-merge: `mergeStrategy: 'agent'` plus a
 `merger` binding on each profile (see `config.test.ts`) — **that** override is still
 fenced in v0.1 until the Merger module lands.
 
@@ -393,8 +395,8 @@ that safe):
 
 ```sh
 # .sandcastle/.env  (gitignored — resolveEnv merges this into every sandbox)
-GH_TOKEN=...        # gitHost: 'gh'
-GITLAB_TOKEN=...    # gitHost: 'glab' (default)
+GH_TOKEN=...        # gitHost: 'gh' (default)
+GITLAB_TOKEN=...    # gitHost: 'glab'
 # gitHost: 'local' → none (no host CLI, no token required)
 ```
 
@@ -443,8 +445,8 @@ alternatives in ADR-0005.
 
 **Served out of the box:** the **Split** profile + **human-merge** (draft MR/PR,
 awaiting review) + **both** host shapes — **GitLab** (`glab`) and **GitHub** (`gh`),
-via `host.ts`. The GitLab shape is the default (the Omniris majority); a GitHub
-project flips `gitHost: 'gh'` in `config.ts`.
+via `host.ts`. The GitHub shape is the default (the Factory's own host — where its
+self-hosted loop runs); a GitLab project flips `gitHost: 'glab'` in `config.ts`.
 
 **Fenced with a loud, early guard** (it throws at startup, not silently no-op):
 

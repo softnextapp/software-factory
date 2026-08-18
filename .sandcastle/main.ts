@@ -735,8 +735,8 @@ const chainDryRun = (): Record<string, unknown> => {
 const titleStyle = cfg.project.commitStyle === 'conventional' ? 'conventional' : 'plain';
 
 // Best-effort host-mismatch warning: a `gitHost` that disagrees with the actual
-// `origin` remote is the most likely misconfiguration on a fresh adopt (a GitHub
-// repo cloned with the Factory's default gitHost='glab'). Surfacing it here —
+// `origin` remote is the most likely misconfiguration on a fresh adopt (a GitLab
+// repo adopted with the Factory's default gitHost='gh'). Surfacing it here —
 // before a real, token-burning run hits the first glab/gh call — turns a confusing
 // mid-loop failure into a one-line "set gitHost: 'gh'". Advisory only: a missing or
 // unrecognised origin emits nothing (the operator may know better than the heuristic).

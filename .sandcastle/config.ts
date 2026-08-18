@@ -188,13 +188,20 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   providers: DEFAULT_PROVIDERS,
   profiles: DEFAULT_PROFILES,
   mergeStrategy: 'human',
-  commitStyle: 'ralph',
-  gitHost: 'glab',
+  // Self-hosting pivot: the Factory runs its own loop on its own GitHub repo, and this
+  // instance config IS the shipped default — so the default moved off the v0.1
+  // Omniris/GitLab baseline to the Factory's own identity: GitHub host, Conventional
+  // Commit titles (this repo's merged history), self-assigned draft PRs. A GitLab
+  // consumer flips gitHost to 'glab' and gives assignee a real username (`@me` is
+  // gh-only) — both host shapes ship in host.ts, and the loop warns at startup on a
+  // gitHost/origin mismatch.
+  commitStyle: 'conventional',
+  gitHost: 'gh',
   baseBranch: 'main',
   labelBases: {},
   queueLabels: ['sandcastle', 'ready-for-agent'],
   chainableBases: [],
-  assignee: null,
+  assignee: '@me',
   // No install hook (repo-specific toolchain); copy node_modules when present. Both are
   // consumer knobs now (issue #19) — these are the values main.ts used to hardcode, so a
   // consumer who sets neither gets identical behaviour.
