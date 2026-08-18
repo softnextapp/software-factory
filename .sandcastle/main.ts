@@ -1276,6 +1276,11 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         issue: issueInfo,
         branch,
         base: issue.base,
+        // Drives the closure decision (issue #27): `Closes #n` only when the target
+        // IS the trunk, else the explicit why-not note. The trunk comes from the
+        // config — never a hardcoded 'main' — so a consumer with another default
+        // branch gets the same guarantee.
+        defaultBranch: cfg.project.baseBranch,
         summary,
         ...(summaryError ? { summaryError } : {}),
         review: {
