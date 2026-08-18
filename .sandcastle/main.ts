@@ -62,6 +62,7 @@ import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.t
 import { loadConfig, type Provider, type Role } from './config.ts';
 import {
   buildRunBranch,
+  mintRunId,
   isAgentBranch,
   runBranchBases,
   decideSweep,
@@ -759,13 +760,26 @@ const branchTips = (): Map<string, string> => {
   return out;
 };
 
-/** Branches checked out in a worktree — a live run may own them; never swept. */
-const worktreeBranches = (): Set<string> => {
-  const out = new Set<string>();
+/**
+ * Branch → the worktree that has it checked out, from ONE `git worktree list`. A
+ * live run may own any of these, so none of them is ever swept; the path is what
+ * the sweep would remove alongside the branch.
+ *
+ * EXACT branch names, never a prefix test: `…-r<run>-1` is a string prefix of
+ * `…-r<run>-10`, so matching the porcelain's `branch refs/heads/…` line by prefix
+ * hands the sweep of an empty iteration-1 branch the worktree of a LIVE
+ * iteration-10 one — which it then removes with `--force`. Reproduced on a
+ * throwaway repo; the map keys on the full ref instead.
+ */
+const worktreeByBranch = (): Map<string, string> => {
+  const out = new Map<string, string>();
+  const BRANCH = 'branch refs/heads/';
   try {
     const raw = execFileSync('git', ['worktree', 'list', '--porcelain'], { encoding: 'utf8' });
+    let path: string | null = null;
     for (const line of raw.split('\n')) {
-      if (line.startsWith('branch ')) out.add(line.slice('branch refs/heads/'.length).trim());
+      if (line.startsWith('worktree ')) path = line.slice('worktree '.length).trim();
+      else if (line.startsWith(BRANCH) && path !== null) out.set(line.slice(BRANCH.length).trim(), path);
     }
   } catch {
     // git worktree unavailable — read as "none": decideSweep's checkedOutElsewhere
@@ -773,21 +787,6 @@ const worktreeBranches = (): Set<string> => {
     // out" refusal is the backstop, same as the Engine's create path).
   }
   return out;
-};
-
-/** The worktree path holding `branch`, when one does. */
-const worktreePathOf = (branch: string): string | null => {
-  try {
-    const raw = execFileSync('git', ['worktree', 'list', '--porcelain'], { encoding: 'utf8' });
-    let path: string | null = null;
-    for (const line of raw.split('\n')) {
-      if (line.startsWith('worktree ')) path = line.slice('worktree '.length).trim();
-      if (line.startsWith(`branch refs/heads/${branch}`) && path !== null) return path;
-    }
-  } catch {
-    // fall through
-  }
-  return null;
 };
 
 /**
@@ -810,14 +809,23 @@ const worktreePathOf = (branch: string): string | null => {
  * zero for everything. NOT remotes either: a branch pushed for a PR then rebased
  * locally would still share its commits with `origin/<branch>` — but its LOCAL
  * content is what this repo owns, so only local refs count.
+ *
+ * The exclusions go through `--stdin` (`^<sha>` lines) rather than argv: this runs
+ * once per agent branch with every OTHER branch's tip, so a repo with a few
+ * hundred branches would build a quadratic argument list and eventually hit
+ * ARG_MAX. `--stdin` is byte-for-byte the same revision set, off the command line.
  */
 const hasOwnCommits = (branch: string, tips: ReadonlyMap<string, string>): boolean => {
   const tip = tips.get(branch);
   if (tip === undefined) return true; // unresolvable ⇒ not provably empty ⇒ kept
-  const otherTips = [...tips.entries()].filter(([name]) => name !== branch).map(([, sha]) => sha);
+  const exclusions = [...tips.entries()]
+    .filter(([name]) => name !== branch)
+    .map(([, sha]) => `^${sha}\n`)
+    .join('');
   try {
-    const out = execFileSync('git', ['rev-list', '--count', tip, '--not', ...otherTips], {
+    const out = execFileSync('git', ['rev-list', '--count', '--stdin', tip], {
       encoding: 'utf8',
+      input: exclusions,
     }).trim();
     return Number(out) > 0;
   } catch {
@@ -873,7 +881,7 @@ const sweepDeadBranches = (protectedBranches: ReadonlySet<string>): void => {
     return;
   }
   const mrSources = new Set(openMrs.map((mr) => mr.sourceBranch));
-  const checkedOut = worktreeBranches();
+  const checkedOut = worktreeByBranch();
   let swept = 0;
   for (const branch of agentBranches) {
     if (protectedBranches.has(branch)) continue; // this run's — about to be created
@@ -881,12 +889,19 @@ const sweepDeadBranches = (protectedBranches: ReadonlySet<string>): void => {
       branch,
       hasOwnCommits: hasOwnCommits(branch, snapshot),
       hasOpenMr: mrSources.has(branch),
-      baseExists: attachedToTrunk(branch),
+      attachedToTrunk: attachedToTrunk(branch),
       checkedOutElsewhere: checkedOut.has(branch),
     };
     const verdict = decideSweep(facts);
     if (!verdict.sweep) continue;
-    const worktree = worktreePathOf(branch);
+    // From the same snapshot the verdict was taken on, so it can only ever name
+    // THIS branch's own worktree. Today the checkedOutElsewhere guard means a
+    // swept branch never has one — acceptance #2 ("supprimée avec son worktree")
+    // and #4 ("ne touche aucune branche d'un run en cours") overlap, and #4 wins:
+    // nothing here can tell a dead run's worktree from a live one's. The removal
+    // stays as the honest half of #2 and as the belt for a git that reports a
+    // worktree the listing above did not.
+    const worktree = checkedOut.get(branch) ?? null;
     try {
       if (worktree !== null) {
         execFileSync('git', ['worktree', 'remove', '--force', worktree], { stdio: 'ignore' });
@@ -948,14 +963,9 @@ const titleStyle = cfg.project.commitStyle === 'conventional' ? 'conventional' :
 // `<planner-branch>-r<runId>-<iteration>`: the run id differs across two relances
 // of the same ticket, so a run killed mid-iteration can no longer have its branch
 // resurrected by the next one — which used to fork from the dead run's base
-// silently (see branch-sweep.ts). Minute resolution is enough: two relances of
-// the SAME ticket within one minute is not a shape worth naming apart, and the
-// minute field keeps the branch name short.
-const RUN_ID: RunId = (() => {
-  // `20260818-0930` from one clock read: date compacted, colon dropped.
-  const [date, time] = new Date().toISOString().split('T');
-  return `${(date ?? '').replaceAll('-', '')}-${(time ?? '').slice(0, 2)}${(time ?? '').slice(3, 5)}`;
-})();
+// silently. The format (seconds, UTC) and its reasons live in branch-sweep.ts,
+// where it is unit-tested; this is only the clock read.
+const RUN_ID: RunId = mintRunId(new Date());
 
 // Best-effort host-mismatch warning: a `gitHost` that disagrees with the actual
 // `origin` remote is the most likely misconfiguration on a fresh adopt (a GitLab

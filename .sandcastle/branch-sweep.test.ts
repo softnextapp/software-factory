@@ -13,7 +13,7 @@
 import assert from 'node:assert/strict';
 import {
   buildRunBranch,
-  parseRunSuffix,
+  mintRunId,
   isAgentBranch,
   runBranchBases,
   decideSweep,
@@ -43,35 +43,46 @@ test('same run + iteration, two different tickets → distinct names', () => {
 });
 
 test('name is planner-branch + "-r<run>-<iteration>" — readable, and never the bare planner branch', () => {
-  assert.equal(buildRunBranch('sandcastle/issue-12-fix', '20260817-2114', 3), 'sandcastle/issue-12-fix-r20260817-2114-3');
+  assert.equal(
+    buildRunBranch('sandcastle/issue-12-fix', '20260817-211432', 3),
+    'sandcastle/issue-12-fix-r20260817-211432-3',
+  );
 });
 
-test('the round-trip parses back the run id and iteration (sweep knows whose leftover it is)', () => {
-  const name = buildRunBranch('sandcastle/issue-12-fix', '20260817-2114', 3);
-  const parsed = parseRunSuffix(name);
-  assert.ok(parsed !== null);
-  assert.equal(parsed.base, 'sandcastle/issue-12-fix');
-  assert.equal(parsed.runId, '20260817-2114');
-  assert.equal(parsed.iteration, 3);
+test('the branch name is a legal git ref: no space, no `..`, no trailing dot or slash', () => {
+  const name = buildRunBranch('sandcastle/issue-12-fix', mintRunId(new Date('2026-08-18T09:30:41Z')), 1);
+  assert.ok(!/[\s~^:?*[\\]/.test(name), `${name} must carry no character git refuses in a ref`);
+  assert.ok(!name.includes('..') && !name.endsWith('.') && !name.endsWith('/'));
 });
 
-test('parseRunSuffix: the pre-#28 legacy -r<iteration> name parses with runId null', () => {
-  // A leftover from before this change (e.g. `…-r1`) is still an agent branch of
-  // THIS project and still sweeps by the same rules — the net must catch it.
-  const parsed = parseRunSuffix('sandcastle/issue-12-fix-r1');
-  assert.ok(parsed !== null);
-  assert.equal(parsed.base, 'sandcastle/issue-12-fix');
-  assert.equal(parsed.runId, null);
-  assert.equal(parsed.iteration, 1);
+// --- mintRunId: the run id whose resolution decides acceptance #1 -------------
+
+test('mintRunId renders YYYYMMDD-HHMMSS from the clock it is given', () => {
+  assert.equal(mintRunId(new Date('2026-08-18T09:30:41.123Z')), '20260818-093041');
 });
 
-test('parseRunSuffix: -r<n> where n is not a run id nor an iteration → null (not ours)', () => {
-  assert.equal(parseRunSuffix('sandcastle/issue-12-fix-r'), null);
-  assert.equal(parseRunSuffix('sandcastle/issue-12-fix-rabc'), null);
-  assert.equal(parseRunSuffix('sandcastle/issue-12-fix-r2026-x'), null);
-  assert.equal(parseRunSuffix('sandcastle/issue-12-fix-r20260817-2114-x'), null);
-  // A run id in the new format followed by junk is not a name we ever minted.
-  assert.equal(parseRunSuffix('sandcastle/issue-12-fix-r20260817-2114-3-4'), null);
+test('acceptance #1: two relances in the SAME minute still mint distinct branch names', () => {
+  // The regression this guards: at minute resolution a run killed at 09:30:05 and
+  // relaunched at 09:30:44 minted the same name, i.e. exactly the resurrected
+  // branch (and silently stale fork base) issue #28 was filed to close.
+  const killed = mintRunId(new Date('2026-08-18T09:30:05Z'));
+  const relance = mintRunId(new Date('2026-08-18T09:30:44Z'));
+  assert.notEqual(killed, relance);
+  assert.notEqual(
+    buildRunBranch('sandcastle/issue-12-fix', killed, 1),
+    buildRunBranch('sandcastle/issue-12-fix', relance, 1),
+  );
+});
+
+test('mintRunId is UTC — the id sorts monotonically across a DST jump', () => {
+  const before = mintRunId(new Date('2026-10-25T00:30:00Z'));
+  const after = mintRunId(new Date('2026-10-25T01:30:00Z'));
+  assert.ok(after > before, `${after} must sort after ${before}`);
+});
+
+test('mintRunId is pure: the same instant always yields the same id', () => {
+  const instant = new Date('2026-08-18T09:30:41Z');
+  assert.equal(mintRunId(instant), mintRunId(new Date(instant.getTime())));
 });
 
 // --- isAgentBranch: whose branches the sweep may even look at ----------------
@@ -105,10 +116,10 @@ test('runBranchBases: every planned branch × every iteration, all carrying the 
 // --- decideSweep: the pure verdict --------------------------------------------
 
 const facts = (over: Partial<BranchFacts>): BranchFacts => ({
-  branch: 'sandcastle/issue-12-fix-r20260817-2114-1',
+  branch: 'sandcastle/issue-12-fix-r20260817-211432-1',
   hasOwnCommits: false,
   hasOpenMr: false,
-  baseExists: true,
+  attachedToTrunk: true,
   checkedOutElsewhere: false,
   ...over,
 });
@@ -131,14 +142,13 @@ test('a branch with an open MR is NEVER swept', () => {
   assert.ok(v.reason.includes('MR'));
 });
 
-test('a branch whose base no longer exists is kept — it is not provably empty', () => {
-  // `git rev-list <br> --not --all` counts commits reachable from the branch and no
-  // other local ref; with the base gone the count is inflated by the base's own
-  // history, so "0 own commits" can no longer be trusted. Keep it; the operator
-  // decides. Deleting on a false reading is how real work disappears.
-  const v = decideSweep(facts({ baseExists: false }));
+test('a branch with unrelated history is kept — it is not provably OUR leftover', () => {
+  // No merge base with the trunk at all: grafted from somewhere else. Emptiness
+  // measured against local tips is too thin a basis to delete on. Keep it; the
+  // operator decides. Deleting on a thin reading is how real work disappears.
+  const v = decideSweep(facts({ attachedToTrunk: false }));
   assert.equal(v.sweep, false);
-  assert.ok(v.reason.includes('base'));
+  assert.ok(v.reason.includes('unrelated history'));
 });
 
 test('a branch checked out in another worktree is never swept (a live run may own it)', () => {
@@ -147,19 +157,45 @@ test('a branch checked out in another worktree is never swept (a live run may ow
   assert.ok(v.reason.includes('worktree'));
 });
 
-test('commits beat MR-beat-base in reporting: the first blocking reason is named', () => {
-  const v = decideSweep(facts({ hasOwnCommits: true, hasOpenMr: true, baseExists: false }));
+test('commits beat MR beat worktree beat history in reporting: the first blocking reason is named', () => {
+  const v = decideSweep(
+    facts({ hasOwnCommits: true, hasOpenMr: true, checkedOutElsewhere: true, attachedToTrunk: false }),
+  );
   assert.equal(v.sweep, false);
   assert.ok(v.reason.includes('commit'));
+});
+
+test('every protection alone is enough — no combination of the four ever sweeps', () => {
+  // The sweep deletes; the interesting property is that it under-deletes, never
+  // over-deletes. Exhaustive over the four facts: the ONLY swept combination is
+  // the all-clear one.
+  for (const hasOwnCommits of [false, true]) {
+    for (const hasOpenMr of [false, true]) {
+      for (const checkedOutElsewhere of [false, true]) {
+        for (const attachedToTrunk of [false, true]) {
+          const v = decideSweep(facts({ hasOwnCommits, hasOpenMr, checkedOutElsewhere, attachedToTrunk }));
+          const allClear = !hasOwnCommits && !hasOpenMr && !checkedOutElsewhere && attachedToTrunk;
+          assert.equal(
+            v.sweep,
+            allClear,
+            `commits=${hasOwnCommits} mr=${hasOpenMr} wt=${checkedOutElsewhere} trunk=${attachedToTrunk}`,
+          );
+          assert.notEqual(v.reason, '', 'both verdicts always carry a motive — the log records it');
+        }
+      }
+    }
+  }
 });
 
 // --- describeSweep: the logged line -------------------------------------------
 
 test('describeSweep renders the branch, the verdict and the reason on one line', () => {
   const verdict = decideSweep(facts({}));
-  const line = describeSweep(verdict, 'sandcastle/issue-12-fix-r20260817-2114-1');
-  assert.ok(line.includes('sandcastle/issue-12-fix-r20260817-2114-1'));
+  const line = describeSweep(verdict, 'sandcastle/issue-12-fix-r20260817-211432-1');
+  assert.ok(line.includes('sandcastle/issue-12-fix-r20260817-211432-1'));
+  assert.ok(line.includes('swept'));
   assert.ok(line.includes('no commit'));
+  assert.ok(!line.includes('\n'), 'one branch, one log line — the operator greps it');
 });
 
 test('describeSweep for a kept branch says keep, with the reason', () => {

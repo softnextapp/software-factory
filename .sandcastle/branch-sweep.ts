@@ -13,8 +13,9 @@
 // from `main`, reopening a divergence that had just been closed by hand.
 //
 // Two effects, shipped together because they close one hole each:
-//   1. buildRunBranch() names a branch after the RUN (date + local clock), so two
-//      runs never mint the same name — the resurrected-branch path disappears.
+//   1. mintRunId()/buildRunBranch() name a branch after the RUN (the wall clock at
+//      startup), so two runs never mint the same name — the resurrected-branch
+//      path disappears.
 //   2. decideSweep() is the startup net: an agent branch with no commit of its own
 //      and no open MR is dead weight a later planner could pick up; the sweep
 //      deletes it (with its worktree) and says why. Branches that carry commits or
@@ -28,8 +29,28 @@
 /** The agent-branch namespace every Factory run forks its work into. */
 const AGENT_BRANCH_PREFIX = 'sandcastle/';
 
-/** A run id as minted by main.ts: `YYYYMMDD-HHMM` — compact, sortable, readable in a branch name. */
+/** A run id as minted by mintRunId(): `YYYYMMDD-HHMMSS` — compact, sortable, readable in a branch name. */
 export type RunId = string;
+
+/**
+ * The identity of ONE run, from the clock read at its startup: `YYYYMMDD-HHMMSS`,
+ * UTC so the id keeps sorting across a machine's DST jumps.
+ *
+ * Pure by parameter: main.ts hands in the `Date`, so the format is testable here
+ * rather than hidden in an IIFE next to the loop.
+ *
+ * SECONDS, not minutes: the acceptance criterion is that two successive runs never
+ * mint the same branch name for one ticket, and a relance of a killed run lands
+ * within the same minute routinely — that is the very shape of the incident this
+ * closes. Two relances inside the same SECOND is not reachable: a run reads its
+ * queue and plans before it forks a single branch.
+ */
+export function mintRunId(now: Date): RunId {
+  const iso = now.toISOString(); // `2026-08-18T09:30:41.000Z`
+  const date = iso.slice(0, 10).replaceAll('-', '');
+  const clock = iso.slice(11, 19).replaceAll(':', '');
+  return `${date}-${clock}`;
+}
 
 /**
  * The full branch name a run forks for one ticket: `<planner-branch>-r<run>-<iteration>`.
@@ -40,36 +61,6 @@ export type RunId = string;
  */
 export function buildRunBranch(plannerBranch: string, runId: RunId, iteration: number): string {
   return `${plannerBranch}-r${runId}-${iteration}`;
-}
-
-/**
- * Split a run-suffixed agent branch back into its parts.
- *
- * Recognises BOTH shapes this Factory has ever minted:
- *   - `-r<run>-<iteration>` (post-#28): runId is the date-clock id, e.g. `20260817-2114`;
- *   - `-r<iteration>` (pre-#28): runId is null — the name predates run-scoped naming.
- *
- * Returns null when the name carries no recognised suffix: a branch the Factory
- * never named this way is not ours to reason about. The two alternatives are
- * explicit and disjoint — a run id always contains `-`, an iteration never does —
- * so a run-scoped name can never be misread as legacy, nor the reverse. A run id
- * without its trailing iteration (or a bare number followed by more numbers) is
- * a shape this Factory never minted and reads as null.
- */
-const RUN_SUFFIX = /-r(?:(\d{8}-\d{2,4})-(\d+)|(\d+))$/;
-export function parseRunSuffix(branch: string): {
-  base: string;
-  runId: RunId | null;
-  iteration: number;
-} | null {
-  const match = branch.match(RUN_SUFFIX);
-  if (!match) return null;
-  const scopedRunId = match[1];
-  return {
-    base: branch.slice(0, branch.length - match[0].length),
-    runId: scopedRunId !== undefined ? scopedRunId : null,
-    iteration: Number(scopedRunId !== undefined ? match[2] : match[3]),
-  };
 }
 
 /**
@@ -103,8 +94,15 @@ export interface BranchFacts {
   readonly hasOwnCommits: boolean;
   /** True when an open MR/PR on the host has this branch as its source. */
   readonly hasOpenMr: boolean;
-  /** True when the branch's fork base still exists as a local ref. */
-  readonly baseExists: boolean;
+  /**
+   * True when the branch shares any history with the project's trunk.
+   *
+   * NOT "its fork base still exists": a leftover forked from an old trunk tip has
+   * no base ref of its own once the trunk moves on, and that is the exact shape
+   * #28 must still sweep. What this rules out is unrelated history — a branch
+   * grafted from elsewhere, which is not provably this repo's leftover.
+   */
+  readonly attachedToTrunk: boolean;
   /** True when the branch is checked out in a worktree (possibly a live run's). */
   readonly checkedOutElsewhere: boolean;
 }
@@ -123,16 +121,15 @@ export interface SweepVerdict {
  *   - no commit of its own above any local ref (the branch is a bare pointer at
  *     its base: nothing was ever built on it);
  *   - no open MR (nothing on the host argues for keeping it);
- *   - its base still exists (otherwise "no commits" cannot be trusted — see below).
+ *   - it is attached to the trunk (otherwise it is not provably ours — see below).
  *
  * Never swept, in decreasing order of precedence:
  *   - it carries commits: real work, however old or abandoned (acceptance #3);
  *   - an open MR carries it: the host still knows the branch (acceptance #3);
  *   - checked out in a worktree: git would refuse the delete anyway, and the
  *     worktree may belong to a run that is still alive (acceptance #4);
- *   - its base is gone: `hasOwnCommits` is computed against every local ref, so a
- *     vanished base inflates the count the other way — the branch is NOT provably
- *     empty, and deleting on an unreadable measurement is how work disappears.
+ *   - unrelated history: no merge base with the trunk at all. `--not` emptiness
+ *     alone is too thin a basis to delete a branch grafted from somewhere else.
  *     Left for the operator, like a diverged base in syncBaseToOrigin.
  */
 export function decideSweep(facts: BranchFacts): SweepVerdict {
@@ -145,8 +142,8 @@ export function decideSweep(facts: BranchFacts): SweepVerdict {
   if (facts.checkedOutElsewhere) {
     return { sweep: false, reason: 'checked out in another worktree — possibly a live run' };
   }
-  if (!facts.baseExists) {
-    return { sweep: false, reason: 'base branch no longer exists — not provably empty, kept' };
+  if (!facts.attachedToTrunk) {
+    return { sweep: false, reason: 'unrelated history — shares no commit with the trunk, kept' };
   }
   return { sweep: true, reason: 'no commit of its own and no MR — dead-run leftover' };
 }
@@ -156,8 +153,6 @@ export function decideSweep(facts: BranchFacts): SweepVerdict {
  * operator reading the log can audit every deletion (acceptance #2: the
  * suppression is journalisée avec son motif).
  */
-export function describeSweep(verdict: SweepVerdict, branch?: string): string {
-  const name = branch ?? '';
-  const what = verdict.sweep ? 'swept' : 'kept';
-  return name === '' ? `${what}: ${verdict.reason}` : `${name} ${what}: ${verdict.reason}`;
+export function describeSweep(verdict: SweepVerdict, branch: string): string {
+  return `${branch} ${verdict.sweep ? 'swept' : 'kept'}: ${verdict.reason}`;
 }
