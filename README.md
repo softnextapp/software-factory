@@ -185,8 +185,10 @@ commits on your behalf):
    `worktrees/`, the out-of-tree Engine install), so secrets never become tracked —
    this is exactly the posture the Factory holds on itself. Your root `.gitignore` and
    `.git/info/exclude` are left alone. A repo adopted **before** this change carries a
-   whole-dir `.sandcastle/` line in its `.git/info/exclude`; adopt detects it and prints
-   the exact line to remove — it never edits your ignore files behind your back.
+   whole-dir `.sandcastle/` line in its `.git/info/exclude`; adopt reads both that file and
+   your root `.gitignore`, recognises every spelling of the rule (`.sandcastle/`,
+   `/.sandcastle/`, `.sandcastle/*`, `.sandcastle/**`) and prints the exact line to remove —
+   it never edits your ignore files behind your back.
 
 After adopting, fill in the project-context skeletons (they ship in the Factory's
 `templates/`, not in the copy) and then follow [Setup](#setup) from the **Authenticate**

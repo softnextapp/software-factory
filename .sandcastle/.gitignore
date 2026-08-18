@@ -4,12 +4,21 @@
 # in review and in history — diffable, restorable, visible to every clone and
 # to agents working in linked worktrees. Only what a machine generates below
 # stays out: secrets (.env*), logs, agent worktrees, the out-of-tree Engine
-# install (#22) and its standalone lockfiles (#23). The examples are negated
+# install (#22) with its local store and standalone lockfiles (#23). The examples are negated
 # back in so `git archive` keeps shipping the templates.
 .env*
 !.env*.example
 logs/
 worktrees/
 node_modules/
+.pnpm-store/
+# One line per package manager adopt.ts can detect (its LOCKFILES table): the
+# out-of-tree Engine install runs with cwd:.sandcastle/, so whichever manager the
+# consumer uses writes ITS lockfile right here. Listing only npm's and pnpm's
+# would let a yarn or bun consumer commit a generated lockfile the moment step 4
+# stages the directory — the very leak #23 closed.
 pnpm-lock.yaml
 package-lock.json
+yarn.lock
+bun.lock
+bun.lockb

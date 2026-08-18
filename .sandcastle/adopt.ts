@@ -54,6 +54,15 @@ const LOCKFILES: { file: string; pm: PackageManager }[] = [
   { file: 'package-lock.json', pm: 'npm' },
 ];
 
+/**
+ * Every lockfile name adopt can detect — i.e. every lockfile the out-of-tree Engine
+ * install (cwd:`.sandcastle/`, issue #22) can end up writing into the config layer.
+ * Exported so the artifact boundary (`.sandcastle/.gitignore`) is checked against
+ * THIS table: since #29 stages `.sandcastle/`, a lockfile listed here but missing
+ * there would be committed as a generated artifact. See consumer-ignore.test.ts.
+ */
+export const DETECTABLE_LOCKFILES: readonly string[] = LOCKFILES.map((l) => l.file);
+
 /** Detect the consumer's package manager from its lockfile; default `npm`. */
 export function detectPackageManager(dirEntries: string[]): PackageManager {
   for (const { file, pm } of LOCKFILES) {
@@ -119,17 +128,34 @@ export function consumerRootIsCjs(consumerPkgJson: string | null): boolean {
 }
 
 /**
- * Is this ignore line the pre-#29 whole-directory rule (`.sandcastle/` or
- * `.sandcastle`)? Such a line — wherever it lives — keeps the entire config
- * layer out of git, which is exactly the posture issue #29 retires: `config.ts`
- * and its `labelBases`/`chainableBases` decisions are project decisions and
- * belong in history. Exact match on the trimmed line: a subpath rule
- * (`.sandcastle/.env*`) or a comment mentioning the directory is NOT the
- * whole-dir rule, and must not be flagged as one.
+ * Every spelling of "ignore the whole `.sandcastle/` directory", as the body of
+ * the rule once a leading `/` anchor is stripped. Pre-#29 adopt only ever wrote
+ * the bare `.sandcastle/`, but step 4 also reads the consumer's TRACKED root
+ * `.gitignore` — a file adopt never wrote, so the spelling there is whoever
+ * typed it: the root-anchored `/.sandcastle/` is at least as idiomatic, and
+ * `.sandcastle/*` / `.sandcastle/**` swallow the layer's contents just as
+ * completely. All of them defeat #29 identically, so all of them must be named.
+ */
+const WHOLE_DIR_SPELLINGS = ['.sandcastle', '.sandcastle/', '.sandcastle/*', '.sandcastle/**'];
+
+/**
+ * Is this ignore line a whole-directory `.sandcastle/` rule? Such a line —
+ * wherever it lives — keeps the entire config layer out of git, which is exactly
+ * the posture issue #29 retires: `config.ts` and its `labelBases`/`chainableBases`
+ * decisions are project decisions and belong in history.
+ *
+ * Exact match on the trimmed line, modulo git's leading-`/` anchor (see
+ * `WHOLE_DIR_SPELLINGS`) — never a substring match. Three shapes are therefore
+ * NOT the whole-dir rule and must not be flagged as one: a scoped subpath rule
+ * (`.sandcastle/.env*` — the #29 boundary's own lines), a comment mentioning the
+ * directory, and a NEGATION (`!.sandcastle/`), which re-includes rather than
+ * ignores.
  */
 export function wholeSandcastleLine(line: string): boolean {
   const t = line.trim();
-  return t === '.sandcastle/' || t === '.sandcastle';
+  if (t === '' || t.startsWith('#') || t.startsWith('!')) return false;
+  const body = t.startsWith('/') ? t.slice(1) : t; // `/x` and `x` ignore the same dir here
+  return WHOLE_DIR_SPELLINGS.includes(body);
 }
 
 /**
@@ -161,6 +187,30 @@ export function wholeDirIgnoreWarning(file: string, lines: readonly string[]): s
     `  tracked. Remove the line(s) above from that file, then re-run:\n` +
     `    git add .sandcastle/ && git commit -m "chore: track the orchestration config"`
   );
+}
+
+/**
+ * The first meaningful line of a failed `execFileSync`'s diagnosis — for the step-4
+ * staging warning, where naming the real cause is the whole point.
+ *
+ * `execFileSync(…, { stdio: 'pipe' })` puts the child's stderr on `err.stderr` and
+ * prefixes `err.message` with a bare `Command failed: <argv>`, so reading
+ * `message`'s first line reports only the command we already printed — a tautology
+ * where git had said, e.g., "The following paths are ignored by one of your
+ * .gitignore files". Prefer stderr, skip git's `hint:` lines (the top one advises
+ * `add -f`, which would stage the secrets the boundary keeps out), and fall back to
+ * the message only when stderr is empty.
+ */
+export function gitFailureReason(err: unknown): string {
+  const e = err as { stderr?: unknown; message?: unknown };
+  const stderr = typeof e?.stderr === 'string' ? e.stderr : e?.stderr?.toString?.() ?? '';
+  const lines = String(stderr)
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l !== '' && !l.startsWith('hint:'));
+  if (lines.length) return lines.join(' — ');
+  const message = typeof e?.message === 'string' ? e.message : '';
+  return message.split('\n')[0]?.trim() || 'git exited non-zero with no diagnostic.';
 }
 
 /** The Factory runtime grouped by where it belongs in the consumer: deps vs devDeps. */
@@ -578,15 +628,17 @@ function main(): void {
       );
       info('    commit it yourself, e.g.: git commit -m "chore: track the orchestration config"');
     } catch (err) {
-      // Staging can fail only when a whole-dir rule still ignores the directory —
-      // either one of the legacy lines warned about above (the operator has not
-      // removed it yet) or one in a file this step does not read (e.g. a global
-      // core.excludesFile). git's own hint here is `add -f`, which is exactly wrong
-      // (it would stage the secrets the boundary exists to keep out), so point at
-      // the named lines / the probe that locates the rule instead.
+      // The usual cause is a whole-dir rule still ignoring the directory — either a
+      // legacy line warned about above (not removed yet) or one in a file this step
+      // does not read (a global `core.excludesFile`). It is not the ONLY cause
+      // (a stale index.lock, dubious ownership, a read-only tree), which is why the
+      // message leads with git's own words rather than asserting the diagnosis.
+      // git's hint here is `add -f`, exactly wrong — it would stage the secrets the
+      // boundary exists to keep out — so point at the named lines / the probe that
+      // locates the rule instead.
       warn(
-        `④ could not stage .sandcastle/ — a whole-dir ignore rule still covers it:\n` +
-          `    ${(err as Error).message.split('\n')[0]}\n` +
+        `④ could not stage .sandcastle/ — git refused:\n` +
+          `    ${gitFailureReason(err)}\n` +
           (legacyIgnores.length
             ? `  Remove the line(s) warned about above, then re-run: git -C ${consumerRoot} add -- .sandcastle/\n`
             : `  Locate the rule with: git -C ${consumerRoot} check-ignore -v -- .sandcastle/config.ts\n` +

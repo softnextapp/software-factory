@@ -35,6 +35,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { DETECTABLE_LOCKFILES, findWholeDirIgnores } from './adopt.ts';
 import { test, finish } from './test-harness.ts';
 
 /** Repo root = process.cwd() under `npm test` (same anchor as esm-shim.test.ts). */
@@ -84,12 +85,48 @@ test('the shipped boundary keeps only runtime artifacts ignored (the #29 posture
     'logs/',
     'worktrees/',
     'node_modules/',
+    '.pnpm-store/',
     'pnpm-lock.yaml',
     'package-lock.json',
+    'yarn.lock',
+    'bun.lock',
+    'bun.lockb',
   ];
   for (const p of expected) {
     assert.ok(patterns.has(p), `expected pattern ${JSON.stringify(p)} in ${IGNORE_PATH}`);
   }
+});
+
+test('every package manager adopt can detect has its lockfile on the ignored side', () => {
+  // Not a restatement of the table above: this one is derived from adopt's OWN
+  // detection table, so teaching adopt a new package manager without extending the
+  // boundary fails HERE. The Engine install runs with cwd:.sandcastle/ (issue #22),
+  // so whichever manager the consumer uses writes its lockfile into this very
+  // directory — and since #29 stages the directory, an un-ignored lockfile becomes
+  // a committed generated artifact (the #23 leak, relocated).
+  const patterns = new Set(patternLines(loadIgnoreFile()));
+  for (const lockfile of DETECTABLE_LOCKFILES) {
+    assert.ok(
+      patterns.has(lockfile),
+      `${lockfile} is a lockfile adopt.ts detects but the boundary does not ignore — such a consumer would commit it`,
+    );
+  }
+});
+
+test('the boundary lists no pattern twice (idempotence: no duplicated ignore rule)', () => {
+  // Issue #29's fourth criterion, on the one file that could carry a duplicate now
+  // that adoption appends nothing: re-running adopt re-copies this file verbatim,
+  // so the only way a rule duplicates is a hand-edit adding a line already present.
+  const lines = patternLines(loadIgnoreFile());
+  const dupes = lines.filter((l, i) => lines.indexOf(l) !== i);
+  assert.deepEqual(dupes, [], `duplicated ignore rule(s) in ${IGNORE_PATH}`);
+});
+
+test('adopt does not read its own boundary as a whole-dir ignore (no false positive)', () => {
+  // Step 4 scans ignore files for the pre-#29 whole-dir rule. Run that same detector
+  // over the REAL shipped file — a line added here that reads as "ignore everything"
+  // would make adoption warn the operator about its own boundary.
+  assert.deepEqual(findWholeDirIgnores(loadIgnoreFile()), []);
 });
 
 test('the negation is ordered AFTER the pattern it re-includes (git takes the LAST match)', () => {
@@ -157,6 +194,11 @@ const MUST_BE_IGNORED: { path: string; why: string }[] = [
   { path: '.sandcastle/worktrees/issue-9/README.md', why: 'agent worktrees forked by the Engine' },
   { path: '.sandcastle/node_modules/@ai-hero/sandcastle/package.json', why: 'the out-of-tree Engine install (#22)' },
   { path: '.sandcastle/pnpm-lock.yaml', why: 'the standalone Engine-install lockfile (#23)' },
+  { path: '.sandcastle/package-lock.json', why: 'the same lockfile for an npm consumer' },
+  { path: '.sandcastle/yarn.lock', why: 'the same lockfile for a yarn consumer — adopt detects yarn' },
+  { path: '.sandcastle/bun.lock', why: 'the same lockfile for a bun consumer — adopt detects bun' },
+  { path: '.sandcastle/bun.lockb', why: "bun's binary lockfile — a generated blob, never reviewable" },
+  { path: '.sandcastle/.pnpm-store/v3/files/00/x', why: "pnpm's local store (config.ts declares it generated)" },
 ];
 
 /** What must stay trackABLE — i.e. NOT ignored: the orchestration config (the
