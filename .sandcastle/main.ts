@@ -718,12 +718,12 @@ const syncBaseToOrigin = (base: string): void => {
 // fact the operator needs in the log — ticket by ticket, not as a round-level remark.
 const resolveBase = (issueNumber: number, labelBase: string): string => {
   if (!cfg.run.chain) return labelBase;
-  if (!cfg.project.chainableBases.includes(labelBase)) {
-    // buildUnchainableBaseWarning is non-empty by construction here (the base is
-    // not in the list); it re-checks so the helper is safe to call anywhere.
-    console.warn(
-      `  ⛓ ⚠ chain: ${buildUnchainableBaseWarning(issueNumber, labelBase, cfg.project.chainableBases)}`,
-    );
+  // The helper re-checks membership (it returns '' for a chainable base, so it is safe
+  // to call anywhere); branching on its result rather than on the list keeps the
+  // "chainable ⇒ no warning" invariant in ONE place, and never prints a bare prefix.
+  const unchainable = buildUnchainableBaseWarning(issueNumber, labelBase, cfg.project.chainableBases);
+  if (unchainable !== '') {
+    console.warn(`  ⛓ ⚠ chain: ${unchainable}`);
     return labelBase;
   }
 
@@ -761,21 +761,24 @@ const resolveBase = (issueNumber: number, labelBase: string): string => {
 // round's tickets CAN derive but that will never chain, so the per-ticket warning
 // of the live run is visible in the dry run too — same verdict, not a more
 // optimistic one (issue #24, criterion 4).
+//
+// The per-root stack walk goes under its own `stacks` key rather than overwriting
+// `chainableBases`: one key holding a branch-name list on the error path and objects
+// on the happy path is unreadable in the printed report, and unusable to anything
+// that ever parses it.
 const chainDryRun = (): Record<string, unknown> => {
   const bases = cfg.project.chainableBases;
   const derivable = derivableBases(cfg.project.baseBranch, cfg.project.labelBases);
-  const unchainable = derivable.filter((base) => !bases.includes(base));
   const report: Record<string, unknown> = {
     feasible: CHAIN_FEASIBILITY.feasible,
     chainableBases: bases,
-    unchainableDerivableBases: unchainable,
+    unchainableDerivableBases: derivable.filter((base) => !bases.includes(base)),
   };
-  if (bases.length === 0) return report; // unreachable past the startup guard; kept total.
   try {
     const openMrs = host.openChangeRequests();
     return {
       ...report,
-      chainableBases: bases.map((root) => {
+      stacks: bases.map((root) => {
         const resolution = resolveChainedBase(openMrs, root);
         return {
           root,

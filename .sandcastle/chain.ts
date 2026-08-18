@@ -209,7 +209,8 @@ export function derivableBases(
  *    Both are the same operator mistake, and both get the same message naming
  *    `labelBases` AND `chainableBases` — neither setting suffices alone, so
  *    naming only one would leave the operator mid-way.
- *  - `ok` — at least one derivable base is chainable; `chainable` lists which.
+ *  - feasible — at least one derivable base is chainable; `chainable` lists which,
+ *    in derivable order (trunk first).
  */
 export type ChainFeasibility =
   | { feasible: false; reason: 'off' }
@@ -223,11 +224,14 @@ export function decideChainFeasibility(cfg: {
   chainableBases: readonly string[];
 }): ChainFeasibility {
   if (!cfg.chain) return { feasible: false, reason: 'off' };
-  const chainable = derivableBases(cfg.baseBranch, cfg.labelBases).filter((base) =>
-    cfg.chainableBases.includes(base),
-  );
+  const derivable = derivableBases(cfg.baseBranch, cfg.labelBases);
+  const chainable = derivable.filter((base) => cfg.chainableBases.includes(base));
   if (chainable.length === 0) {
-    return { feasible: false, reason: 'no-chainable-base', message: buildNoChainableBaseMessage() };
+    return {
+      feasible: false,
+      reason: 'no-chainable-base',
+      message: buildNoChainableBaseMessage(derivable, cfg.chainableBases),
+    };
   }
   return { feasible: true, chainable };
 }
@@ -239,21 +243,37 @@ export function decideChainFeasibility(cfg: {
  * one alone and chaining stays inert, which is exactly the silent mode this
  * guard exists to forbid. French like every operator-facing free text this
  * Factory emits (mr-body.ts); the quoted shape is the issue's own wording.
+ *
+ * It also states the two lists it compared, because "no base can chain" alone does
+ * not tell the operator WHICH of the two mistakes they made — an empty
+ * `chainableBases`, or one naming a branch no ticket derives. An earlier draft
+ * hard-coded the first diagnosis, which was simply false on a fresh consumer where
+ * both settings are empty.
  */
-function buildNoChainableBaseMessage(): string {
+function buildNoChainableBaseMessage(
+  derivable: readonly string[],
+  chainableBases: readonly string[],
+): string {
   return (
-    'SANDCASTLE_CHAIN=1 mais aucune base de ce round ne peut chaîner : `chainableBases` est ' +
-    'vide, ou ne nomme aucune base qu’un ticket puisse atteindre. Le chaînage exige les DEUX ' +
-    'réglages ensemble :\n' +
+    'SANDCASTLE_CHAIN=1 mais aucune base de ce round ne peut chaîner.\n' +
+    `  - bases que les tickets peuvent dériver (\`baseBranch\` + valeurs de \`labelBases\`) : ${quoteList(derivable)} ;\n` +
+    `  - bases déclarées chaînables (\`chainableBases\`) : ${quoteList(chainableBases)}.\n` +
+    'Les deux ensembles ne se recoupent pas. Le chaînage exige les DEUX réglages ensemble :\n' +
     '  - `labelBases` (config.ts) : label → branche de base, pour que les tickets de l’effort ' +
     'atterrissent sur une branche commune plutôt que sur le tronc ;\n' +
     '  - `chainableBases` (config.ts) : les bases éligibles au chaînage — la valeur de ' +
     '`labelBases` de l’effort (ou `baseBranch` pour un dépôt plat).\n' +
     'Aucun des deux ne suffit seul : `labelBases` sans `chainableBases` laisse le chaînage ' +
-    'inerte (le cas présent), et `chainableBases` sans la valeur `labelBases` correspondante ' +
-    'nomme une base qu’aucun ticket ne dérive. Corrigez config.ts, ou lancez sans ' +
-    'SANDCASTLE_CHAIN pour un round non chaîné.'
+    'inerte, et `chainableBases` sans la valeur `labelBases` correspondante nomme une base ' +
+    'qu’aucun ticket ne dérive. Corrigez config.ts, ou lancez sans SANDCASTLE_CHAIN pour un ' +
+    'round non chaîné.'
   );
+}
+
+/** Branch names as a backticked list, or `aucune` — an empty list is a diagnosis, not a blank. */
+function quoteList(branches: readonly string[]): string {
+  if (branches.length === 0) return 'aucune';
+  return branches.map((branch) => `\`${branch}\``).join(', ');
 }
 
 /**

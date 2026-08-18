@@ -132,6 +132,20 @@ test('derivableBases: a label base equal to the trunk collapses (one derivable b
   assert.deepEqual(derivableBases('main', { rgaa: 'main' }), ['main']);
 });
 
+test('derivableBases: no label base → the trunk alone (the fresh-consumer default)', () => {
+  assert.deepEqual(derivableBases('main', {}), ['main']);
+});
+
+test('derivableBases: several labels → trunk first, then each distinct base, deduped', () => {
+  // Two labels pointing at the SAME epic must not yield it twice — the list feeds
+  // both the refusal message and the dry-run report, where a repeat reads as a bug.
+  assert.deepEqual(derivableBases('main', { rgaa: 'epic/a', a11y: 'epic/a', perf: 'epic/b' }), [
+    'main',
+    'epic/a',
+    'epic/b',
+  ]);
+});
+
 test('feasibility: chain off → off, whatever the bases (the round is not chained at all)', () => {
   const r = decideChainFeasibility({ chain: false, baseBranch: TRUNK, labelBases: LB, chainableBases: [] });
   assert.deepEqual(r, { feasible: false, reason: 'off' });
@@ -176,6 +190,40 @@ test('feasibility: one chainable label base among several derivable bases is eno
   assert.deepEqual(r, { feasible: true, chainable: ['epic/rgaa-accessibilite'] });
 });
 
+test('feasibility: several chainable bases → all of them, in derivable order (trunk first)', () => {
+  const r = decideChainFeasibility({
+    chain: true,
+    baseBranch: TRUNK,
+    labelBases: LB,
+    // Deliberately reversed relative to the derivable order: `chainable` follows the
+    // bases the round can derive, not the order the operator happened to type.
+    chainableBases: ['epic/rgaa-accessibilite', 'main'],
+  });
+  assert.deepEqual(r, { feasible: true, chainable: ['main', 'epic/rgaa-accessibilite'] });
+});
+
+test('feasibility: a chainable list mixing a derivable and a stray base → feasible, stray dropped', () => {
+  // The stray (`develop`) must not reach `chainable`: the consumer of this list forks
+  // from it, so a branch no ticket derives has no business being reported as usable.
+  const r = decideChainFeasibility({
+    chain: true,
+    baseBranch: TRUNK,
+    labelBases: LB,
+    chainableBases: ['develop', 'epic/rgaa-accessibilite'],
+  });
+  assert.deepEqual(r, { feasible: true, chainable: ['epic/rgaa-accessibilite'] });
+});
+
+test('feasibility: chain off stays off even when a base WOULD chain (the flag decides)', () => {
+  const r = decideChainFeasibility({
+    chain: false,
+    baseBranch: TRUNK,
+    labelBases: LB,
+    chainableBases: ['main', 'epic/rgaa-accessibilite'],
+  });
+  assert.deepEqual(r, { feasible: false, reason: 'off' });
+});
+
 // Narrow a refusal to its message — `reason === 'no-chainable-base'` guards every
 // access, so a shape change to ChainFeasibility fails HERE rather than at the
 // assertion that reads `.message`.
@@ -197,13 +245,34 @@ test('the refusal message names BOTH settings and says neither suffices alone', 
   assert.ok(message.includes('SANDCASTLE_CHAIN'), 'message must name the flag being refused');
 });
 
-test('the refusal message stays actionable when there is no label base yet', () => {
-  // labelBases={} is the fresh-consumer case: the message must still say how the
-  // two settings combine, not assume an epic label exists.
+test('the refusal message states the two sets it compared, so the operator sees WHICH is wrong', () => {
+  // Naming both settings is not enough on its own: "no base can chain" leaves open
+  // which of the two mistakes was made. The message therefore quotes the bases the
+  // round can derive and the bases declared chainable.
+  const message = refusalMessage(
+    decideChainFeasibility({
+      chain: true,
+      baseBranch: TRUNK,
+      labelBases: LB,
+      chainableBases: ['develop'],
+    }),
+  );
+  assert.ok(message.includes('`main`'), 'must quote the derivable trunk');
+  assert.ok(message.includes('`epic/rgaa-accessibilite`'), 'must quote the derivable label base');
+  assert.ok(message.includes('`develop`'), 'must quote the base declared chainable in vain');
+});
+
+test('the refusal message says `aucune` rather than a blank when a set is empty', () => {
+  // labelBases={} + chainableBases=[] is the fresh-consumer case. An earlier draft
+  // asserted "labelBases sans chainableBases (le cas présent)" here, which was simply
+  // false — nothing was configured at all. The message must report, not guess.
   const message = refusalMessage(
     decideChainFeasibility({ chain: true, baseBranch: TRUNK, labelBases: {}, chainableBases: [] }),
   );
-  assert.ok(message.includes('chainableBases'));
+  assert.ok(message.includes('chainableBases'), 'must still name the setting to fill');
+  assert.ok(message.includes('aucune'), 'an empty chainableBases must read as `aucune`, not as a gap');
+  assert.ok(message.includes('`main`'), 'must still quote the one base the round derives');
+  assert.ok(!/le cas présent/.test(message), 'must not assert which of the two mistakes was made');
 });
 
 // --- per-ticket warning (issue #24) ------------------------------------------
@@ -218,6 +287,18 @@ test('unchainable-base warning: names the ticket, its base, and the consequence'
 
 test('unchainable-base warning: is empty for a chainable base (no noise per ticket)', () => {
   assert.equal(buildUnchainableBaseWarning(19, 'epic/rgaa-accessibilite', ['epic/rgaa-accessibilite']), '');
+});
+
+test('unchainable-base warning: an empty chainableBases still warns (nothing is chainable)', () => {
+  // main.ts branches on this string being non-empty, so an empty list returning ''
+  // would resurrect the silent degradation the issue exists to kill.
+  const w = buildUnchainableBaseWarning(19, 'main', []);
+  assert.ok(w.includes('#19'));
+  assert.ok(w.includes('`main`'));
+});
+
+test('unchainable-base warning: a base chainable among several is still silent', () => {
+  assert.equal(buildUnchainableBaseWarning(7, 'main', ['epic/a', 'main', 'epic/b']), '');
 });
 
 finish();
