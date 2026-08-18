@@ -9,6 +9,7 @@ node_modules/
 .sandcastle/.env.secrets
 .sandcastle/logs/
 .sandcastle/worktrees/
+.sandcastle/publish-pending.json
 
 # Local Claude settings (per-developer)
 .claude/settings.local.json

@@ -62,6 +62,15 @@ import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.t
 import { loadConfig, type Provider, type Role } from './config.ts';
 import { ensureWorktreeExclude } from './worktree-exclude.ts';
 import {
+  decideResume,
+  dropPendingIssues,
+  pendingFileSummary,
+  readPendingPublishes,
+  recordPendingPublish,
+  writePendingPublishes,
+  type PendingPublish,
+} from './publish.ts';
+import {
   parseEnvFile,
   resolveToken,
   resolveTokens,
@@ -761,6 +770,134 @@ const warnHostMismatch = (): { configured: string; originHost: string | null; ok
 };
 
 // ---------------------------------------------------------------------------
+// Publish ledger (issue #26)
+//
+// A branch pushed whose Draft MR/PR creation failed is not orphaned: the failed
+// run records a trace here, and the NEXT run drains the ledger before Phase 1 —
+// opening the missing MR from the recorded title/description, or explaining why
+// it cannot. A ticket with a pending trace is also held out of the planner queue
+// (see Phase 1), so the resume never re-runs the ticket on a `-r2` branch.
+//
+// Like SECRETS_PATH, the ledger is CWD-relative and gitignored — a run artifact,
+// never Factory source. The decisions (create | resolved | gone, the queue hold)
+// are the pure functions in publish.ts; this file owns only the host IO.
+// ---------------------------------------------------------------------------
+const PENDING_PATH = path.join(process.cwd(), '.sandcastle', 'publish-pending.json');
+// Reassigned (never mutated in place) as the drain erases/re-records traces and
+// Phase 3 appends new ones — the in-memory copy is the source of truth between
+// writes, and each write persists it whole.
+let pending: PendingPublish[] = readPendingPublishes(PENDING_PATH);
+
+// The branches origin currently holds, for the drain's `gone` ruling. Null (not
+// []) means the listing itself failed — `gone` is then undecidable and the drain
+// falls back to `create` (see decideResume). Read once per drain, shared by every
+// trace.
+const remoteBranches = (): string[] | null => {
+  try {
+    return execFileSync('git', ['ls-remote', '--heads', '--refs', 'origin'], { encoding: 'utf8' })
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => line.split(/\s+/)[1]?.replace(/^refs\/heads\//, '') ?? '');
+  } catch {
+    return null;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Ledger drain (issue #26) — what the NEXT run does with the previous run's
+// "pushed without a MR" traces. Runs once, before Phase 1, in a LIVE run only
+// (the dry run reports the ledger instead — see its `pendingPublishes` entry).
+//
+// Per trace, decideResume rules and this renders it:
+//   resolved → the MR exists (operator opened it by hand, or a race): erase only;
+//   gone     → origin lost the branch (merged+deleted, dropped): erase and say why;
+//   create   → re-push the branch (`git push` is a no-op when origin is already
+//              up to date, and heals a pruned remote ref), then open the MR from
+//              the RECORDED title/description — the exact MR the failed run
+//              would have opened, rebuilt without re-running any agent — and
+//              erase on success.
+//
+// A create that fails again RE-RECORDS the trace with the new reason (a fresh
+// 503), so the ledger keeps holding the ticket out of the queue until it lands.
+// Erases and re-records are persisted after EACH trace: a drain that dies midway
+// (Ctrl-C, a crash) leaves the ledger describing exactly what did not finish.
+// ---------------------------------------------------------------------------
+const drainPendingPublishes = (): void => {
+  if (pending.length === 0) return;
+  console.log(`\n▸ ${pending.length} pending publish trace(s) from a previous run — resuming:`);
+
+  let openMrs;
+  try {
+    openMrs = host.openChangeRequests();
+  } catch (error) {
+    console.error(`  ⚠ could not read open ${hostTerms.cr}s — resume deferred: ${error}`);
+    return; // the ledger stays; the next run retries
+  }
+  const branches = remoteBranches();
+
+  // Iterated over a SNAPSHOT: the body reassigns `pending`, and an array being
+  // rewritten under its own for-of stops early — a two-trace ledger would drain
+  // only its first trace.
+  for (const trace of [...pending]) {
+    const without = (): PendingPublish[] => pending.filter((entry) => entry.branch !== trace.branch);
+    const erase = (): void => {
+      pending = without();
+      writePendingPublishes(PENDING_PATH, pending);
+    };
+    const decision = decideResume(trace, openMrs, branches);
+
+    if (decision === 'resolved') {
+      console.log(
+        `  ✓ #${trace.issue}: a ${hostTerms.cr} for \`${trace.branch}\` is already open — trace cleared.`,
+      );
+      erase();
+      continue;
+    }
+    if (decision === 'gone') {
+      console.log(
+        `  ✓ #${trace.issue}: \`${trace.branch}\` no longer on origin (merged and deleted, or ` +
+          `dropped) — nothing to publish, trace cleared.`,
+      );
+      erase();
+      continue;
+    }
+
+    console.log(
+      `  → #${trace.issue}: opening the missing ${hostTerms.cr} for \`${trace.branch}\` → ${trace.base}`,
+    );
+    try {
+      // Re-push only when the listing says origin lacks the branch (the remote ref
+      // was pruned, or the trace's push half never landed). In the common case —
+      // push succeeded, create 503'd — origin already has it, and pushing from a
+      // machine whose LOCAL ref has since been pruned would fail and block the
+      // resume for nothing. `null` (listing failed) skips the push for the same
+      // reason: the create names the branch, and the host is the authority on
+      // whether it exists.
+      if (branches !== null && !branches.includes(trace.branch)) {
+        execFileSync('git', ['push', 'origin', trace.branch], { stdio: 'inherit' });
+      }
+      host.createDraftChangeRequest({
+        sourceBranch: trace.branch,
+        targetBranch: trace.base,
+        title: trace.title,
+        description: trace.description,
+        assignee: cfg.project.assignee,
+      });
+      erase();
+      console.log(`  ✓ #${trace.issue}: ${hostTerms.cr} opened — trace cleared.`);
+    } catch (error) {
+      pending = recordPendingPublish(without(), { ...trace, reason: String(error) });
+      writePendingPublishes(PENDING_PATH, pending);
+      console.error(
+        `  ✗ #${trace.issue}: could not open the ${hostTerms.cr} — trace KEPT, retried next run.\n` +
+          `    ${manualCreateHint(cfg.project.gitHost, trace.branch, trace.base)}\n` +
+          `    ${String(error)}`,
+      );
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Dry run — validate the active profile's wiring without launching a single agent.
 //   SANDCASTLE_DRYRUN=1 npx tsx .sandcastle/main.ts
 // Prints, per role, the exact env object buildEnv() bakes into the sandbox (token
@@ -820,6 +957,9 @@ if (cfg.run.dryRun) {
           ? { required: false, reason: 'local (no tracker) — no host token needed' }
           : { required: true, key: hostToken.key, ...tokenStatus(hostToken) },
       hostMismatch: warnHostMismatch(),
+      // The publish ledger (issue #26): reported, never drained, in a dry run —
+      // a dry run must not open MRs. Says what a live run would resume.
+      pendingPublishes: pendingFileSummary(pending),
       chain: cfg.run.chain
         ? { enabled: true, ...chainDryRun() }
         : { enabled: false, hint: 'SANDCASTLE_CHAIN=1 to stack MRs instead of fanning out' },
@@ -870,6 +1010,10 @@ try {
 // above ran the same check into its structured report).
 warnHostMismatch();
 
+// Drain the publish ledger before the first sandbox: a pushed-but-MR-less branch
+// is finished HERE — by opening its MR — not re-implemented by the round below.
+drainPendingPublishes();
+
 // Ensure generated artifacts (`.pnpm-store/`, …) do not trip the Engine's post-run
 // "uncommitted changes" check in the agent worktrees forked below (issue #20). Idempotent
 // and host-side: writes the patterns into the repo's shared `.git/info/exclude`, honored
@@ -890,6 +1034,28 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
   // A throwaway sandbox where the planner reads the `sandcastle` queue and emits
   // <plan>{ issues: [...] }</plan>. Empty list → backlog drained, stop.
   // -------------------------------------------------------------------------
+  // The work queue, enumerated host-side over EVERY configured queue label and
+  // deduped (issue #15): the planner no longer runs a queue command, it receives
+  // this list inline as the sole source of truth (see plan-prompt.md). A ticket
+  // with a pending publish trace is held out — resume work the drain above just
+  // handled (or deferred), not fresh work; left in, the planner would re-pick it
+  // and duplicate a full implement+review cycle on a `-r2` branch (issue #26).
+  // FORCE is the operator's explicit exit from the hold: they asked for the
+  // re-run, so the trace stops standing in. The hold is LOGGED, never silent —
+  // a ticket leaving the queue must say why.
+  const queueIssues = host.queueIssues(cfg.project.queueLabels);
+  let plannerQueue = queueIssues;
+  if (!cfg.run.force && pending.length > 0) {
+    const { kept, held } = dropPendingIssues(queueIssues, pending);
+    if (held.length > 0) {
+      plannerQueue = kept;
+      console.log(
+        `  ⏸ publish ledger: holding #${held.join(', #')} out of the queue — their branch is ` +
+          `pushed but has no ${hostTerms.cr} yet (see .sandcastle/publish-pending.json).`,
+      );
+    }
+  }
+
   const plan = await sandcastle.run({
     sandbox: docker({ env: envFor('planner') }),
     name: 'planner',
@@ -910,11 +1076,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
       CHAIN_MODE: cfg.run.chain ? 'on' : 'off',
       ONLY: cfg.run.only === null ? 'none' : cfg.run.only.join(', '),
       FORCE: cfg.run.force ? 'on' : 'off',
-      // Host-specific open-MR command (plan-prompt.md runs it verbatim) plus the
-      // work queue, enumerated host-side over EVERY configured queue label and
-      // deduped (issue #15): the planner no longer runs a queue command, it
-      // receives this list inline as the sole source of truth (see plan-prompt.md).
-      ISSUE_QUEUE_JSON: JSON.stringify(host.queueIssues(cfg.project.queueLabels)),
+      ISSUE_QUEUE_JSON: JSON.stringify(plannerQueue),
       OPEN_MRS_CMD: openMrsCommand(cfg.project.gitHost),
     },
   });
@@ -1187,8 +1349,19 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
   // happened is the expensive part.
   for (const { issue, branch, implStdout, reviewStdout, reviewed, logs } of completed) {
     console.log(`\nPublishing #${issue.number} → ${branch} (target ${issue.base})`);
+    // Split into a PUSH half and a CREATE half (issue #26): a push that fails is
+    // plain old Phase-3 failure (nothing durable to remember — the branch is not
+    // on origin, so a re-plan of the ticket is legitimate). A push that SUCCEEDS
+    // followed by a create that fails is exactly the orphan the publish ledger
+    // exists for: record a trace so the NEXT run opens the missing MR instead of
+    // re-implementing the ticket. mrTitle/mrDesc are hoisted so the trace can
+    // carry them when the create itself is what failed.
+    let pushed = false;
+    let mrTitle: string | undefined;
+    let mrDesc: string | undefined;
     try {
       execFileSync('git', ['push', '-u', 'origin', branch], { stdio: 'inherit' });
+      pushed = true;
 
       // Title and description are built here, not left to `git log -1` and a constant:
       // the reviewer's cost is dominated by reconstructing intent, and the run already
@@ -1201,13 +1374,13 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
       }
       const commits = commitsOn(issue.base, branch);
       const issueInfo = host.issueInfoOf(issue.number, issue.title);
-      const mrTitle = buildMrTitle({
+      mrTitle = buildMrTitle({
         style: titleStyle,
         issue: { number: issue.number, title: issue.title },
         summary,
         commits,
       });
-      const mrDesc = buildMrDescription({
+      mrDesc = buildMrDescription({
         issue: issueInfo,
         branch,
         base: issue.base,
@@ -1238,6 +1411,43 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         assignee: cfg.project.assignee,
       });
     } catch (error) {
+      if (pushed) {
+        // The branch is on origin and its MR is not — durable trace for the next
+        // run's drain (issue #26). When the failure was the create itself, the
+        // trace carries the built title/description and the resume opens the
+        // exact MR this run meant to. When it was earlier (an MR-body builder),
+        // the trace falls back to a title rebuilt from the first commit and a
+        // body that says so — degraded, but never silently empty.
+        const { summary } = extractMrSummary(implStdout);
+        const fallbackTitle = buildMrTitle({
+          style: titleStyle,
+          issue: { number: issue.number, title: issue.title },
+          summary,
+          commits: commitsOn(issue.base, branch),
+        });
+        const fallbackDesc =
+          `Resumed publish for #${issue.number} (${issue.title}): the branch was pushed by ` +
+          `round ${iteration} but its ${hostTerms.cr} could not be opened. The original MR ` +
+          `description was not recorded — this MR was opened by the publish-ledger resume.`;
+        const trace: PendingPublish = {
+          issue: issue.number,
+          branch,
+          base: issue.base,
+          title: mrTitle ?? fallbackTitle,
+          description: mrDesc ?? fallbackDesc,
+          reason: String(error),
+          round: iteration,
+        };
+        pending = recordPendingPublish(pending, trace);
+        writePendingPublishes(PENDING_PATH, pending);
+        console.error(
+          `  ✗ #${issue.number}: ${hostTerms.cr} creation failed for pushed \`${branch}\` — ` +
+            `trace recorded, the NEXT run will open it (issue #26). Or by hand:\n` +
+            `    ${manualCreateHint(cfg.project.gitHost, branch, issue.base)}\n` +
+            `    ${String(error)}`,
+        );
+        continue;
+      }
       console.error(
         `  ✗ #${issue.number}: publish failed for \`${branch}\` — the commits are on the ` +
           `${hostTerms.cr} by hand:\n` +

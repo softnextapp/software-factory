@@ -22,6 +22,7 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/plan.ts` | Parses the planner's `<plan>` JSON; label → base resolution. |
 | `.sandcastle/chain.ts` | Chained-MR base resolution — the pure, host-agnostic stack walk. |
 | `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, work-queue enumeration, and the prompt-time command strings). |
+| `.sandcastle/publish.ts` | The publish ledger — a durable trace of a pushed branch whose MR/PR creation failed, drained by the next run (issue #26). |
 | `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts. |
 | `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
@@ -50,6 +51,16 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
    create`, via `host.ts`) for every branch that got commits. **Never auto-merged**
    (`MERGE_STRATEGY=human`): a human
    reviews and merges.
+
+A publish whose **push succeeds but whose MR/PR creation fails** (a host 503) is not
+lost: the run records a trace in the gitignored `.sandcastle/publish-pending.json`,
+and the **next run drains the ledger before planning** — it opens the missing MR/PR
+from the recorded title and description (no agent re-runs), or explains why it
+cannot (the MR already exists → trace cleared; the branch is gone from origin →
+merged-and-deleted, trace cleared). While a trace is pending, its issue is held out
+of the planner queue so the ticket is never re-implemented on a duplicate branch
+(issue #26). `SANDCASTLE_FORCE=1 SANDCASTLE_ONLY=<n>` bypasses the hold — the
+operator asked for the re-run.
 
 The **Agent roles** are Planner, Implementer, Reviewer — plus an optional Merger
 (only under `MERGE_STRATEGY=agent`, fenced in v0.1). The active **Profile** fixes
