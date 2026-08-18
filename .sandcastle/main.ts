@@ -66,6 +66,16 @@ import {
 } from './mr-body.ts';
 import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.ts';
 import { loadConfig, type Provider, type Role } from './config.ts';
+import {
+  buildRunBranch,
+  mintRunId,
+  isAgentBranch,
+  runBranchBases,
+  decideSweep,
+  describeSweep,
+  type BranchFacts,
+  type RunId,
+} from './branch-sweep.ts';
 import { ensureWorktreeExclude } from './worktree-exclude.ts';
 import {
   parseEnvFile,
@@ -751,6 +761,221 @@ const resolveBase = (issueNumber: number, labelBase: string): string => {
   return resolution.base;
 };
 
+// ---------------------------------------------------------------------------
+// Startup sweep of dead runs' empty branches (issue #28)
+//
+// The naming half of the fix lives in branch-sweep.ts; this is the net half. A run
+// killed mid-iteration leaves its agent branches behind — a bare pointer at the
+// base it forked from. The next run of the same ticket would reuse that name (the
+// old `-r${iteration}` suffix restarted at 1) and so fork from the dead run's base
+// instead of the resolved one, silently. buildRunBranch() names branches per RUN
+// now, so the collision cannot happen; this sweep removes the leftovers that are
+// already here and would otherwise sit in the planner's way forever.
+//
+// What is safe to delete, in one line: a local `sandcastle/*` branch with no
+// commit of its own and no open MR. The decision is decideSweep() in
+// branch-sweep.ts — pure, unit-tested; this block only gathers the git facts and
+// executes the verdict. A branch that carries commits, or an MR, is never touched:
+// old and abandoned is not empty, and the whole point is that work survives.
+//
+// Not before Phase 1: the sweep must know which branches the CURRENT run is about
+// to create, and that set is only known once the planner has spoken. A branch of
+// THIS run at startup is "empty" by definition — it does not exist yet — so the
+// planned names are excluded below. Anything else checked out in a worktree is
+// excluded too (git would refuse the delete, and a concurrently running Factory
+// instance — a sibling on another terminal — is exactly that).
+// ---------------------------------------------------------------------------
+
+/**
+ * Every local branch → its tip sha, in ONE for-each-ref. The snapshot the sweep
+ * measures emptiness against (see hasOwnCommits); taken once, before any deletion.
+ */
+const branchTips = (): Map<string, string> => {
+  const out = new Map<string, string>();
+  const raw = execFileSync(
+    'git',
+    ['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads'],
+    { encoding: 'utf8' },
+  );
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    const space = trimmed.indexOf(' ');
+    if (space <= 0) continue;
+    out.set(trimmed.slice(0, space), trimmed.slice(space + 1));
+  }
+  return out;
+};
+
+/**
+ * Branch → the worktree that has it checked out, from ONE `git worktree list`. A
+ * live run may own any of these, so none of them is ever swept; the path is what
+ * the sweep would remove alongside the branch.
+ *
+ * EXACT branch names, never a prefix test: `…-r<run>-1` is a string prefix of
+ * `…-r<run>-10`, so matching the porcelain's `branch refs/heads/…` line by prefix
+ * hands the sweep of an empty iteration-1 branch the worktree of a LIVE
+ * iteration-10 one — which it then removes with `--force`. Reproduced on a
+ * throwaway repo; the map keys on the full ref instead.
+ */
+const worktreeByBranch = (): Map<string, string> => {
+  const out = new Map<string, string>();
+  const BRANCH = 'branch refs/heads/';
+  try {
+    const raw = execFileSync('git', ['worktree', 'list', '--porcelain'], { encoding: 'utf8' });
+    let path: string | null = null;
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('worktree ')) path = line.slice('worktree '.length).trim();
+      else if (line.startsWith(BRANCH) && path !== null) out.set(line.slice(BRANCH.length).trim(), path);
+    }
+  } catch {
+    // git worktree unavailable — read as "none": decideSweep's checkedOutElsewhere
+    // then reads false and the branch still deletes (git's own "already checked
+    // out" refusal is the backstop, same as the Engine's create path).
+  }
+  return out;
+};
+
+/**
+ * Whether a branch has a commit no OTHER local branch reaches — "un commit
+ * au-dessus de sa base". Measured tip-against-tips: `git rev-list <tip> --not
+ * <every other branch tip>` walks the branch's history skipping what the rest of
+ * the repo already holds, so the count is zero exactly when the branch is a bare
+ * pointer at its fork point — including the stale case from the issue, where the
+ * branch forked from an old tip of a base that has since moved on (no clean "base
+ * ref" exists there, which is why this is measured against ALL other tips rather
+ * than a guessed base).
+ *
+ * TIPS, not ref names, on purpose: the sweep deletes branches in a loop, and a
+ * ref name that no longer exists makes the NEXT rev-list fatal. A tip sha keeps
+ * meaning the same commit after its ref is gone, so one snapshot taken before the
+ * first deletion stays valid for the whole loop — and resolves every branch in a
+ * single for-each-ref instead of one rev-parse per branch.
+ *
+ * NOT `--not --all`: `--all` includes the branch itself, and the count would be
+ * zero for everything. NOT remotes either: a branch pushed for a PR then rebased
+ * locally would still share its commits with `origin/<branch>` — but its LOCAL
+ * content is what this repo owns, so only local refs count.
+ *
+ * The exclusions go through `--stdin` (`^<sha>` lines) rather than argv: this runs
+ * once per agent branch with every OTHER branch's tip, so a repo with a few
+ * hundred branches would build a quadratic argument list and eventually hit
+ * ARG_MAX. `--stdin` is byte-for-byte the same revision set, off the command line.
+ */
+const hasOwnCommits = (branch: string, tips: ReadonlyMap<string, string>): boolean => {
+  const tip = tips.get(branch);
+  if (tip === undefined) return true; // unresolvable ⇒ not provably empty ⇒ kept
+  const exclusions = [...tips.entries()]
+    .filter(([name]) => name !== branch)
+    .map(([, sha]) => `^${sha}\n`)
+    .join('');
+  try {
+    const out = execFileSync('git', ['rev-list', '--count', '--stdin', tip], {
+      encoding: 'utf8',
+      input: exclusions,
+    }).trim();
+    return Number(out) > 0;
+  } catch {
+    // Unreadable ⇒ treat as committed work: a branch we cannot measure is not
+    // provably empty, and never swept. Same posture as a vanished base.
+    return true;
+  }
+};
+
+/**
+ * Whether the branch's history ties back to the project's trunk — the cheap
+ * "is this branch attached to this repo" check, which does not require naming a
+ * base the branch no longer has (a leftover forked from an old trunk tip has no
+ * base ref of its own once the trunk moves on — that is the exact #28 shape, and
+ * it MUST still sweep: being an ancestor of the moved-on trunk is what a dead
+ * empty leftover looks like).
+ *
+ * The one shape this REJECTS is unrelated history: no merge base with the trunk
+ * at all — a branch grafted from somewhere else is not provably this repo's
+ * leftover, and `--not` emptiness alone is too thin a basis to delete on.
+ */
+const attachedToTrunk = (branch: string): boolean => {
+  const trunk = cfg.project.baseBranch;
+  try {
+    // Non-zero when the two histories share no commit at all.
+    execFileSync('git', ['merge-base', branch, trunk], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const sweepDeadBranches = (protectedBranches: ReadonlySet<string>): void => {
+  // Snapshot BEFORE any deletion: hasOwnCommits measures a branch against every
+  // other branch TIP, and tips (shas) stay valid after their ref is deleted — see
+  // hasOwnCommits. The snapshot is also the semantically right measure: "empty
+  // against the repo as the sweep found it".
+  let snapshot: Map<string, string>;
+  try {
+    snapshot = branchTips();
+  } catch {
+    return; // not a git repo / git broken — nothing to sweep
+  }
+  const agentBranches = [...snapshot.keys()].filter(isAgentBranch);
+  if (agentBranches.length === 0) return;
+  let openMrs: ReturnType<typeof host.openChangeRequests> = [];
+  try {
+    openMrs = host.openChangeRequests();
+  } catch (error) {
+    // No host read, no sweep: without the MR list a pushed-and-PR'd branch could
+    // read as empty. The loop's own host calls will surface the failure anyway.
+    console.warn(`  ⚠ sweep skipped — could not list open ${hostTerms.cr}s: ${error}`);
+    return;
+  }
+  const mrSources = new Set(openMrs.map((mr) => mr.sourceBranch));
+  const checkedOut = worktreeByBranch();
+  let swept = 0;
+  for (const branch of agentBranches) {
+    if (protectedBranches.has(branch)) continue; // this run's — about to be created
+    const facts: BranchFacts = {
+      branch,
+      hasOwnCommits: hasOwnCommits(branch, snapshot),
+      hasOpenMr: mrSources.has(branch),
+      attachedToTrunk: attachedToTrunk(branch),
+      checkedOutElsewhere: checkedOut.has(branch),
+    };
+    const verdict = decideSweep(facts);
+    if (!verdict.sweep) continue;
+    // From the same snapshot the verdict was taken on, so it can only ever name
+    // THIS branch's own worktree. Today the checkedOutElsewhere guard means a
+    // swept branch never has one — acceptance #2 ("supprimée avec son worktree")
+    // and #4 ("ne touche aucune branche d'un run en cours") overlap, and #4 wins:
+    // nothing here can tell a dead run's worktree from a live one's. The removal
+    // stays as the honest half of #2 and as the belt for a git that reports a
+    // worktree the listing above did not.
+    const worktree = checkedOut.get(branch) ?? null;
+    try {
+      if (worktree !== null) {
+        execFileSync('git', ['worktree', 'remove', '--force', worktree], { stdio: 'ignore' });
+      }
+      execFileSync('git', ['branch', '-D', branch], { stdio: 'ignore' });
+      swept++;
+      console.log(
+        `  🧹 ${describeSweep(verdict, branch)}${worktree !== null ? ` (worktree ${worktree})` : ''}`,
+      );
+    } catch (error) {
+      console.warn(`  ⚠ could not sweep \`${branch}\` — ${error}`);
+    }
+  }
+  if (swept === 0) {
+    console.log(`  🧹 sweep: ${agentBranches.length} agent branch(es) examined, none swept.`);
+  } else {
+    // Drop worktree metadata the removals may have left (an unremovable dirty
+    // worktree leaves a stale administrative entry); the Engine does the same
+    // before forking its own.
+    try {
+      execFileSync('git', ['worktree', 'prune'], { stdio: 'ignore' });
+    } catch {
+      // advisory only
+    }
+  }
+};
+
 // What resolveBase() would return tonight, for the dry run. Read-only: no fetch, no
 // local ref created. Never throws — a dry run on a machine where glab is not authed
 // must still print the profile wiring it was mainly asked about.
@@ -798,6 +1023,14 @@ const chainDryRun = (): Record<string, unknown> => {
 // semantic-release) and may squash the MR title into a commit, so the title must stay
 // a valid Conventional Commit header. `ralph` repos have no such constraint.
 const titleStyle = cfg.project.commitStyle === 'conventional' ? 'conventional' : 'plain';
+
+// This run's identity, minted ONCE (issue #28). Agent branches are named
+// `<planner-branch>-r<runId>-<iteration>`: the run id differs across two relances
+// of the same ticket, so a run killed mid-iteration can no longer have its branch
+// resurrected by the next one — which used to fork from the dead run's base
+// silently. The format (seconds, UTC) and its reasons live in branch-sweep.ts,
+// where it is unit-tested; this is only the clock read.
+const RUN_ID: RunId = mintRunId(new Date());
 
 // Best-effort host-mismatch warning: a `gitHost` that disagrees with the actual
 // `origin` remote is the most likely misconfiguration on a fresh adopt (a GitLab
@@ -1068,6 +1301,23 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     console.log(`  #${issue.number}: ${issue.title} → ${issue.branch} (base ${issue.base})`);
   }
 
+  // Startup sweep of dead runs' empty branches (issue #28) — first iteration only:
+  // later iterations run inside this same process and their predecessors' branches
+  // are this run's own. Runs after the planner has spoken so the names THIS run is
+  // about to create (every planned branch × every iteration it may still reach) are
+  // excluded, and before Phase 2 forks a single worktree.
+  if (iteration === 1) {
+    console.log(`Sweeping dead-run branches (run ${RUN_ID}):`);
+    const mine = new Set(
+      runBranchBases(
+        issues.map((issue) => ({ branch: issue.branch })),
+        RUN_ID,
+        Array.from({ length: cfg.run.maxIterations }, (_, i) => i + 1),
+      ),
+    );
+    sweepDeadBranches(mine);
+  }
+
   // -------------------------------------------------------------------------
   // Phase 2: Implement + fix-in-place review, ≤ MAX_PARALLEL concurrent.
   //
@@ -1102,10 +1352,11 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
 
   const settled = await Promise.allSettled(
     issues.map(async (issue) => {
-      // Unique per round. A blocked/no-commit issue keeps its queue label and
-      // is re-planned next round with the same issue.branch; the -r suffix stops
-      // createSandbox from colliding with the leftover branch.
-      const branch = `${issue.branch}-r${iteration}`;
+      // Unique per RUN (issue #28): `-r<runId>-<iteration>`. The run id is minted
+      // once at startup, so two runs of the same ticket never mint the same name —
+      // the killed-run collision this issue was filed for. Iteration still varies
+      // within the run, preserving the old guarantee for re-planned tickets.
+      const branch = buildRunBranch(issue.branch, RUN_ID, iteration);
       // BASE_BRANCH is ours, not sandcastle's built-in TARGET_BRANCH: in the review
       // worktree the branch already exists, and the built-in resolves from the
       // worktree, which would make `git diff TARGET...BRANCH` a self-diff (empty, no
