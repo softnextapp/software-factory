@@ -37,7 +37,13 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import * as sandcastle from '@ai-hero/sandcastle';
 import { docker } from '@ai-hero/sandcastle/sandboxes/docker';
-import { resolveChainedBase, decideBaseSync } from './chain.ts';
+import {
+  resolveChainedBase,
+  decideBaseSync,
+  decideChainFeasibility,
+  derivableBases,
+  buildUnchainableBaseWarning,
+} from './chain.ts';
 import {
   createHost,
   HOST_TERMS,
@@ -147,6 +153,34 @@ const ALLOWED_BASES: readonly string[] = [
     ...cfg.project.chainableBases,
   ]),
 ];
+
+// ---------------------------------------------------------------------------
+// Chain feasibility (issue #24)
+//
+// The guard the revue incident asked for: SANDCASTLE_CHAIN=1 with no chainable
+// base used to fall through to the plain label base without a word, and the
+// operator found out only after the agents had run. Refuse HERE — before the
+// dry-run report, before tokens, before any sandbox. The predicate is pure and
+// lives in chain.ts (the seam this module shares with decideBaseSync); this is
+// only its side-effecting edge.
+//
+// Placed ABOVE the dry-run block on purpose: `SANDCASTLE_DRYRUN=1` must return
+// the SAME verdict as the live run, not a more optimistic one. A dry run that
+// printed a healthy chain report while the live run would refuse is exactly the
+// divergence the issue's fourth criterion forbids.
+//
+// `off` is not an error — chain simply is not active, and the round runs
+// unchained like before. Only `no-chainable-base` throws.
+// ---------------------------------------------------------------------------
+const CHAIN_FEASIBILITY = decideChainFeasibility({
+  chain: cfg.run.chain,
+  baseBranch: cfg.project.baseBranch,
+  labelBases: cfg.project.labelBases,
+  chainableBases: cfg.project.chainableBases,
+});
+if (!CHAIN_FEASIBILITY.feasible && CHAIN_FEASIBILITY.reason === 'no-chainable-base') {
+  throw new Error(CHAIN_FEASIBILITY.message);
+}
 
 // ---------------------------------------------------------------------------
 // Auth-token isolation (env-first)
@@ -677,8 +711,21 @@ const syncBaseToOrigin = (base: string): void => {
 // this is exactly the label-derived base; with it, the head of the open-MR stack
 // rooted there. Logs the whole stack, because "which branch did this fork from" stops
 // being obvious the moment it is not the configured base.
-const resolveBase = (labelBase: string): string => {
-  if (!cfg.run.chain || !cfg.project.chainableBases.includes(labelBase)) return labelBase;
+//
+// A chained round whose ticket's base is NOT chainable warns per ticket (issue #24):
+// the startup guard already proved at least one base chains, but this ticket derives
+// another one, and the run silently degrading to unchained FOR THIS TICKET is the
+// fact the operator needs in the log — ticket by ticket, not as a round-level remark.
+const resolveBase = (issueNumber: number, labelBase: string): string => {
+  if (!cfg.run.chain) return labelBase;
+  if (!cfg.project.chainableBases.includes(labelBase)) {
+    // buildUnchainableBaseWarning is non-empty by construction here (the base is
+    // not in the list); it re-checks so the helper is safe to call anywhere.
+    console.warn(
+      `  ⛓ ⚠ chain: ${buildUnchainableBaseWarning(issueNumber, labelBase, cfg.project.chainableBases)}`,
+    );
+    return labelBase;
+  }
 
   const resolution = resolveChainedBase(host.openChangeRequests(), labelBase);
   if (!resolution.chained) {
@@ -707,12 +754,27 @@ const resolveBase = (labelBase: string): string => {
 // What resolveBase() would return tonight, for the dry run. Read-only: no fetch, no
 // local ref created. Never throws — a dry run on a machine where glab is not authed
 // must still print the profile wiring it was mainly asked about.
+//
+// `feasible` mirrors the startup verdict (which has ALREADY thrown by the time this
+// runs — a dry run reached here only because chaining is feasible), and
+// `unchainableDerivableBases` names the bases of the second failure mode: bases a
+// round's tickets CAN derive but that will never chain, so the per-ticket warning
+// of the live run is visible in the dry run too — same verdict, not a more
+// optimistic one (issue #24, criterion 4).
 const chainDryRun = (): Record<string, unknown> => {
   const bases = cfg.project.chainableBases;
-  if (bases.length === 0) return { chainableBases: [] };
+  const derivable = derivableBases(cfg.project.baseBranch, cfg.project.labelBases);
+  const unchainable = derivable.filter((base) => !bases.includes(base));
+  const report: Record<string, unknown> = {
+    feasible: CHAIN_FEASIBILITY.feasible,
+    chainableBases: bases,
+    unchainableDerivableBases: unchainable,
+  };
+  if (bases.length === 0) return report; // unreachable past the startup guard; kept total.
   try {
     const openMrs = host.openChangeRequests();
     return {
+      ...report,
       chainableBases: bases.map((root) => {
         const resolution = resolveChainedBase(openMrs, root);
         return {
@@ -725,7 +787,7 @@ const chainDryRun = (): Record<string, unknown> => {
       }),
     };
   } catch (error) {
-    return { error: `could not read open MRs — ${(error as Error).message}` };
+    return { ...report, error: `could not read open MRs — ${(error as Error).message}` };
   }
 };
 
@@ -983,7 +1045,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         `  ⚠ #${issue.number}: planner said base \`${issue.base}\`, labels say \`${labelBase}\` — using the labels.`,
       );
     }
-    const base = resolveBase(labelBase);
+    const base = resolveBase(issue.number, labelBase);
     assertBaseUsable(base);
     // Fast-forward the base to origin so agent branches fork from the latest
     // published tip, not a stale local ref (issue #14). Live only — the dry run

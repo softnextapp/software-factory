@@ -171,3 +171,106 @@ export function decideBaseSync(rel: {
   if (rel.localAheadOfOrigin) return 'ahead';
   return 'diverged';
 }
+
+// ---------------------------------------------------------------------------
+// Chain feasibility (issue #24)
+//
+// A run launched with SANDCASTLE_CHAIN=1 used to fall back to the plain label
+// base without a word when no base was chainable — the revue incident (17 Aug
+// 2026): a round was interrupted by hand after the built branch turned out to be
+// missing the code its ticket selection had assumed. The README already
+// documented the inertia; the execution was mute. This seam decides, purely, the
+// two observable outcomes the issue asks for:
+//
+//   - no chainable base applies at all   → the run refuses BEFORE the planner;
+//   - a specific ticket's base is out    → the log says so, per ticket.
+//
+// "Feasible" here is a CONFIG fact — chain active AND at least one derivable
+// base chainable — not a statement that a stack is open. "No open MR on the
+// root" is a legitimate first ticket of a wave (resolveChainedBase returns the
+// root, `chained: false`), not a refusal; refusing there would stop an effort's
+// first round ever starting.
+// ---------------------------------------------------------------------------
+
+/** The bases a round's tickets can actually derive: the trunk plus every `labelBases` value. */
+export function derivableBases(
+  baseBranch: string,
+  labelBases: Readonly<Record<string, string>>,
+): string[] {
+  return [...new Set([baseBranch, ...Object.values(labelBases)])];
+}
+
+/**
+ * Can this round chain at all?
+ *
+ *  - `off` — chain is not active; nothing to declare (not an error).
+ *  - `no-chainable-base` — chain is active but NO derivable base is chainable:
+ *    either `chainableBases` is empty, or it names bases no ticket can derive.
+ *    Both are the same operator mistake, and both get the same message naming
+ *    `labelBases` AND `chainableBases` — neither setting suffices alone, so
+ *    naming only one would leave the operator mid-way.
+ *  - `ok` — at least one derivable base is chainable; `chainable` lists which.
+ */
+export type ChainFeasibility =
+  | { feasible: false; reason: 'off' }
+  | { feasible: false; reason: 'no-chainable-base'; message: string }
+  | { feasible: true; chainable: string[] };
+
+export function decideChainFeasibility(cfg: {
+  chain: boolean;
+  baseBranch: string;
+  labelBases: Readonly<Record<string, string>>;
+  chainableBases: readonly string[];
+}): ChainFeasibility {
+  if (!cfg.chain) return { feasible: false, reason: 'off' };
+  const chainable = derivableBases(cfg.baseBranch, cfg.labelBases).filter((base) =>
+    cfg.chainableBases.includes(base),
+  );
+  if (chainable.length === 0) {
+    return { feasible: false, reason: 'no-chainable-base', message: buildNoChainableBaseMessage() };
+  }
+  return { feasible: true, chainable };
+}
+
+/**
+ * The startup refusal. The two settings are named as a PAIR because they only
+ * work together: `labelBases` decides what bases the round's tickets derive,
+ * `chainableBases` decides which of those the chain may stack on — set either
+ * one alone and chaining stays inert, which is exactly the silent mode this
+ * guard exists to forbid. French like every operator-facing free text this
+ * Factory emits (mr-body.ts); the quoted shape is the issue's own wording.
+ */
+function buildNoChainableBaseMessage(): string {
+  return (
+    'SANDCASTLE_CHAIN=1 mais aucune base de ce round ne peut chaîner : `chainableBases` est ' +
+    'vide, ou ne nomme aucune base qu’un ticket puisse atteindre. Le chaînage exige les DEUX ' +
+    'réglages ensemble :\n' +
+    '  - `labelBases` (config.ts) : label → branche de base, pour que les tickets de l’effort ' +
+    'atterrissent sur une branche commune plutôt que sur le tronc ;\n' +
+    '  - `chainableBases` (config.ts) : les bases éligibles au chaînage — la valeur de ' +
+    '`labelBases` de l’effort (ou `baseBranch` pour un dépôt plat).\n' +
+    'Aucun des deux ne suffit seul : `labelBases` sans `chainableBases` laisse le chaînage ' +
+    'inerte (le cas présent), et `chainableBases` sans la valeur `labelBases` correspondante ' +
+    'nomme une base qu’aucun ticket ne dérive. Corrigez config.ts, ou lancez sans ' +
+    'SANDCASTLE_CHAIN pour un round non chaîné.'
+  );
+}
+
+/**
+ * The per-ticket warning for a base outside `chainableBases`: names the ticket,
+ * its base, and the consequence — this ticket forks from and targets the plain
+ * base and will not see the stack. Empty when the base chains (the common case;
+ * a chained round must not print a warning per ticket).
+ */
+export function buildUnchainableBaseWarning(
+  issueNumber: number,
+  base: string,
+  chainableBases: readonly string[],
+): string {
+  if (chainableBases.includes(base)) return '';
+  return (
+    `#${issueNumber} → base \`${base}\`, hors \`chainableBases\` : ce ticket ne verra pas la pile — ` +
+    `il part de \`${base}\` et y cible sa demande de fusion, comme si le chaînage était inactif. ` +
+    `Ajoutez \`${base}\` à \`chainableBases\` (config.ts) si ce ticket doit chaîner.`
+  );
+}
