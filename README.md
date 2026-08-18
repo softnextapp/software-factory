@@ -22,7 +22,7 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/plan.ts` | Parses the planner's `<plan>` JSON; label → base resolution. |
 | `.sandcastle/chain.ts` | Chained-MR base resolution — the pure, host-agnostic stack walk. |
 | `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, work-queue enumeration, and the prompt-time command strings). |
-| `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts. |
+| `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts, and states the issue's fate (`Closes #n` on the default branch, an explicit why-not note on any other base). |
 | `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
 | `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |

@@ -31,6 +31,14 @@
 // module turns them into a title and a markdown body. Tests: `npx tsx
 // .sandcastle/mr-body.test.ts`.
 //
+// The body also states, right under the header, WHAT HAPPENS TO THE ISSUE (issue #27):
+// `Closes #n` when the MR targets the project's default branch, or an explicit
+// "this MR will NOT close #n, and here is who owns the closing" when it targets any
+// other base (a staging base, a stacked branch). Both hosts close an issue only when
+// the carrying MR merges into the default branch — so on every other base the defect
+// was not the missing keyword but the silence: nothing warned the reviewer that the
+// issue would outlive the merge.
+//
 // This is the Factory's canonical copy. It replaces the three near-identical
 // per-instance duplicates (api/.sandcastle/mr-body.mts, back-office/ and
 // design-system/.sandcastle/mr-body.ts) that existed only because each repo's
@@ -163,6 +171,10 @@ export interface MrBodyInput {
   issue: IssueInfo;
   branch: string;
   base: string;
+  /** The project trunk (`ProjectConfig.baseBranch`). The closure decision compares
+   *  `base` against THIS — not against `origin/HEAD` or a hardcoded name — so a
+   *  consumer whose trunk is `master` or `develop` gets the right answer too. */
+  defaultBranch: string;
   summary: MrSummary | null;
   /** Set when a `<mr-summary>` block was present but unusable — surfaced in the body. */
   summaryError?: string | undefined;
@@ -407,6 +419,49 @@ export function buildMrTitle(input: {
 }
 
 // ---------------------------------------------------------------------------
+// Issue closure (issue #27)
+// ---------------------------------------------------------------------------
+
+/** What the MR body promises about the issue it carries. */
+export interface ClosureDecision {
+  /** True only when the host will actually close the issue at merge time — which
+   *  both hosts do ONLY for an MR merged into the project's default branch. */
+  closes: boolean;
+  /** The ready-to-render sentence for the body: `Closes #n` when it closes, the
+   *  explicit why-not note (naming the base, the issue, and who owns the closing)
+   *  when it does not. */
+  line: string;
+}
+
+/**
+ * Decide what the MR body says about its issue, from the base it targets and the
+ * project's default branch (issue #27).
+ *
+ * GitHub and GitLab close an issue only when an MR carrying a closing keyword
+ * merges into the DEFAULT branch. `mr-body.ts` used to emit no keyword at all, so
+ * a fan-out to `main` left every issue open by accident — the absence was never
+ * the defect, the SILENCE was: on a stacked or staging base nobody was told the
+ * issue would outlive the merge.
+ *
+ * The keyword stays `Closes` verbatim in every language: the recognized list
+ * (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved) is closed and
+ * has no translatable equivalent — « Ferme #5 » cross-links but closes nothing.
+ * The NOTE around it is prose and may be French, like the rest of the body.
+ */
+export function decideIssueClosure(base: string, defaultBranch: string, issueNumber: number): ClosureDecision {
+  if (base === defaultBranch) {
+    return { closes: true, line: `Closes #${issueNumber}` };
+  }
+  return {
+    closes: false,
+    line:
+      `**Fermeture de l’issue** : cette MR cible \`${base}\`, pas \`${defaultBranch}\` — ` +
+      `elle ne fermera **pas** #${issueNumber}. La fermeture revient à la MR ` +
+      `\`${base} → ${defaultBranch}\`, ou se fait à la main.`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Description
 // ---------------------------------------------------------------------------
 
@@ -643,12 +698,13 @@ function renderDiffstat(diffstat: DiffStat): string {
 /**
  * Assemble the markdown description.
  *
- * Section order is reviewer-first: intent, then what changed, then what the run
- * itself found and verified, then the mechanical inventory. A reviewer who reads
- * only the first screen should already know why the MR exists and where to look.
+ * Section order is reviewer-first: the issue's fate (closure line), then intent,
+ * then what changed, then what the run itself found and verified, then the
+ * mechanical inventory. A reviewer who reads only the first screen should already
+ * know why the MR exists, what happens to its issue, and where to look.
  */
 export function buildMrDescription(input: MrBodyInput): string {
-  const { issue, branch, base, summary, summaryError, review, commits, diffstat, run, testing } =
+  const { issue, branch, base, defaultBranch, summary, summaryError, review, commits, diffstat, run, testing } =
     input;
   const parts: string[] = [];
 
@@ -665,6 +721,12 @@ export function buildMrDescription(input: MrBodyInput): string {
     `| Produit par | Sandcastle, round ${run.round}, profil \`${run.profile}\` |`,
   ].join('\n');
   parts.push(header);
+
+  // What happens to the issue — host-derived, before anything authored, because it
+  // is the one line the merge itself acts on (issue #27). `Closes #n` only when the
+  // target IS the default branch; every other base gets the why-not note instead,
+  // never a keyword that would silently do nothing.
+  parts.push(decideIssueClosure(base, defaultBranch, issue.number).line);
 
   // A stacked MR is the single most misread shape in chained mode: merged in the
   // wrong order it drags an unreviewed branch in with it. Say so at the top.
