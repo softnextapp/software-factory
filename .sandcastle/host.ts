@@ -609,6 +609,174 @@ function runDraftCreate(cli: 'gh' | 'glab', argv: readonly string[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Host-read failure classification + retry (issue #25)
+//
+// Three of the five verbs below (labelsOf, openChangeRequests, queueIssues) had
+// no try, no catch and no retry: a TRANSIENT host outage — 5xx, severed
+// connection, timeout — killed the run at whatever iteration it landed on, after
+// the agents had already produced work. Observed 2026-08-17 during a partial
+// GitHub outage (API Requests in major_outage, GraphQL answering 1-in-8) with
+// 4998/5000 requests left: not quota, pure transience. issueInfoOf already
+// degraded gracefully on the same grounds — "a thinner MR is a nuisance, a run
+// dead after two agent cycles is a loss" (main.ts) — the asymmetry was an
+// oversight, not a trade.
+//
+// A DEFINITIVE failure (404, auth, missing scope, exhausted quota) must NOT be
+// retried: waiting changes nothing, and hiding a 404 behind three attempts costs
+// time without saving the run. So the classification is a pure function over the
+// failing invocation's (status, stderr) — the two things an execFileSync throw
+// carries — unit-tested on captured real CLI output like every other parser here.
+// ---------------------------------------------------------------------------
+
+/** What a failed host read is, once classified. `reason` rides into the retry log. */
+export interface HostFailure {
+  /** True when another attempt could plausibly succeed (5xx, outage, quota window). */
+  readonly retryable: boolean;
+  /** Short stable cause for the log line — 'auth' | 'not-found' | 'quota' | 'outage' | 'unknown'. */
+  readonly reason: string;
+}
+
+/**
+ * Classify a failed `gh`/`glab` invocation from its exit status and captured
+ * stderr — the exact fields the thrown execFileSync error exposes (main.ts and
+ * the wrappers below read them off `err.status` / `err.stderr`). Both CLIs spell
+ * the HTTP status the same way in their error lines (`HTTP 401:` for gh,
+ * `: 401 {message:` for glab), so ONE classifier serves both; the fixtures in
+ * host.test.ts are byte-accurate captures of each CLI's real output.
+ *
+ * Fail-open to RETRYABLE: an unrecognised wording must not kill a run on a guess,
+ * because an unknown transient is the exact loss this classifier exists to
+ * prevent, while an unknown-but-definitive failure still surfaces after the
+ * bounded attempts.
+ */
+export function classifyHostFailure(status: number | null, stderr: string): HostFailure {
+  const text = stderr ?? '';
+  // gh prints `HTTP 401: …`; glab prints `… : 401 {message: …}`. One scan finds either.
+  const ghMatch = /HTTP (\d{3}):/.exec(text);
+  const glabMatch = /: (\d{3}) \{message:/.exec(text);
+  const code = ghMatch ? Number(ghMatch[1]) : glabMatch ? Number(glabMatch[1]) : null;
+  if (code !== null) {
+    if (code >= 500 || code === 429) {
+      // 5xx: the host is having a moment; 429: the window resets. Both repay waiting.
+      return { retryable: true, reason: code === 429 ? 'quota' : 'outage' };
+    }
+    if (code === 401 || code === 403) {
+      // Bad credentials / missing scope — no amount of retrying re-auths the CLI.
+      return { retryable: false, reason: 'auth' };
+    }
+    if (code === 404 || code === 410) {
+      // The thing is gone for good; three attempts only hide that.
+      return { retryable: false, reason: 'not-found' };
+    }
+    // Any other 4xx is a request-shape problem the loop cannot fix by repeating it.
+    if (code >= 400 && code < 500) return { retryable: false, reason: 'client-error' };
+  }
+  // gh's GraphQL flavour reports a missing issue/PR with NO status at all —
+  // "Could not resolve to an issue or pull request…" — which is its 404.
+  if (/could not resolve to (an|a) /i.test(text)) {
+    return { retryable: false, reason: 'not-found' };
+  }
+  // Connection-level failure. Two spellings: the CLIs' own banners (gh "error
+  // connecting to <host>", glab "x error connecting to <host>") and the Go HTTP
+  // transport line both CLIs surface verbatim when the API is unreachable —
+  // `Post "https://…": dial tcp …: connect: connection refused` (captured live).
+  // Empty stderr (process killed pre-read) rides here too.
+  if (/error connecting/i.test(text) || /\bdial tcp\b|\bi\/o timeout\b|\bcontext deadline exceeded\b/.test(text) || text.trim() === '') {
+    return { retryable: true, reason: 'outage' };
+  }
+  // Unrecognised wording with no status: fail toward the retry, not the run — an
+  // unknown transient is the exact loss this classifier exists to prevent, and an
+  // unknown-but-definitive failure still surfaces after the bounded attempts.
+  return { retryable: true, reason: 'unknown' };
+}
+
+/** Bounded attempts for one host read: the initial try plus the retries after it. */
+export const HOST_READ_ATTEMPTS = 4;
+
+/** First retry waits this long; each subsequent retry doubles it. */
+export const HOST_RETRY_BASE_DELAY_MS = 500;
+
+/**
+ * Random extra delay added to each backoff (0…this), so two loops restarting
+ * after the same outage do not resynchronise their attempts on the host.
+ */
+export const HOST_RETRY_JITTER_MS = 250;
+
+/** The delay shape for one retry: the exponential base plus a jitter draw. */
+export interface HostRetryPlan {
+  readonly delayMs: number;
+  readonly jitterMs: number;
+}
+
+/**
+ * Pure retry plan for the pause BEFORE attempt N+1 (attempt is 0-based, i.e. the
+ * number of failures so far). Exposed for tests; the runner below consumes it.
+ */
+export function hostRetryPlanFor(attempt: number, random: () => number = Math.random): HostRetryPlan {
+  const exp = Math.min(attempt, HOST_READ_ATTEMPTS - 2); // cap the exponent with the attempt bound
+  return {
+    delayMs: HOST_RETRY_BASE_DELAY_MS * 2 ** exp,
+    jitterMs: Math.floor(random() * (HOST_RETRY_JITTER_MS + 1)),
+  };
+}
+
+/** What one executed attempt of a host read looked like — the runner's log input. */
+export interface HostReadAttempt {
+  readonly attempt: number;
+  readonly status: number | null;
+  readonly stderr: string;
+}
+
+/** The host-facing effects runHostRead needs; injected so tests drive them purely. */
+export interface HostReadEffects {
+  sleep(ms: number): void;
+  log(line: string): void;
+  random(): number;
+}
+
+const defaultHostReadEffects: HostReadEffects = {
+  sleep: (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
+  log: (line) => console.warn(line),
+  random: () => Math.random(),
+};
+
+/**
+ * Run one host READ (labels / MR list / queue list) with bounded retries: a
+ * retryable failure waits the exponential backoff plus jitter and tries again (N
+ * attempts total), a definitive one rethrows immediately without consuming the
+ * remaining attempts, and every retry logs verb, attempt and cause so a slow run
+ * is readable after the fact. The read itself is injected — createHost() passes
+ * an execFileSync call, tests pass a recorder — so the loop is deterministic
+ * under test and the only time-based part (the sleep) is an effect.
+ */
+export function runHostRead(
+  verb: string,
+  read: () => string,
+  effects: HostReadEffects = defaultHostReadEffects,
+): string {
+  for (let attempt = 1; attempt <= HOST_READ_ATTEMPTS; attempt++) {
+    try {
+      return read();
+    } catch (error) {
+      const err = error as Error & { status?: number | null; stderr?: string };
+      const stderr = typeof err.stderr === 'string' ? err.stderr : err.message ?? '';
+      const failure = classifyHostFailure(typeof err.status === 'number' ? err.status : null, stderr);
+      if (!failure.retryable || attempt === HOST_READ_ATTEMPTS) {
+        throw error;
+      }
+      const { delayMs, jitterMs } = hostRetryPlanFor(attempt - 1, effects.random);
+      const pauseMs = delayMs + jitterMs;
+      const cause = stderr.split('\n')[0]?.trim() || 'no stderr captured';
+      effects.log(
+        `  ⚠ ${verb} failed (attempt ${attempt}/${HOST_READ_ATTEMPTS}, ${failure.reason}): ${cause} — retrying in ${pauseMs}ms`,
+      );
+      effects.sleep(pauseMs);
+    }
+  }
+  throw new Error(`runHostRead(${verb}): unreachable — the loop always returns or throws`);
+}
+
+// ---------------------------------------------------------------------------
 // Factory — bind the host's executing wrappers. Each is a thin shell over
 // execFileSync (or spawnSync, for the captured-output create above) using the pure
 // builders/parsers; the host decision lives in one branch per CLI, and main.ts
@@ -629,15 +797,20 @@ export interface Host {
 }
 
 export function createHost(host: GitHost): Host {
+  // One read = one retrying runHostRead. The verb string names the exact CLI
+  // invocation in the retry log, so a slow run reads back unambiguously.
+  const ghRead = (verb: string, argv: readonly string[]): string =>
+    runHostRead(`gh ${verb}`, () => execFileSync('gh', argv, { encoding: 'utf8' }));
+  const glabRead = (verb: string, argv: readonly string[]): string =>
+    runHostRead(`glab ${verb}`, () => execFileSync('glab', argv, { encoding: 'utf8' }));
+
   if (host === 'gh') {
     return {
       labelsOf: (issueNumber) =>
-        parseGhIssueLabels(
-          execFileSync('gh', ghIssueLabelsArgs(issueNumber), { encoding: 'utf8' }),
-        ),
+        parseGhIssueLabels(ghRead('issue view (labels)', ghIssueLabelsArgs(issueNumber))),
       issueInfoOf: (issueNumber, fallbackTitle) => {
         try {
-          const raw = execFileSync('gh', ghIssueViewArgs(issueNumber), { encoding: 'utf8' });
+          const raw = ghRead('issue view (info)', ghIssueViewArgs(issueNumber));
           return parseGhIssue(raw, fallbackTitle, issueNumber);
         } catch (error) {
           console.error(`  ⚠ #${issueNumber}: could not read the issue for the PR body — ${error}`);
@@ -645,12 +818,11 @@ export function createHost(host: GitHost): Host {
         }
       },
       createDraftChangeRequest: (args) => runDraftCreate('gh', ghPrCreateArgs(args)),
-      openChangeRequests: () =>
-        parseGhPrList(execFileSync('gh', ghPrListArgs(), { encoding: 'utf8' })),
+      openChangeRequests: () => parseGhPrList(ghRead('pr list', ghPrListArgs())),
       queueIssues: (labels) =>
         dedupeQueue(
           labels.flatMap((label) =>
-            parseGhQueue(execFileSync('gh', ghQueueListArgs(label), { encoding: 'utf8' })),
+            parseGhQueue(ghRead(`issue list --label ${label}`, ghQueueListArgs(label))),
           ),
         ),
     };
@@ -666,19 +838,25 @@ export function createHost(host: GitHost): Host {
   return {
     labelsOf: (issueNumber) =>
       parseGlabIssueLabels(
-        execFileSync(
-          'glab',
-          ['issue', 'view', String(issueNumber), '--output', 'json', '--jq', '.labels'],
-          { encoding: 'utf8' },
-        ),
+        glabRead('issue view (labels)', [
+          'issue',
+          'view',
+          String(issueNumber),
+          '--output',
+          'json',
+          '--jq',
+          '.labels',
+        ]),
       ),
     issueInfoOf: (issueNumber, fallbackTitle) => {
       try {
-        const raw = execFileSync(
-          'glab',
-          ['issue', 'view', String(issueNumber), '--output', 'json'],
-          { encoding: 'utf8' },
-        );
+        const raw = glabRead('issue view (info)', [
+          'issue',
+          'view',
+          String(issueNumber),
+          '--output',
+          'json',
+        ]);
         return parseGlabIssue(raw, fallbackTitle, issueNumber);
       } catch (error) {
         console.error(`  ⚠ #${issueNumber}: could not read the issue for the MR body — ${error}`);
@@ -688,14 +866,12 @@ export function createHost(host: GitHost): Host {
     createDraftChangeRequest: (args) => runDraftCreate('glab', glabMrCreateArgs(args)),
     openChangeRequests: () =>
       parseOpenMergeRequests(
-        execFileSync('glab', ['mr', 'list', '--output', 'json', '--per-page', '100'], {
-          encoding: 'utf8',
-        }),
+        glabRead('mr list', ['mr', 'list', '--output', 'json', '--per-page', '100']),
       ),
     queueIssues: (labels) =>
       dedupeQueue(
         labels.flatMap((label) =>
-          parseGlabQueue(execFileSync('glab', glabQueueListArgs(label), { encoding: 'utf8' })),
+          parseGlabQueue(glabRead(`issue list --label ${label}`, glabQueueListArgs(label))),
         ),
       ),
   };

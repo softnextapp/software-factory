@@ -36,6 +36,13 @@ import {
   hostTokenMissingMessage,
   isUncommittedChangesWarning,
   classifyDraftCreateOutput,
+  classifyHostFailure,
+  hostRetryPlanFor,
+  runHostRead,
+  HOST_READ_ATTEMPTS,
+  HOST_RETRY_BASE_DELAY_MS,
+  HOST_RETRY_JITTER_MS,
+  type HostReadAttempt,
 } from './host.ts';
 import { test, throws, finish } from './test-harness.ts';
 
@@ -561,6 +568,206 @@ test('hostTokenMissingMessage: local falls back to a generic message (never call
   const msg = hostTokenMissingMessage('GH_TOKEN', 'local', '.sandcastle/.env');
   assert.ok(msg.includes('GH_TOKEN'));
   assert.ok(msg.includes('.sandcastle/.env'));
+});
+
+// --- host-read failure classification + retry (issue #25) --------------------
+//
+// Three of the five host verbs (labelsOf, openChangeRequests, queueIssues) had no
+// try/catch and no retry: a transient host outage (5xx, severed connection, timed
+// out) killed a run at the second iteration after the agents had already produced
+// work, while a DEFINITIVE failure (404, auth, exhausted quota) would have been
+// pointlessly re-attempted. Observed 2026-08-17 during a partial GitHub outage
+// (API Requests in major_outage, GraphQL answering 1-in-8) with 4998/5000
+// requests left — not quota, pure transience.
+//
+// The classification is a PURE function over the failing CLI invocation's
+// (status, stderr) — the two things the thrown execFileSync error carries — so it
+// is testable on captured real CLI output exactly like the parsers above. Every
+// fixture string below is a byte-accurate capture of what the CLI actually
+// printed (gh 2.97.0, glab 1.63.0), not a paraphrase.
+
+// gh, captured live against github.com:
+const GH_401 = 'HTTP 401: Bad credentials (https://api.github.com/graphql)\nTry authenticating with:  gh auth login -h github.com\n';
+const GH_404 = 'GraphQL: Could not resolve to an issue or pull request with the number of 999999999. (repository.issue)\n';
+const GH_CONN = 'error connecting to github.invalid\ncheck your internet connection or https://githubstatus.com\n';
+// gh's Go HTTP transport, surfaced verbatim when the API endpoint itself is
+// unreachable (captured live, GH_HOST pointed at a refused port):
+const GH_DIAL_REFUSED = 'Post "https://127.0.0.1/api/graphql": dial tcp 127.0.0.1:443: connect: connection refused\n';
+// glab, captured live against gitlab.com / a stubbed 5xx endpoint:
+const GLAB_401 = 'ERROR: GET https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/issues/1: 401 {message: 401 Unauthorized}\n';
+const GLAB_502 = 'ERROR: GET http://127.0.0.1:8443/api/v4/projects/o%2Fr/issues/1: 502 {message: 502 stubbed}\n';
+const GLAB_503 = 'ERROR: GET http://127.0.0.1:8453/api/v4/projects/o%2Fr/issues: 503 {message: 503 stubbed}\n';
+const GLAB_429 = 'ERROR: GET http://127.0.0.1:8463/api/v4/projects/o%2Fr/issues/1: 429 {message: 429 Too Many Requests}\n';
+const GLAB_CONN = 'x error connecting to gitlab.invalid\n• Check your internet connection and status.gitlab.com. If on GitLab Self-Managed, run \'sudo gitlab-ctl status\' on your server.\n';
+const GLAB_404_API = 'ERROR: GET https://gitlab.com/api/v4/projects/o%2Fr/issues/999999999: 404 {message: 404 Not Found}\n';
+
+test('classifyHostFailure: server/host outage (5xx) is retryable — gh and glab captures', () => {
+  assert.equal(classifyHostFailure(1, GH_CONN).retryable, true);
+  assert.equal(classifyHostFailure(1, GLAB_CONN).retryable, true);
+  assert.equal(classifyHostFailure(1, GLAB_502).retryable, true);
+  assert.equal(classifyHostFailure(1, GLAB_503).retryable, true);
+});
+
+test('classifyHostFailure: transport-level refusal/timeout (Go dial tcp, i/o timeout) is the outage case', () => {
+  // Both CLIs surface the Go HTTP transport line verbatim when the endpoint is
+  // unreachable — captured live from gh. These classify as `outage` (not the
+  // catch-all `unknown`) so the retry log names the real cause.
+  for (const stderr of [
+    GH_DIAL_REFUSED,
+    'Get "https://api.github.com/": dial tcp 140.82.1.6:443: i/o timeout\n',
+    'Get "https://gitlab.com/api/v4/projects": context deadline exceeded\n',
+  ]) {
+    const failure = classifyHostFailure(1, stderr);
+    assert.equal(failure.retryable, true, stderr);
+    assert.equal(failure.reason, 'outage', stderr);
+  }
+});
+
+test('classifyHostFailure: quota (429) is retryable — the window resets', () => {
+  // 429 is "wait, not never": the issue's own incident had quota intact, but a
+  // consumer hitting a secondary rate limit recovers by backing off.
+  assert.equal(classifyHostFailure(1, GLAB_429).retryable, true);
+});
+
+test('classifyHostFailure: auth (401) is definitive — waiting changes nothing', () => {
+  const gh = classifyHostFailure(1, GH_401);
+  assert.equal(gh.retryable, false);
+  assert.equal(gh.reason, 'auth');
+  assert.equal(classifyHostFailure(1, GLAB_401).retryable, false);
+});
+
+test('classifyHostFailure: not-found (404 / GraphQL could-not-resolve) is definitive', () => {
+  assert.equal(classifyHostFailure(1, GH_404).retryable, false);
+  assert.equal(classifyHostFailure(1, GLAB_404_API).retryable, false);
+});
+
+test('classifyHostFailure: an UNRECOGNISED failure defaults to retryable (fail toward the retry, not the run)', () => {
+  // A novel error wording must not classify as definitive on a guess: a run killed
+  // by an unrecognised transient is the exact loss this issue is about, while an
+  // unknown-but-definitive failure still surfaces after the bounded attempts.
+  const unknown = classifyHostFailure(1, 'some never-seen-before CLI error');
+  assert.equal(unknown.retryable, true);
+  assert.equal(unknown.reason, 'unknown');
+});
+
+test('classifyHostFailure: an error with NO captured stderr is retryable (connection killed pre-read)', () => {
+  assert.equal(classifyHostFailure(1, '').retryable, true);
+});
+
+test('classifyHostFailure: permission (403) is definitive — a token without scope never gains it by waiting', () => {
+  assert.equal(
+    classifyHostFailure(1, 'ERROR: GET https://gitlab.com/api/v4/projects/o%2Fr/issues: 403 {message: 403 Forbidden}').retryable,
+    false,
+  );
+});
+
+test('hostRetryPlanFor: exponential backoff with a positive jitter bound, capped at the attempt count', () => {
+  assert.equal(hostRetryPlanFor(0).delayMs, HOST_RETRY_BASE_DELAY_MS);
+  assert.equal(hostRetryPlanFor(1).delayMs, HOST_RETRY_BASE_DELAY_MS * 2);
+  assert.equal(hostRetryPlanFor(2).delayMs, HOST_RETRY_BASE_DELAY_MS * 4);
+  // Every delay offers jitter headroom; never zero (a zero sleep is no sleep).
+  for (let attempt = 0; attempt < HOST_READ_ATTEMPTS; attempt++) {
+    const plan = hostRetryPlanFor(attempt);
+    assert.ok(plan.jitterMs >= 0 && plan.jitterMs <= HOST_RETRY_JITTER_MS, `attempt ${attempt} jitter in range`);
+    assert.ok(plan.delayMs + plan.jitterMs > 0, `attempt ${attempt} total delay > 0`);
+  }
+});
+
+test('hostRetryPlanFor: named constants are sane (bounded attempts, sub-second base, small jitter)', () => {
+  assert.ok(HOST_READ_ATTEMPTS >= 2 && HOST_READ_ATTEMPTS <= 6, `${HOST_READ_ATTEMPTS} attempts`);
+  assert.ok(HOST_RETRY_BASE_DELAY_MS >= 250 && HOST_RETRY_BASE_DELAY_MS <= 2000, `${HOST_RETRY_BASE_DELAY_MS}ms base`);
+  assert.ok(HOST_RETRY_JITTER_MS > 0 && HOST_RETRY_JITTER_MS <= 1000, `${HOST_RETRY_JITTER_MS}ms jitter`);
+});
+
+// A recording stand-in for the real executor + clock. The runner under test takes
+// them as parameters, so the retry loop is driven deterministically here and only
+// becomes time-based inside createHost().
+interface RecordedRead {
+  readonly attempts: HostReadAttempt[];
+  readonly slept: number[];
+  readonly logged: string[];
+}
+const recordedRead = (behaviour: readonly { status: number | null; stderr: string; stdout?: string }[]): {
+  run: () => string;
+  state: RecordedRead;
+} => {
+  const state: { attempts: HostReadAttempt[]; slept: number[]; logged: string[] } = {
+    attempts: [],
+    slept: [],
+    logged: [],
+  };
+  let call = 0;
+  const run = () =>
+    runHostRead('issue view 42', () => {
+      const step = behaviour[Math.min(call, behaviour.length - 1)]!;
+      call++;
+      state.attempts.push({ attempt: call, status: step.status, stderr: step.stderr });
+      if (step.status !== 0) {
+        const error = new Error(`host CLI failed (exit ${step.status}):\n${step.stderr}`) as Error & {
+          status?: number | null;
+          stderr?: string;
+        };
+        error.status = step.status;
+        error.stderr = step.stderr;
+        throw error;
+      }
+      return step.stdout ?? '[]';
+    }, {
+      sleep: (ms) => state.slept.push(ms),
+      log: (line) => state.logged.push(line),
+      random: () => 0.5, // deterministic jitter: always the midpoint
+    });
+  return { run, state: state as RecordedRead };
+};
+
+test('runHostRead: a transient failure then success retries, sleeps the backoff, and logs each retry', () => {
+  const { run, state } = recordedRead([
+    { status: 1, stderr: GLAB_503 },
+    { status: 0, stderr: '', stdout: '["bug"]' },
+  ]);
+  assert.equal(run(), '["bug"]');
+  assert.equal(state.attempts.length, 2, 'one retry');
+  // Deterministic midpoint jitter = half the jitter budget on top of the base delay.
+  assert.deepEqual(state.slept, [HOST_RETRY_BASE_DELAY_MS + HOST_RETRY_JITTER_MS / 2]);
+  assert.equal(state.logged.length, 1, 'exactly one retry line');
+  const line = state.logged[0]!;
+  assert.ok(line.includes('issue view 42'), `names the verb: ${line}`);
+  assert.ok(/2\/|attempt 2|retry/.test(line), `names the attempt: ${line}`);
+  assert.ok(line.length > 0 && line.includes('503'), `carries the cause: ${line}`);
+});
+
+test('runHostRead: a definitive failure throws immediately, consuming no further attempts', () => {
+  const { run, state } = recordedRead([
+    { status: 1, stderr: GH_401 },
+    { status: 0, stderr: '', stdout: '[]' },
+  ]);
+  assert.throws(run, /401/);
+  assert.equal(state.attempts.length, 1, 'no retry on a definitive failure');
+  assert.deepEqual(state.slept, [], 'no backoff consumed');
+});
+
+test('runHostRead: retries stop at the bound and the LAST error is what surfaces', () => {
+  const { run, state } = recordedRead([{ status: 1, stderr: GH_CONN }]);
+  assert.throws(run, /error connecting/);
+  assert.equal(state.attempts.length, HOST_READ_ATTEMPTS, `exactly ${HOST_READ_ATTEMPTS} attempts`);
+  assert.equal(state.slept.length, HOST_READ_ATTEMPTS - 1, 'a sleep per retry, none after the last');
+  assert.equal(state.logged.length, HOST_READ_ATTEMPTS - 1);
+});
+
+test('runHostRead: backoff is strictly exponential across the retry sequence', () => {
+  const { run, state } = recordedRead([{ status: 1, stderr: GLAB_502 }]);
+  assert.throws(run);
+  const expected = [0, 1, 2].slice(0, HOST_READ_ATTEMPTS - 1).map(
+    (i) => HOST_RETRY_BASE_DELAY_MS * 2 ** i + HOST_RETRY_JITTER_MS / 2,
+  );
+  assert.deepEqual(state.slept, expected);
+});
+
+test('runHostRead: a first-try success never sleeps and never logs', () => {
+  const { run, state } = recordedRead([{ status: 0, stderr: '', stdout: '[]' }]);
+  assert.equal(run(), '[]');
+  assert.deepEqual(state.slept, []);
+  assert.deepEqual(state.logged, []);
 });
 
 finish();
