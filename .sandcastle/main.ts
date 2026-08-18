@@ -48,6 +48,7 @@ import {
 import {
   createHost,
   HOST_TERMS,
+  HostReadError,
   openMrsCommand,
   promptHostArgs,
   inferGitHostFromUrl,
@@ -66,6 +67,14 @@ import {
   type DiffStat,
 } from './mr-body.ts';
 import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.ts';
+import {
+  isLostIterationError,
+  recordLostIteration,
+  isRunLost,
+  describeLostIteration,
+  describeIterationLosses,
+  type LostIteration,
+} from './iteration.ts';
 import { loadConfig, type Provider, type Role } from './config.ts';
 import {
   buildRunBranch,
@@ -1330,465 +1339,516 @@ ensureWorktreeExclude(process.cwd(), cfg.project.worktreeExclude);
 
 // ---------------------------------------------------------------------------
 // Main loop
+//
+// Per-iteration failure boundary (issue #31). Before it, a host read that
+// survived its retries (a `gh issue list` in 503 long enough to outlast the
+// #25 backoff) escaped this loop and killed the RUN — iterations delivered,
+// branches pushed, then eight more iterations never ran. The boundary below is
+// the second half of the fix #25 was the first half of: a TRANSIENT failure
+// that outlasted its retries ends its ITERATION only (the next one re-reads
+// the queue on a host that may have healed), while a DEFINITIVE one (auth,
+// exhausted quota, a config error, any non-host throw) still stops the run —
+// retrying ten iterations on an invalid token is ten losses, not ten chances.
+//
+// A lost iteration is counted and named, never swallowed, and a run that lost
+// them ALL exits non-zero (see the tail of the loop): a run that failed nine
+// times out of ten must not read as a calm one.
 // ---------------------------------------------------------------------------
+
+// Reassigned (never mutated in place), like `pending` above: each lost iteration
+// appends immutably via recordLostIteration, and the in-memory tally is the
+// source of truth for the end-of-run summary and the all-lost verdict.
+let lostIterations: LostIteration[] = [];
+let ranIterations = 0;
 
 for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${cfg.run.maxIterations} ===\n`);
-
-  // -------------------------------------------------------------------------
-  // Phase 1: Plan
-  //
-  // A throwaway sandbox where the planner reads the `sandcastle` queue and emits
-  // <plan>{ issues: [...] }</plan>. Empty list → backlog drained, stop.
-  // -------------------------------------------------------------------------
-  // The work queue, enumerated host-side over EVERY configured queue label and
-  // deduped (issue #15): the planner no longer runs a queue command, it receives
-  // this list inline as the sole source of truth (see plan-prompt.md). A ticket
-  // with a pending publish trace is held out — resume work the drain above just
-  // handled (or deferred), not fresh work; left in, the planner would re-pick it
-  // and duplicate a full implement+review cycle on a `-r2` branch (issue #26).
-  // FORCE is the operator's explicit exit from the hold: they asked for the
-  // re-run, so the trace stops standing in. The hold is LOGGED, never silent —
-  // a ticket leaving the queue must say why.
-  const queueIssues = host.queueIssues(cfg.project.queueLabels);
-  let plannerQueue = queueIssues;
-  if (!cfg.run.force && pending.length > 0) {
-    const { kept, held } = dropPendingIssues(queueIssues, pending);
-    if (held.length > 0) {
-      plannerQueue = kept;
-      console.log(
-        `  ⏸ publish ledger: holding #${held.join(', #')} out of the queue — their branch is ` +
-          `pushed but has no ${hostTerms.cr} yet (see .sandcastle/publish-pending.json).`,
-      );
-    }
-  }
-
-  const plan = await sandcastle.run({
-    sandbox: docker({ env: envFor('planner') }),
-    name: 'planner',
-    agent: agentFor('planner'),
-    promptFile: './.sandcastle/plan-prompt.md',
-    // The planner has to know the mode to apply the `Blocked by:` rule correctly.
-    // Off, an issue whose blocker is still open must be skipped — it would fork from
-    // the base and not see the blocker's code. On, the stack puts the blocker's
-    // branch underneath, so the same issue is workable. Same queue, opposite answer;
-    // the planner cannot read process.env, so the mode is passed in.
+  ranIterations += 1;
+  try {
+    // -------------------------------------------------------------------------
+    // Phase 1: Plan
     //
-    // ONLY/FORCE are the same kind of run-knob the planner cannot see. ONLY tells it
-    // the round is restricted to specific issue numbers (it should propose from that
-    // set); FORCE tells it to re-propose them even if they already have an open MR.
-    // main.ts still enforces ONLY on the result (see applyOnly below) — the planner
-    // is an agent — so a value here is guidance, not trust.
-    promptArgs: {
-      CHAIN_MODE: cfg.run.chain ? 'on' : 'off',
-      ONLY: cfg.run.only === null ? 'none' : cfg.run.only.join(', '),
-      FORCE: cfg.run.force ? 'on' : 'off',
-      ISSUE_QUEUE_JSON: JSON.stringify(plannerQueue),
-      OPEN_MRS_CMD: openMrsCommand(cfg.project.gitHost),
-    },
-  });
-
-  const parsed = parsePlan(plan.stdout, ALLOWED_BASES);
-  if (parsed.length === 0) {
-    console.log('Planner returned no issues. Stopping.');
-    break;
-  }
-
-  // SANDCASTLE_ONLY restricts the round to specific issue numbers. Enforced in code
-  // (applyOnly), not trusted to the planner: it intersects the plan with the
-  // operator's allow-list and drops everything else. FORCE was passed to the planner
-  // above so it re-proposes the issues even if they already have an open MR; this
-  // filter then guarantees only the allow-list survives.
-  let candidates = parsed;
-  if (cfg.run.only !== null) {
-    const onlyList = cfg.run.only.join(',');
-    const { kept, dropped } = applyOnly(parsed, cfg.run.only);
-    if (dropped.length > 0) {
-      console.log(
-        `  ⊘ SANDCASTLE_ONLY=${onlyList}: dropped ${dropped.length} planner issue(s) ` +
-          `outside the allow-list (${dropped.map((i) => '#' + i.number).join(', ')}).`,
-      );
+    // A throwaway sandbox where the planner reads the `sandcastle` queue and emits
+    // <plan>{ issues: [...] }</plan>. Empty list → backlog drained, stop.
+    // -------------------------------------------------------------------------
+    // The work queue, enumerated host-side over EVERY configured queue label and
+    // deduped (issue #15): the planner no longer runs a queue command, it receives
+    // this list inline as the sole source of truth (see plan-prompt.md). A ticket
+    // with a pending publish trace is held out — resume work the drain above just
+    // handled (or deferred), not fresh work; left in, the planner would re-pick it
+    // and duplicate a full implement+review cycle on a `-r2` branch (issue #26).
+    // FORCE is the operator's explicit exit from the hold: they asked for the
+    // re-run, so the trace stops standing in. The hold is LOGGED, never silent —
+    // a ticket leaving the queue must say why.
+    const queueIssues = host.queueIssues(cfg.project.queueLabels);
+    let plannerQueue = queueIssues;
+    if (!cfg.run.force && pending.length > 0) {
+      const { kept, held } = dropPendingIssues(queueIssues, pending);
+      if (held.length > 0) {
+        plannerQueue = kept;
+        console.log(
+          `  ⏸ publish ledger: holding #${held.join(', #')} out of the queue — their branch is ` +
+            `pushed but has no ${hostTerms.cr} yet (see .sandcastle/publish-pending.json).`,
+        );
+      }
     }
-    if (kept.length === 0) {
-      console.log(
-        `  ⊘ SANDCASTLE_ONLY=${onlyList}: none of the planned issues match the allow-list. ` +
-          `Stopping — if the issue is not in the open queue, the planner cannot pick it.`,
-      );
+
+    const plan = await sandcastle.run({
+      sandbox: docker({ env: envFor('planner') }),
+      name: 'planner',
+      agent: agentFor('planner'),
+      promptFile: './.sandcastle/plan-prompt.md',
+      // The planner has to know the mode to apply the `Blocked by:` rule correctly.
+      // Off, an issue whose blocker is still open must be skipped — it would fork from
+      // the base and not see the blocker's code. On, the stack puts the blocker's
+      // branch underneath, so the same issue is workable. Same queue, opposite answer;
+      // the planner cannot read process.env, so the mode is passed in.
+      //
+      // ONLY/FORCE are the same kind of run-knob the planner cannot see. ONLY tells it
+      // the round is restricted to specific issue numbers (it should propose from that
+      // set); FORCE tells it to re-propose them even if they already have an open MR.
+      // main.ts still enforces ONLY on the result (see applyOnly below) — the planner
+      // is an agent — so a value here is guidance, not trust.
+      promptArgs: {
+        CHAIN_MODE: cfg.run.chain ? 'on' : 'off',
+        ONLY: cfg.run.only === null ? 'none' : cfg.run.only.join(', '),
+        FORCE: cfg.run.force ? 'on' : 'off',
+        ISSUE_QUEUE_JSON: JSON.stringify(plannerQueue),
+        OPEN_MRS_CMD: openMrsCommand(cfg.project.gitHost),
+      },
+    });
+
+    const parsed = parsePlan(plan.stdout, ALLOWED_BASES);
+    if (parsed.length === 0) {
+      console.log('Planner returned no issues. Stopping.');
       break;
     }
-    candidates = kept;
-  }
 
-  // Cap the round to its configured parallelism. In chained mode that cap is 1 (a
-  // stack is built one MR at a time — a second issue would fork from a branch that
-  // does not exist yet); otherwise it is MAX_PARALLEL. The dropped issues keep their
-  // `sandcastle` label and come back next round.
-  const planned = candidates.slice(0, cfg.effectiveMaxParallel);
-  if (planned.length < candidates.length) {
-    if (cfg.run.chain) {
-      console.log(
-        `  ⛓ chain: ${candidates.length} issue(s) queued; keeping #${planned[0]?.number} ` +
-          `only — a stack is built one MR at a time.`,
-      );
-    } else {
-      console.log(
-        `  ⛷ max parallel: ${candidates.length} issue(s) queued, cap is ` +
-          `${cfg.effectiveMaxParallel}; running #${planned.map((i) => i.number).join(', ')} ` +
-          `this round, the rest next round.`,
-      );
+    // SANDCASTLE_ONLY restricts the round to specific issue numbers. Enforced in code
+    // (applyOnly), not trusted to the planner: it intersects the plan with the
+    // operator's allow-list and drops everything else. FORCE was passed to the planner
+    // above so it re-proposes the issues even if they already have an open MR; this
+    // filter then guarantees only the allow-list survives.
+    let candidates = parsed;
+    if (cfg.run.only !== null) {
+      const onlyList = cfg.run.only.join(',');
+      const { kept, dropped } = applyOnly(parsed, cfg.run.only);
+      if (dropped.length > 0) {
+        console.log(
+          `  ⊘ SANDCASTLE_ONLY=${onlyList}: dropped ${dropped.length} planner issue(s) ` +
+            `outside the allow-list (${dropped.map((i) => '#' + i.number).join(', ')}).`,
+        );
+      }
+      if (kept.length === 0) {
+        console.log(
+          `  ⊘ SANDCASTLE_ONLY=${onlyList}: none of the planned issues match the allow-list. ` +
+            `Stopping — if the issue is not in the open queue, the planner cannot pick it.`,
+        );
+        break;
+      }
+      candidates = kept;
     }
-  }
 
-  // The host's view/unlabel/comment verbs — reused to pre-render the implementer's
-  // claim commands below and spread into its promptArgs.
-  const hostVerbs = promptHostArgs(cfg.project.gitHost);
-  // Resolve + validate every base before any sandbox is created, so an unpublished
-  // base stops the round here rather than after two agent cycles.
-  const issues = planned.map((issue) => {
-    const labels = host.labelsOf(issue.number);
-    const labelBase = baseForLabels(labels, cfg.project.labelBases, cfg.project.baseBranch);
-    if (issue.base !== undefined && issue.base !== labelBase) {
-      console.warn(
-        `  ⚠ #${issue.number}: planner said base \`${issue.base}\`, labels say \`${labelBase}\` — using the labels.`,
+    // Cap the round to its configured parallelism. In chained mode that cap is 1 (a
+    // stack is built one MR at a time — a second issue would fork from a branch that
+    // does not exist yet); otherwise it is MAX_PARALLEL. The dropped issues keep their
+    // `sandcastle` label and come back next round.
+    const planned = candidates.slice(0, cfg.effectiveMaxParallel);
+    if (planned.length < candidates.length) {
+      if (cfg.run.chain) {
+        console.log(
+          `  ⛓ chain: ${candidates.length} issue(s) queued; keeping #${planned[0]?.number} ` +
+            `only — a stack is built one MR at a time.`,
+        );
+      } else {
+        console.log(
+          `  ⛷ max parallel: ${candidates.length} issue(s) queued, cap is ` +
+            `${cfg.effectiveMaxParallel}; running #${planned.map((i) => i.number).join(', ')} ` +
+            `this round, the rest next round.`,
+        );
+      }
+    }
+
+    // The host's view/unlabel/comment verbs — reused to pre-render the implementer's
+    // claim commands below and spread into its promptArgs.
+    const hostVerbs = promptHostArgs(cfg.project.gitHost);
+    // Resolve + validate every base before any sandbox is created, so an unpublished
+    // base stops the round here rather than after two agent cycles.
+    const issues = planned.map((issue) => {
+      const labels = host.labelsOf(issue.number);
+      const labelBase = baseForLabels(labels, cfg.project.labelBases, cfg.project.baseBranch);
+      if (issue.base !== undefined && issue.base !== labelBase) {
+        console.warn(
+          `  ⚠ #${issue.number}: planner said base \`${issue.base}\`, labels say \`${labelBase}\` — using the labels.`,
+        );
+      }
+      const base = resolveBase(issue.number, labelBase);
+      assertBaseUsable(base);
+      // Fast-forward the base to origin so agent branches fork from the latest
+      // published tip, not a stale local ref (issue #14). Live only — the dry run
+      // exits before Phase 2.
+      syncBaseToOrigin(base);
+      // Pre-render the host's unlabel command for each queue label the issue actually
+      // carries, so the implementer runs them verbatim instead of re-splitting a label
+      // list (issue #15: a captable issue carries `ready-for-agent`, not `sandcastle`).
+      const claimCommands = claimLabels(labels, cfg.project.queueLabels)
+        .map((label) => `${hostVerbs.UNLABEL_PREFIX} ${issue.number} ${hostVerbs.UNLABEL_FLAG} ${label}`)
+        .join('\n');
+      return { ...issue, base, claimCommands };
+    });
+
+    console.log(`Planned ${issues.length} issue(s) this round:`);
+    for (const issue of issues) {
+      console.log(`  #${issue.number}: ${issue.title} → ${issue.branch} (base ${issue.base})`);
+    }
+
+    // Startup sweep of dead runs' empty branches (issue #28) — first iteration only:
+    // later iterations run inside this same process and their predecessors' branches
+    // are this run's own. Runs after the planner has spoken so the names THIS run is
+    // about to create (every planned branch × every iteration it may still reach) are
+    // excluded, and before Phase 2 forks a single worktree.
+    if (iteration === 1) {
+      console.log(`Sweeping dead-run branches (run ${RUN_ID}):`);
+      const mine = new Set(
+        runBranchBases(
+          issues.map((issue) => ({ branch: issue.branch })),
+          RUN_ID,
+          Array.from({ length: cfg.run.maxIterations }, (_, i) => i + 1),
+        ),
       );
+      sweepDeadBranches(mine);
     }
-    const base = resolveBase(issue.number, labelBase);
-    assertBaseUsable(base);
-    // Fast-forward the base to origin so agent branches fork from the latest
-    // published tip, not a stale local ref (issue #14). Live only — the dry run
-    // exits before Phase 2.
-    syncBaseToOrigin(base);
-    // Pre-render the host's unlabel command for each queue label the issue actually
-    // carries, so the implementer runs them verbatim instead of re-splitting a label
-    // list (issue #15: a captable issue carries `ready-for-agent`, not `sandcastle`).
-    const claimCommands = claimLabels(labels, cfg.project.queueLabels)
-      .map((label) => `${hostVerbs.UNLABEL_PREFIX} ${issue.number} ${hostVerbs.UNLABEL_FLAG} ${label}`)
-      .join('\n');
-    return { ...issue, base, claimCommands };
-  });
 
-  console.log(`Planned ${issues.length} issue(s) this round:`);
-  for (const issue of issues) {
-    console.log(`  #${issue.number}: ${issue.title} → ${issue.branch} (base ${issue.base})`);
-  }
+    // -------------------------------------------------------------------------
+    // Phase 2: Implement + fix-in-place review, ≤ MAX_PARALLEL concurrent.
+    //
+    // Hand-rolled semaphore caps concurrency; Promise.allSettled so one failing branch
+    // doesn't abort the batch. The reviewer runs only if the implementer produced
+    // commits, and it fixes in place (edits + commits directly) rather than gating
+    // with a verdict.
+    //
+    // Each issue gets *two sequential sandboxes on the same branch*: impl then review,
+    // each with its role's provider env. That env is baked at sandbox level, so a
+    // single sandbox cannot host both. close() drops the impl worktree path but keeps
+    // the branch ref + its commits, so the review createSandbox({ branch }) checks out
+    // the existing branch and sees the implementation (baseBranch is ignored for an
+    // existing branch, which is why passing it twice is harmless). The semaphore is
+    // held across both, so concurrency stays capped at effectiveMaxParallel — the cost
+    // is wall-clock (the install hook, if any, runs twice per issue).
+    // -------------------------------------------------------------------------
+    let running = 0;
+    const queue: Array<() => void> = [];
+    const acquire = (): Promise<void> =>
+      running < cfg.effectiveMaxParallel
+        ? ((running += 1), Promise.resolve())
+        : new Promise<void>((resolve) => queue.push(resolve));
+    const release = (): void => {
+      running -= 1;
+      const next = queue.shift();
+      if (next) {
+        running += 1;
+        next();
+      }
+    };
 
-  // Startup sweep of dead runs' empty branches (issue #28) — first iteration only:
-  // later iterations run inside this same process and their predecessors' branches
-  // are this run's own. Runs after the planner has spoken so the names THIS run is
-  // about to create (every planned branch × every iteration it may still reach) are
-  // excluded, and before Phase 2 forks a single worktree.
-  if (iteration === 1) {
-    console.log(`Sweeping dead-run branches (run ${RUN_ID}):`);
-    const mine = new Set(
-      runBranchBases(
-        issues.map((issue) => ({ branch: issue.branch })),
-        RUN_ID,
-        Array.from({ length: cfg.run.maxIterations }, (_, i) => i + 1),
-      ),
-    );
-    sweepDeadBranches(mine);
-  }
-
-  // -------------------------------------------------------------------------
-  // Phase 2: Implement + fix-in-place review, ≤ MAX_PARALLEL concurrent.
-  //
-  // Hand-rolled semaphore caps concurrency; Promise.allSettled so one failing branch
-  // doesn't abort the batch. The reviewer runs only if the implementer produced
-  // commits, and it fixes in place (edits + commits directly) rather than gating
-  // with a verdict.
-  //
-  // Each issue gets *two sequential sandboxes on the same branch*: impl then review,
-  // each with its role's provider env. That env is baked at sandbox level, so a
-  // single sandbox cannot host both. close() drops the impl worktree path but keeps
-  // the branch ref + its commits, so the review createSandbox({ branch }) checks out
-  // the existing branch and sees the implementation (baseBranch is ignored for an
-  // existing branch, which is why passing it twice is harmless). The semaphore is
-  // held across both, so concurrency stays capped at effectiveMaxParallel — the cost
-  // is wall-clock (the install hook, if any, runs twice per issue).
-  // -------------------------------------------------------------------------
-  let running = 0;
-  const queue: Array<() => void> = [];
-  const acquire = (): Promise<void> =>
-    running < cfg.effectiveMaxParallel
-      ? ((running += 1), Promise.resolve())
-      : new Promise<void>((resolve) => queue.push(resolve));
-  const release = (): void => {
-    running -= 1;
-    const next = queue.shift();
-    if (next) {
-      running += 1;
-      next();
-    }
-  };
-
-  const settled = await Promise.allSettled(
-    issues.map(async (issue) => {
-      // Unique per RUN (issue #28): `-r<runId>-<iteration>`. The run id is minted
-      // once at startup, so two runs of the same ticket never mint the same name —
-      // the killed-run collision this issue was filed for. Iteration still varies
-      // within the run, preserving the old guarantee for re-planned tickets.
-      const branch = buildRunBranch(issue.branch, RUN_ID, iteration);
-      // BASE_BRANCH is ours, not sandcastle's built-in TARGET_BRANCH: in the review
-      // worktree the branch already exists, and the built-in resolves from the
-      // worktree, which would make `git diff TARGET...BRANCH` a self-diff (empty, no
-      // error — the reviewer would silently review nothing).
-      const promptArgs = {
-        ISSUE_NUMBER: String(issue.number),
-        ISSUE_TITLE: issue.title,
-        BRANCH: branch,
-        BASE_BRANCH: issue.base,
-        // Drives the commit-subject format in the implement/review prompts: 'ralph'
-        // (RALPH:-prefixed subjects) vs 'conventional' (type(scope): …, commitlint-safe).
-        COMMIT_STYLE: cfg.project.commitStyle,
-        // Pre-rendered host unlabel command(s) — one per line — that take this issue
-        // out of the queue (`sandcastle` OR `ready-for-agent`; issue #15). The
-        // implementer runs them verbatim, no label-list re-splitting.
-        CLAIM_COMMANDS: issue.claimCommands,
-        // Host verbs the prompts compose to view / comment on the issue (glab vs gh
-        // differ past the binary). See promptHostArgs() in host.ts.
-        ...hostVerbs,
-      };
-      await acquire();
-      try {
-        // --- Implement (implementer's provider sandbox, creates the branch) ---
-        let implement: RunResult;
-        // Inside the try so a createSandbox failure still hits release() below —
-        // otherwise a queued issue would wait forever and allSettled never settles.
-        const implSandbox = await sandcastle.createSandbox({
-          branch,
-          baseBranch: issue.base,
-          sandbox: docker({ env: envFor('implementer') }),
-          hooks,
-          copyToWorktree,
-        });
+    const settled = await Promise.allSettled(
+      issues.map(async (issue) => {
+        // Unique per RUN (issue #28): `-r<runId>-<iteration>`. The run id is minted
+        // once at startup, so two runs of the same ticket never mint the same name —
+        // the killed-run collision this issue was filed for. Iteration still varies
+        // within the run, preserving the old guarantee for re-planned tickets.
+        const branch = buildRunBranch(issue.branch, RUN_ID, iteration);
+        // BASE_BRANCH is ours, not sandcastle's built-in TARGET_BRANCH: in the review
+        // worktree the branch already exists, and the built-in resolves from the
+        // worktree, which would make `git diff TARGET...BRANCH` a self-diff (empty, no
+        // error — the reviewer would silently review nothing).
+        const promptArgs = {
+          ISSUE_NUMBER: String(issue.number),
+          ISSUE_TITLE: issue.title,
+          BRANCH: branch,
+          BASE_BRANCH: issue.base,
+          // Drives the commit-subject format in the implement/review prompts: 'ralph'
+          // (RALPH:-prefixed subjects) vs 'conventional' (type(scope): …, commitlint-safe).
+          COMMIT_STYLE: cfg.project.commitStyle,
+          // Pre-rendered host unlabel command(s) — one per line — that take this issue
+          // out of the queue (`sandcastle` OR `ready-for-agent`; issue #15). The
+          // implementer runs them verbatim, no label-list re-splitting.
+          CLAIM_COMMANDS: issue.claimCommands,
+          // Host verbs the prompts compose to view / comment on the issue (glab vs gh
+          // differ past the binary). See promptHostArgs() in host.ts.
+          ...hostVerbs,
+        };
+        await acquire();
         try {
-          implement = await implSandbox.run({
-            name: `implementer #${issue.number}`,
-            agent: agentFor('implementer'),
-            promptFile: './.sandcastle/implement-prompt.md',
-            promptArgs,
+          // --- Implement (implementer's provider sandbox, creates the branch) ---
+          let implement: RunResult;
+          // Inside the try so a createSandbox failure still hits release() below —
+          // otherwise a queued issue would wait forever and allSettled never settles.
+          const implSandbox = await sandcastle.createSandbox({
+            branch,
+            baseBranch: issue.base,
+            sandbox: docker({ env: envFor('implementer') }),
+            hooks,
+            copyToWorktree,
           });
-        } finally {
-          await implSandbox.close();
-        }
-
-        // --- Review (reviewer's provider sandbox, same branch) ---
-        // Spun up UNCONDITIONALLY — do not collapse it into the implementer sandbox
-        // in profile `opus` just because both envs are identical there. Best-effort
-        // refinement: a reviewer failure — including a failure to even create the
-        // second sandbox — must NOT reject the issue. The implementer's commits
-        // already landed and Phase 3 can publish them. Captured for the MR body: the
-        // reviewer's two <review-findings> ledgers travel in its stdout, and
-        // `reviewed` distinguishes "no reviewer ran" from "a reviewer ran and
-        // reported nothing" — two very different things to a human about to merge.
-        let reviewStdout = '';
-        let reviewed = false;
-        const logs: string[] = [];
-        if (implement.logFilePath) logs.push(implement.logFilePath);
-        if (implement.commits.length > 0) {
-          let reviewSandbox: Sandbox | undefined;
           try {
-            reviewSandbox = await sandcastle.createSandbox({
-              branch,
-              baseBranch: issue.base,
-              sandbox: docker({ env: envFor('reviewer') }),
-              hooks,
-              copyToWorktree,
-            });
-            const review = await reviewSandbox.run({
-              name: `reviewer #${issue.number}`,
-              agent: agentFor('reviewer'),
-              promptFile: './.sandcastle/review-prompt.md',
+            implement = await implSandbox.run({
+              name: `implementer #${issue.number}`,
+              agent: agentFor('implementer'),
+              promptFile: './.sandcastle/implement-prompt.md',
               promptArgs,
             });
-            reviewStdout = review.stdout;
-            reviewed = true;
-            if (review.logFilePath) logs.push(review.logFilePath);
-          } catch (error) {
-            console.error(`  ⚠ #${issue.number} review failed; keeping implementation: ${error}`);
           } finally {
-            if (reviewSandbox) await reviewSandbox.close();
+            await implSandbox.close();
           }
+
+          // --- Review (reviewer's provider sandbox, same branch) ---
+          // Spun up UNCONDITIONALLY — do not collapse it into the implementer sandbox
+          // in profile `opus` just because both envs are identical there. Best-effort
+          // refinement: a reviewer failure — including a failure to even create the
+          // second sandbox — must NOT reject the issue. The implementer's commits
+          // already landed and Phase 3 can publish them. Captured for the MR body: the
+          // reviewer's two <review-findings> ledgers travel in its stdout, and
+          // `reviewed` distinguishes "no reviewer ran" from "a reviewer ran and
+          // reported nothing" — two very different things to a human about to merge.
+          let reviewStdout = '';
+          let reviewed = false;
+          const logs: string[] = [];
+          if (implement.logFilePath) logs.push(implement.logFilePath);
+          if (implement.commits.length > 0) {
+            let reviewSandbox: Sandbox | undefined;
+            try {
+              reviewSandbox = await sandcastle.createSandbox({
+                branch,
+                baseBranch: issue.base,
+                sandbox: docker({ env: envFor('reviewer') }),
+                hooks,
+                copyToWorktree,
+              });
+              const review = await reviewSandbox.run({
+                name: `reviewer #${issue.number}`,
+                agent: agentFor('reviewer'),
+                promptFile: './.sandcastle/review-prompt.md',
+                promptArgs,
+              });
+              reviewStdout = review.stdout;
+              reviewed = true;
+              if (review.logFilePath) logs.push(review.logFilePath);
+            } catch (error) {
+              console.error(`  ⚠ #${issue.number} review failed; keeping implementation: ${error}`);
+            } finally {
+              if (reviewSandbox) await reviewSandbox.close();
+            }
+          }
+
+          return {
+            issue,
+            branch,
+            commits: implement.commits.length,
+            implStdout: implement.stdout,
+            reviewStdout,
+            reviewed,
+            logs,
+          };
+        } finally {
+          release();
         }
+      }),
+    );
 
-        return {
-          issue,
-          branch,
-          commits: implement.commits.length,
-          implStdout: implement.stdout,
-          reviewStdout,
-          reviewed,
-          logs,
-        };
-      } finally {
-        release();
+    settled.forEach((outcome, i) => {
+      if (outcome.status === 'rejected') {
+        console.error(`  ✗ #${issues[i]?.number} (${issues[i]?.branch}) failed: ${outcome.reason}`);
       }
-    }),
-  );
+    });
 
-  settled.forEach((outcome, i) => {
-    if (outcome.status === 'rejected') {
-      console.error(`  ✗ #${issues[i]?.number} (${issues[i]?.branch}) failed: ${outcome.reason}`);
+    type Completed = {
+      issue: PlannedIssue & { base: string; claimCommands: string };
+      branch: string;
+      commits: number;
+      implStdout: string;
+      reviewStdout: string;
+      reviewed: boolean;
+      logs: string[];
+    };
+    const completed = settled
+      .filter(
+        (o): o is PromiseFulfilledResult<Completed> => o.status === 'fulfilled' && o.value.commits > 0,
+      )
+      .map((o) => o.value);
+
+    if (completed.length === 0) {
+      console.log('No branch produced commits. Stopping.');
+      break;
     }
-  });
 
-  type Completed = {
-    issue: PlannedIssue & { base: string; claimCommands: string };
-    branch: string;
-    commits: number;
-    implStdout: string;
-    reviewStdout: string;
-    reviewed: boolean;
-    logs: string[];
-  };
-  const completed = settled
-    .filter(
-      (o): o is PromiseFulfilledResult<Completed> => o.status === 'fulfilled' && o.value.commits > 0,
-    )
-    .map((o) => o.value);
+    // -------------------------------------------------------------------------
+    // Phase 3: Publish (host-side) — push + Draft MR per completed branch.
+    //
+    // main.ts runs on the host and branch commits live in the bind-mounted .git, so we
+    // push + open a Draft MR/PR from here (host git + the host CLI are already authed).
+    // Never auto-merged (MERGE_STRATEGY=human) — a human reviews and merges. We do NOT
+    // let the host CLI push (it would push the host's *current* branch, not the worktree
+    // branch); we push the worktree branch ourselves, then ask the host to open the MR/PR.
+    // -------------------------------------------------------------------------
+    // Everything here goes through argv (execFileSync / host.createDraftChangeRequest),
+    // never a shell string: `branch`, `mrTitle` and `mrDesc` are agent-authored — the
+    // branch comes from the planner's JSON, the title and body from the implementer's
+    // and reviewer's own words. plan.ts constrains the branch shape, but the title and
+    // the description are free text (multi-line markdown, backticks, quotes) and quoting
+    // that by hand is how injections happen.
+    //
+    // Per-branch try/catch: a transient `git push` or host-CLI failure on one branch
+    // must not skip the branches after it, and must not end the run. Their work is
+    // committed and their MR/PR can be opened by hand — losing the report of what
+    // happened is the expensive part.
+    for (const { issue, branch, implStdout, reviewStdout, reviewed, logs } of completed) {
+      console.log(`\nPublishing #${issue.number} → ${branch} (target ${issue.base})`);
+      // Split into a PUSH half and a CREATE half (issue #26): a push that fails is
+      // plain old Phase-3 failure (nothing durable to remember — the branch is not
+      // on origin, so a re-plan of the ticket is legitimate). A push that SUCCEEDS
+      // followed by a create that fails is exactly the orphan the publish ledger
+      // exists for: record a trace so the NEXT run opens the missing MR instead of
+      // re-implementing the ticket. mrTitle/mrDesc are hoisted so the trace can
+      // carry them when the create itself is what failed.
+      let pushed = false;
+      let mrTitle: string | undefined;
+      let mrDesc: string | undefined;
+      try {
+        execFileSync('git', ['push', '-u', 'origin', branch], { stdio: 'inherit' });
+        pushed = true;
 
-  if (completed.length === 0) {
-    console.log('No branch produced commits. Stopping.');
-    break;
-  }
-
-  // -------------------------------------------------------------------------
-  // Phase 3: Publish (host-side) — push + Draft MR per completed branch.
-  //
-  // main.ts runs on the host and branch commits live in the bind-mounted .git, so we
-  // push + open a Draft MR/PR from here (host git + the host CLI are already authed).
-  // Never auto-merged (MERGE_STRATEGY=human) — a human reviews and merges. We do NOT
-  // let the host CLI push (it would push the host's *current* branch, not the worktree
-  // branch); we push the worktree branch ourselves, then ask the host to open the MR/PR.
-  // -------------------------------------------------------------------------
-  // Everything here goes through argv (execFileSync / host.createDraftChangeRequest),
-  // never a shell string: `branch`, `mrTitle` and `mrDesc` are agent-authored — the
-  // branch comes from the planner's JSON, the title and body from the implementer's
-  // and reviewer's own words. plan.ts constrains the branch shape, but the title and
-  // the description are free text (multi-line markdown, backticks, quotes) and quoting
-  // that by hand is how injections happen.
-  //
-  // Per-branch try/catch: a transient `git push` or host-CLI failure on one branch
-  // must not skip the branches after it, and must not end the run. Their work is
-  // committed and their MR/PR can be opened by hand — losing the report of what
-  // happened is the expensive part.
-  for (const { issue, branch, implStdout, reviewStdout, reviewed, logs } of completed) {
-    console.log(`\nPublishing #${issue.number} → ${branch} (target ${issue.base})`);
-    // Split into a PUSH half and a CREATE half (issue #26): a push that fails is
-    // plain old Phase-3 failure (nothing durable to remember — the branch is not
-    // on origin, so a re-plan of the ticket is legitimate). A push that SUCCEEDS
-    // followed by a create that fails is exactly the orphan the publish ledger
-    // exists for: record a trace so the NEXT run opens the missing MR instead of
-    // re-implementing the ticket. mrTitle/mrDesc are hoisted so the trace can
-    // carry them when the create itself is what failed.
-    let pushed = false;
-    let mrTitle: string | undefined;
-    let mrDesc: string | undefined;
-    try {
-      execFileSync('git', ['push', '-u', 'origin', branch], { stdio: 'inherit' });
-      pushed = true;
-
-      // Title and description are built here, not left to `git log -1` and a constant:
-      // the reviewer's cost is dominated by reconstructing intent, and the run already
-      // knows it. Agent-authored halves ride in on stdout; the rest is read from the
-      // host and git. A mute or malformed agent block degrades the body and is
-      // REPORTED in it — never fails the publish. See mr-body.ts.
-      const { summary, error: summaryError } = extractMrSummary(implStdout);
-      if (summaryError) {
-        console.error(`  ⚠ #${issue.number}: ${summaryError} — MR body will say so.`);
-      }
-      const commits = commitsOn(issue.base, branch);
-      const issueInfo = host.issueInfoOf(issue.number, issue.title);
-      mrTitle = buildMrTitle({
-        style: titleStyle,
-        issue: { number: issue.number, title: issue.title },
-        summary,
-        commits,
-      });
-      mrDesc = buildMrDescription({
-        issue: issueInfo,
-        branch,
-        base: issue.base,
-        // Drives the closure decision (issue #27): `Closes #n` only when the target
-        // IS the trunk, else the explicit why-not note. The trunk comes from the
-        // config — never a hardcoded 'main' — so a consumer with another default
-        // branch gets the same guarantee.
-        defaultBranch: cfg.project.baseBranch,
-        summary,
-        ...(summaryError ? { summaryError } : {}),
-        review: {
-          reviewed,
-          found: extractReviewLedger(reviewStdout, 'found').data,
-          resolved: extractReviewLedger(reviewStdout, 'resolved').data,
-        },
-        commits,
-        diffstat: diffstatOf(issue.base, branch),
-        run: {
-          profile: cfg.run.profile,
-          implementerModel: modelFor('implementer'),
-          reviewerModel: modelFor('reviewer'),
-          round: iteration,
-          logs,
-        },
-      });
-      // Open the Draft MR/PR through the host layer — glab mr create / gh pr create,
-      // argv only. assignee null ⇒ leave it unassigned (host default).
-      host.createDraftChangeRequest({
-        sourceBranch: branch,
-        targetBranch: issue.base,
-        title: mrTitle,
-        description: mrDesc,
-        assignee: cfg.project.assignee,
-      });
-    } catch (error) {
-      if (pushed) {
-        // The branch is on origin and its MR is not — durable trace for the next
-        // run's drain (issue #26). When the failure was the create itself, the
-        // trace carries the built title/description and the resume opens the
-        // exact MR this run meant to. When it was earlier (an MR-body builder),
-        // the trace falls back to a title rebuilt from the first commit and a
-        // body that says so — degraded, but never silently empty. Both fallbacks
-        // are LAZY: in the ordinary case (the create 503'd) mrTitle/mrDesc are
-        // set, and eagerly rebuilding a title would re-run `git log` — and print
-        // its own warning — for a value about to be discarded.
-        const fallbackTitle = (): string =>
-          buildMrTitle({
-            style: titleStyle,
-            issue: { number: issue.number, title: issue.title },
-            summary: extractMrSummary(implStdout).summary,
-            commits: commitsOn(issue.base, branch),
-          });
-        const fallbackDesc = (): string =>
-          `Resumed publish for #${issue.number} (${issue.title}): the branch was pushed by ` +
-          `round ${iteration} but its ${hostTerms.cr} could not be opened. The original MR ` +
-          `description was not recorded — this MR was opened by the publish-ledger resume.`;
-        const trace: PendingPublish = {
-          issue: issue.number,
+        // Title and description are built here, not left to `git log -1` and a constant:
+        // the reviewer's cost is dominated by reconstructing intent, and the run already
+        // knows it. Agent-authored halves ride in on stdout; the rest is read from the
+        // host and git. A mute or malformed agent block degrades the body and is
+        // REPORTED in it — never fails the publish. See mr-body.ts.
+        const { summary, error: summaryError } = extractMrSummary(implStdout);
+        if (summaryError) {
+          console.error(`  ⚠ #${issue.number}: ${summaryError} — MR body will say so.`);
+        }
+        const commits = commitsOn(issue.base, branch);
+        const issueInfo = host.issueInfoOf(issue.number, issue.title);
+        mrTitle = buildMrTitle({
+          style: titleStyle,
+          issue: { number: issue.number, title: issue.title },
+          summary,
+          commits,
+        });
+        mrDesc = buildMrDescription({
+          issue: issueInfo,
           branch,
           base: issue.base,
-          title: mrTitle ?? fallbackTitle(),
-          description: mrDesc ?? fallbackDesc(),
-          reason: String(error),
-          round: iteration,
-        };
-        pending = recordPendingPublish(pending, trace);
-        persistPending();
+          // Drives the closure decision (issue #27): `Closes #n` only when the target
+          // IS the trunk, else the explicit why-not note. The trunk comes from the
+          // config — never a hardcoded 'main' — so a consumer with another default
+          // branch gets the same guarantee.
+          defaultBranch: cfg.project.baseBranch,
+          summary,
+          ...(summaryError ? { summaryError } : {}),
+          review: {
+            reviewed,
+            found: extractReviewLedger(reviewStdout, 'found').data,
+            resolved: extractReviewLedger(reviewStdout, 'resolved').data,
+          },
+          commits,
+          diffstat: diffstatOf(issue.base, branch),
+          run: {
+            profile: cfg.run.profile,
+            implementerModel: modelFor('implementer'),
+            reviewerModel: modelFor('reviewer'),
+            round: iteration,
+            logs,
+          },
+        });
+        // Open the Draft MR/PR through the host layer — glab mr create / gh pr create,
+        // argv only. assignee null ⇒ leave it unassigned (host default).
+        host.createDraftChangeRequest({
+          sourceBranch: branch,
+          targetBranch: issue.base,
+          title: mrTitle,
+          description: mrDesc,
+          assignee: cfg.project.assignee,
+        });
+      } catch (error) {
+        if (pushed) {
+          // The branch is on origin and its MR is not — durable trace for the next
+          // run's drain (issue #26). When the failure was the create itself, the
+          // trace carries the built title/description and the resume opens the
+          // exact MR this run meant to. When it was earlier (an MR-body builder),
+          // the trace falls back to a title rebuilt from the first commit and a
+          // body that says so — degraded, but never silently empty. Both fallbacks
+          // are LAZY: in the ordinary case (the create 503'd) mrTitle/mrDesc are
+          // set, and eagerly rebuilding a title would re-run `git log` — and print
+          // its own warning — for a value about to be discarded.
+          const fallbackTitle = (): string =>
+            buildMrTitle({
+              style: titleStyle,
+              issue: { number: issue.number, title: issue.title },
+              summary: extractMrSummary(implStdout).summary,
+              commits: commitsOn(issue.base, branch),
+            });
+          const fallbackDesc = (): string =>
+            `Resumed publish for #${issue.number} (${issue.title}): the branch was pushed by ` +
+            `round ${iteration} but its ${hostTerms.cr} could not be opened. The original MR ` +
+            `description was not recorded — this MR was opened by the publish-ledger resume.`;
+          const trace: PendingPublish = {
+            issue: issue.number,
+            branch,
+            base: issue.base,
+            title: mrTitle ?? fallbackTitle(),
+            description: mrDesc ?? fallbackDesc(),
+            reason: String(error),
+            round: iteration,
+          };
+          pending = recordPendingPublish(pending, trace);
+          persistPending();
+          console.error(
+            `  ✗ #${issue.number}: ${hostTerms.cr} creation failed for pushed \`${branch}\` — ` +
+              `trace recorded, the NEXT run will open it (issue #26). Or by hand:\n` +
+              `    ${manualCreateHint(cfg.project.gitHost, branch, issue.base)}\n` +
+              `    ${String(error)}`,
+          );
+          continue;
+        }
         console.error(
-          `  ✗ #${issue.number}: ${hostTerms.cr} creation failed for pushed \`${branch}\` — ` +
-            `trace recorded, the NEXT run will open it (issue #26). Or by hand:\n` +
-            `    ${manualCreateHint(cfg.project.gitHost, branch, issue.base)}\n` +
+          `  ✗ #${issue.number}: publish failed for \`${branch}\` — the commits are on the ` +
+            `${hostTerms.cr} by hand:\n` +
+            `    git push -u origin ${branch} && ${manualCreateHint(cfg.project.gitHost, branch, issue.base)}\n` +
             `    ${String(error)}`,
         );
-        continue;
       }
-      console.error(
-        `  ✗ #${issue.number}: publish failed for \`${branch}\` — the commits are on the ` +
-          `${hostTerms.cr} by hand:\n` +
-          `    git push -u origin ${branch} && ${manualCreateHint(cfg.project.gitHost, branch, issue.base)}\n` +
-          `    ${String(error)}`,
-      );
     }
+  } catch (error) {
+    // The boundary itself (issue #31). Only a host read whose retries are spent
+    // is absorbed here; a definitive failure or a non-host throw rethrows and
+    // ends the run exactly as before — the discrimination lives in
+    // iteration.ts, not in this catch. Nothing already on disk is discarded by
+    // taking this path: worktrees/branches the Engine preserved stay put, and a
+    // pushed branch without its MR keeps its #26 ledger trace.
+    if (!isLostIterationError(error)) throw error;
+    // Narrowed by the guard above: only a spent-transient host read reaches here.
+    const hostError = error as HostReadError;
+    lostIterations = recordLostIteration(lostIterations, iteration, hostError);
+    console.error(describeLostIteration(lostIterations[lostIterations.length - 1]!, cfg.run.maxIterations));
+    continue;
   }
+}
+
+// The run's tally, said out loud when anything was lost (issue #31, criterion
+// 2): the count is the difference between a degraded run and a silent one.
+if (lostIterations.length > 0) {
+  console.log(`\n${describeIterationLosses(lostIterations, ranIterations)}`);
+}
+
+// Criterion 4: a run whose every iteration was lost is not a success. Exit
+// non-zero so the operator's automation sees the difference — the log above
+// already said it in words.
+if (isRunLost(lostIterations, ranIterations)) {
+  console.error(
+    `\nEvery iteration of this run (${ranIterations}) was lost to host failures — nothing was published.`,
+  );
+  process.exit(1);
 }
 
 console.log('\nAll done.');

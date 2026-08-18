@@ -761,6 +761,47 @@ const defaultHostReadEffects: HostReadEffects = {
   random: () => Math.random(),
 };
 
+// ---------------------------------------------------------------------------
+// HostReadError — the classification carried OUT of the retry (issue #31)
+//
+// Pre-#31, a spent runHostRead rethrew the raw execFileSync error and nothing
+// upstream could tell a definitive failure from a transient one without
+// re-running classifyHostFailure on (status, stderr) — fields the throw happens
+// to carry today and might not tomorrow. That distinction is exactly what the
+// per-iteration boundary in main.ts needs: a transient failure that survived
+// every retry costs its ITERATION (the next one re-lists the queue on a host
+// that may have healed), while a definitive one stops the RUN — retrying ten
+// iterations on an invalid token is ten losses, not ten chances (issue #31,
+// criterion 3).
+//
+// A subclass rather than a wrapper: `instanceof` stays the discriminator, and
+// the original error rides along as `cause` for anyone who needs the stack.
+// ---------------------------------------------------------------------------
+
+/** What a spent runHostRead throws: the failure's classification, preserved. */
+export class HostReadError extends Error {
+  /** The verb that failed (`gh issue list --label …`) — names the read in logs. */
+  readonly verb: string;
+  /** The #25 classification of the LAST attempt — retryable here means "was", not "is". */
+  readonly failure: HostFailure;
+  constructor(verb: string, failure: HostFailure, cause: unknown) {
+    // One line, like the retry log: the boundary prints this verbatim, and a
+    // multi-line stderr there would bury the iteration banner under it.
+    const detail = firstErrorLine(cause);
+    super(`\`${verb}\` failed (${failure.reason}): ${detail}`, { cause });
+    this.name = 'HostReadError';
+    this.verb = verb;
+    this.failure = failure;
+  }
+}
+
+/** The first line of an error's stderr-or-message, capped — a log cause, not a dump. */
+function firstErrorLine(error: unknown): string {
+  const err = error as Error & { stderr?: string };
+  const text = typeof err.stderr === 'string' && err.stderr !== '' ? err.stderr : err.message ?? '';
+  return text.split('\n')[0]?.trim() || 'no stderr captured';
+}
+
 /**
  * Run one host READ (labels / MR list / queue list) with bounded retries: a
  * retryable failure waits the exponential backoff plus jitter and tries again (N
@@ -769,6 +810,10 @@ const defaultHostReadEffects: HostReadEffects = {
  * is readable after the fact. The read itself is injected — createHost() passes
  * an execFileSync call, tests pass a recorder — so the loop is deterministic
  * under test and the only time-based part (the sleep) is an effect.
+ *
+ * A failure that leaves this loop — spent retries or definitive — is rethrown as
+ * a {@link HostReadError}, so the caller reads the #25 classification instead of
+ * re-deriving it from the raw throw.
  */
 export function runHostRead(
   verb: string,
@@ -783,7 +828,7 @@ export function runHostRead(
       const stderr = typeof err.stderr === 'string' ? err.stderr : err.message ?? '';
       const failure = classifyHostFailure(typeof err.status === 'number' ? err.status : null, stderr);
       if (!failure.retryable || attempt === HOST_READ_ATTEMPTS) {
-        throw error;
+        throw new HostReadError(verb, failure, error);
       }
       const { delayMs, jitterMs } = hostRetryPlanFor(attempt - 1, effects.random);
       const pauseMs = delayMs + jitterMs;
