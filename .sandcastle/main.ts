@@ -37,7 +37,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import * as sandcastle from '@ai-hero/sandcastle';
 import { docker } from '@ai-hero/sandcastle/sandboxes/docker';
-import { resolveChainedBase, decideBaseSync } from './chain.ts';
+import { resolveChainedBase, decideBaseSync, type OpenMergeRequest } from './chain.ts';
 import {
   createHost,
   HOST_TERMS,
@@ -788,6 +788,18 @@ const PENDING_PATH = path.join(process.cwd(), '.sandcastle', 'publish-pending.js
 // writes, and each write persists it whole.
 let pending: PendingPublish[] = readPendingPublishes(PENDING_PATH);
 
+// Persist the in-memory ledger. writePendingPublishes never throws (it returns the
+// failure): an unwritable `.sandcastle/` must not abort the drain — nor the publish
+// loop, which still has other branches to report — so a failed write is a warning.
+// The caller's own message always carries the manual-create hint, which is what the
+// operator needs when the trace could not be recorded.
+const persistPending = (): void => {
+  const error = writePendingPublishes(PENDING_PATH, pending);
+  if (error !== null) {
+    console.error(`  ⚠ could not write ${PENDING_PATH} — the trace is in memory only: ${error}`);
+  }
+};
+
 // The branches origin currently holds, for the drain's `gone` ruling. Null (not
 // []) means the listing itself failed — `gone` is then undecidable and the drain
 // falls back to `create` (see decideResume). Read once per drain, shared by every
@@ -811,11 +823,10 @@ const remoteBranches = (): string[] | null => {
 // Per trace, decideResume rules and this renders it:
 //   resolved → the MR exists (operator opened it by hand, or a race): erase only;
 //   gone     → origin lost the branch (merged+deleted, dropped): erase and say why;
-//   create   → re-push the branch (`git push` is a no-op when origin is already
-//              up to date, and heals a pruned remote ref), then open the MR from
-//              the RECORDED title/description — the exact MR the failed run
-//              would have opened, rebuilt without re-running any agent — and
-//              erase on success.
+//   create   → open the MR from the RECORDED title/description — the exact MR the
+//              failed run would have opened, rebuilt without re-running any agent —
+//              and erase on success. No push: the branch is already on origin (that
+//              is what distinguishes `create` from `gone`).
 //
 // A create that fails again RE-RECORDS the trace with the new reason (a fresh
 // 503), so the ledger keeps holding the ticket out of the queue until it lands.
@@ -826,7 +837,7 @@ const drainPendingPublishes = (): void => {
   if (pending.length === 0) return;
   console.log(`\n▸ ${pending.length} pending publish trace(s) from a previous run — resuming:`);
 
-  let openMrs;
+  let openMrs: OpenMergeRequest[];
   try {
     openMrs = host.openChangeRequests();
   } catch (error) {
@@ -842,7 +853,7 @@ const drainPendingPublishes = (): void => {
     const without = (): PendingPublish[] => pending.filter((entry) => entry.branch !== trace.branch);
     const erase = (): void => {
       pending = without();
-      writePendingPublishes(PENDING_PATH, pending);
+      persistPending();
     };
     const decision = decideResume(trace, openMrs, branches);
 
@@ -866,16 +877,12 @@ const drainPendingPublishes = (): void => {
       `  → #${trace.issue}: opening the missing ${hostTerms.cr} for \`${trace.branch}\` → ${trace.base}`,
     );
     try {
-      // Re-push only when the listing says origin lacks the branch (the remote ref
-      // was pruned, or the trace's push half never landed). In the common case —
-      // push succeeded, create 503'd — origin already has it, and pushing from a
-      // machine whose LOCAL ref has since been pruned would fail and block the
-      // resume for nothing. `null` (listing failed) skips the push for the same
-      // reason: the create names the branch, and the host is the authority on
-      // whether it exists.
-      if (branches !== null && !branches.includes(trace.branch)) {
-        execFileSync('git', ['push', 'origin', trace.branch], { stdio: 'inherit' });
-      }
+      // No re-push here, by construction: `create` is only reached when origin still
+      // holds the branch (or when the listing failed and the host is the authority on
+      // whether it does). A trace is recorded only AFTER a successful push, so a
+      // branch origin has genuinely lost is `gone`, not something to re-push — and
+      // pushing from a machine whose LOCAL ref has since been pruned would fail and
+      // block the resume for nothing.
       host.createDraftChangeRequest({
         sourceBranch: trace.branch,
         targetBranch: trace.base,
@@ -887,7 +894,7 @@ const drainPendingPublishes = (): void => {
       console.log(`  ✓ #${trace.issue}: ${hostTerms.cr} opened — trace cleared.`);
     } catch (error) {
       pending = recordPendingPublish(without(), { ...trace, reason: String(error) });
-      writePendingPublishes(PENDING_PATH, pending);
+      persistPending();
       console.error(
         `  ✗ #${trace.issue}: could not open the ${hostTerms.cr} — trace KEPT, retried next run.\n` +
           `    ${manualCreateHint(cfg.project.gitHost, trace.branch, trace.base)}\n` +
@@ -1417,15 +1424,18 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         // trace carries the built title/description and the resume opens the
         // exact MR this run meant to. When it was earlier (an MR-body builder),
         // the trace falls back to a title rebuilt from the first commit and a
-        // body that says so — degraded, but never silently empty.
-        const { summary } = extractMrSummary(implStdout);
-        const fallbackTitle = buildMrTitle({
-          style: titleStyle,
-          issue: { number: issue.number, title: issue.title },
-          summary,
-          commits: commitsOn(issue.base, branch),
-        });
-        const fallbackDesc =
+        // body that says so — degraded, but never silently empty. Both fallbacks
+        // are LAZY: in the ordinary case (the create 503'd) mrTitle/mrDesc are
+        // set, and eagerly rebuilding a title would re-run `git log` — and print
+        // its own warning — for a value about to be discarded.
+        const fallbackTitle = (): string =>
+          buildMrTitle({
+            style: titleStyle,
+            issue: { number: issue.number, title: issue.title },
+            summary: extractMrSummary(implStdout).summary,
+            commits: commitsOn(issue.base, branch),
+          });
+        const fallbackDesc = (): string =>
           `Resumed publish for #${issue.number} (${issue.title}): the branch was pushed by ` +
           `round ${iteration} but its ${hostTerms.cr} could not be opened. The original MR ` +
           `description was not recorded — this MR was opened by the publish-ledger resume.`;
@@ -1433,13 +1443,13 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           issue: issue.number,
           branch,
           base: issue.base,
-          title: mrTitle ?? fallbackTitle,
-          description: mrDesc ?? fallbackDesc,
+          title: mrTitle ?? fallbackTitle(),
+          description: mrDesc ?? fallbackDesc(),
           reason: String(error),
           round: iteration,
         };
         pending = recordPendingPublish(pending, trace);
-        writePendingPublishes(PENDING_PATH, pending);
+        persistPending();
         console.error(
           `  ✗ #${issue.number}: ${hostTerms.cr} creation failed for pushed \`${branch}\` — ` +
             `trace recorded, the NEXT run will open it (issue #26). Or by hand:\n` +

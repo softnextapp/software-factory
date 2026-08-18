@@ -190,7 +190,23 @@ export function readPendingPublishes(path: string): PendingPublish[] {
   }
 }
 
-/** Persist the ledger. An empty ledger still writes `[]` — the erase is durable too. */
-export function writePendingPublishes(path: string, pending: readonly PendingPublish[]): void {
-  writeFileSync(path, serializePendingPublishes(pending));
+/**
+ * Persist the ledger. An empty ledger still writes `[]` — the erase is durable too.
+ *
+ * Returns the failure as a STRING instead of throwing (null on success): the ledger
+ * is a safety net, and a net that can abort the run it protects is worse than no
+ * net. An unwritable `.sandcastle/` (read-only mount, full disk) must degrade to a
+ * logged warning — the caller still prints the manual-create hint — not kill the
+ * drain before Phase 1 nor the publish loop mid-way through `completed`.
+ */
+export function writePendingPublishes(
+  path: string,
+  pending: readonly PendingPublish[],
+): string | null {
+  try {
+    writeFileSync(path, serializePendingPublishes(pending));
+    return null;
+  } catch (error) {
+    return String(error);
+  }
 }
