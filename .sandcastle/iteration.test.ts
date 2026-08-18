@@ -19,7 +19,6 @@ import {
   HostReadError,
   runHostRead,
   classifyHostFailure,
-  type HostFailure,
 } from './host.ts';
 import {
   isLostIterationError,
@@ -49,10 +48,12 @@ const GH_503 = 'HTTP 503: Service Unavailable (https://api.github.com/graphql)\n
 const GH_401 = 'HTTP 401: Bad credentials (https://api.github.com/graphql)\nTry authenticating with:  gh auth login -h github.com\n';
 
 /**
- * A host read whose CLI fails with `stderr` on EVERY attempt, driven through
- * runHostRead. Whether that burns all HOST_READ_ATTEMPTS (a retryable wording)
- * or stops at the first (a definitive one) is #25's decision — this helper only
- * guarantees the outcome is the HostReadError the boundary will actually see.
+ * A host read whose CLI fails with `stderr` on EVERY attempt, driven through the
+ * real runHostRead. ONE helper for both halves of the boundary on purpose:
+ * whether the failure burns all HOST_READ_ATTEMPTS (a retryable wording) or stops
+ * at the first (a definitive one) is #25's decision, not the fixture's — naming
+ * the two cases apart here would assert a distinction the helper does not make.
+ * What it guarantees is the outcome: the HostReadError the boundary will see.
  */
 const failingRead = (verb: string, stderr: string): HostReadError => {
   const read = (): string => {
@@ -66,15 +67,29 @@ const failingRead = (verb: string, stderr: string): HostReadError => {
   throw new Error('the read was expected to throw');
 };
 
-/** A retryable wording that outlived every retry — the "spent" half of the boundary. */
-const spentRead = failingRead;
-/** A definitive wording, refused on the first attempt — the "stops the run" half. */
-const refusedRead = failingRead;
+/**
+ * A host read whose CLI throw is not an Error at all — `throw null`, a thrown
+ * string. Nothing in the Engine promises the injected read throws an
+ * execFileSync-shaped object, and a TypeError raised while classifying one would
+ * leave the retry as a NON-host throw: the boundary would stop the run on what
+ * is, as far as anyone can tell, an outage.
+ */
+const readThrowing = (thrown: unknown): HostReadError => {
+  try {
+    runHostRead('gh issue list', () => {
+      throw thrown;
+    }, { sleep: () => {}, log: () => {}, random: () => 0 });
+  } catch (error) {
+    return error as HostReadError;
+  }
+  throw new Error('the read was expected to throw');
+};
+
 
 // --- HostReadError: the classification carried out (the seam #31 needs) ------
 
 test('a spent host read throws a HostReadError carrying verb + classification + cause', () => {
-  const error = spentRead('gh issue list --label sandcastle', GH_503);
+  const error = failingRead('gh issue list --label sandcastle', GH_503);
   assert.ok(error instanceof HostReadError);
   assert.equal(error.verb, 'gh issue list --label sandcastle');
   // Retryable HERE means "was retryable" — the retries are spent by construction.
@@ -89,14 +104,14 @@ test('a spent host read throws a HostReadError carrying verb + classification + 
 });
 
 test('a definitive host read also surfaces as HostReadError, with retryable=false', () => {
-  const error = refusedRead('gh issue list --label sandcastle', GH_401);
+  const error = failingRead('gh issue list --label sandcastle', GH_401);
   assert.ok(error instanceof HostReadError);
   assert.equal(error.failure.retryable, false);
   assert.equal(error.failure.reason, 'auth');
 });
 
 test('HostReadError is an Error — it reads like one in a stack and a log', () => {
-  const error = spentRead('gh issue list', GH_503);
+  const error = failingRead('gh issue list', GH_503);
   assert.ok(error instanceof Error);
   assert.equal(error.name, 'HostReadError');
 });
@@ -104,31 +119,31 @@ test('HostReadError is an Error — it reads like one in a stack and a log', () 
 // --- isLostIterationError: the discrimination (criteria 1 and 3) -------------
 
 test('a spent TRANSIENT host read loses its ITERATION, not the run (criterion 1)', () => {
-  assert.equal(isLostIterationError(spentRead('gh issue list', GH_503)), true);
+  assert.equal(isLostIterationError(failingRead('gh issue list', GH_503)), true);
   // The other transient causes classify the same way.
   const GLAB_503 = 'ERROR: GET http://127.0.0.1:8453/api/v4/projects/o%2Fr/issues: 503 {message: 503 stubbed}\n';
-  assert.equal(isLostIterationError(spentRead('glab issue list', GLAB_503)), true);
+  assert.equal(isLostIterationError(failingRead('glab issue list', GLAB_503)), true);
   const GH_CONN = 'error connecting to github.invalid\ncheck your internet connection or https://githubstatus.com\n';
-  assert.equal(isLostIterationError(spentRead('gh pr list', GH_CONN)), true);
+  assert.equal(isLostIterationError(failingRead('gh pr list', GH_CONN)), true);
 });
 
 test('an UNRECOGNISED wording that survived its retries is a lost iteration, not a dead run', () => {
   // #25 fails open to retryable precisely so this lands here: an unknown
   // transient costs one iteration, and still surfaces in the tally.
-  const error = spentRead('gh issue list', 'some never-seen-before CLI error');
+  const error = failingRead('gh issue list', 'some never-seen-before CLI error');
   assert.equal(error.failure.reason, 'unknown');
   assert.equal(isLostIterationError(error), true);
 });
 
 test('a DEFINITIVE host read stops the run — auth (criterion 3)', () => {
-  assert.equal(isLostIterationError(refusedRead('gh issue list', GH_401)), false);
+  assert.equal(isLostIterationError(failingRead('gh issue list', GH_401)), false);
 });
 
 test('every definitive cause stops the run: quota-exhausted, not-found, client-error', () => {
   // Built directly rather than through runHostRead: the classifier is the
   // decision's only input, so each definitive reason is pinned at the seam.
   const asHostError = (status: number | null, stderr: string): HostReadError =>
-    new HostReadError('gh issue list', classifyHostFailure(status, stderr) as HostFailure, cliError(stderr));
+    new HostReadError('gh issue list', classifyHostFailure(status, stderr), cliError(stderr));
   const cases: [string, string][] = [
     ['quota-exhausted', 'HTTP 403: API rate limit exceeded for user ID 1234.\n'],
     ['not-found', 'GraphQL: Could not resolve to an issue or pull request with the number of 999999999.\n'],
@@ -152,9 +167,9 @@ test('a NON-host error stops the run — a config error or a bug must not read a
 // --- recordLostIteration: the count (criterion 2) ----------------------------
 
 test('recordLostIteration: appends one entry carrying the iteration number and the reason', () => {
-  const second = spentRead('gh issue list', GH_503);
+  const second = failingRead('gh issue list', GH_503);
   const tally = recordLostIteration(
-    recordLostIteration([], 2, spentRead('gh issue list', GH_503)),
+    recordLostIteration([], 2, failingRead('gh issue list', GH_503)),
     3,
     second,
   );
@@ -171,24 +186,24 @@ test('recordLostIteration: appends one entry carrying the iteration number and t
 });
 
 test('recordLostIteration: never mutates the tally it was given', () => {
-  const input = recordLostIteration([], 2, spentRead('gh issue list', GH_503));
+  const input = recordLostIteration([], 2, failingRead('gh issue list', GH_503));
   const copy = [...input];
-  recordLostIteration(input, 4, spentRead('gh pr list', GH_503));
+  recordLostIteration(input, 4, failingRead('gh pr list', GH_503));
   assert.deepEqual(input, copy);
 });
 
 // --- isRunLost: criterion 4 ---------------------------------------------------
 
 test('a run that lost EVERY iteration it ran is a lost run (criterion 4)', () => {
-  let tally = recordLostIteration([], 1, spentRead('gh issue list', GH_503));
-  tally = recordLostIteration(tally, 2, spentRead('gh issue list', GH_503));
-  tally = recordLostIteration(tally, 3, spentRead('gh issue list', GH_503));
+  let tally = recordLostIteration([], 1, failingRead('gh issue list', GH_503));
+  tally = recordLostIteration(tally, 2, failingRead('gh issue list', GH_503));
+  tally = recordLostIteration(tally, 3, failingRead('gh issue list', GH_503));
   assert.equal(tally.length, 3);
   assert.equal(isRunLost(tally, 3), true);
 });
 
 test('a run where SOME iterations delivered is NOT a lost run — it exits 0 with the tally', () => {
-  const tally = recordLostIteration([], 2, spentRead('gh issue list', GH_503));
+  const tally = recordLostIteration([], 2, failingRead('gh issue list', GH_503));
   assert.equal(isRunLost(tally, 10), false);
 });
 
@@ -202,7 +217,7 @@ test('a run that ran NOTHING is not "all lost" — no new failure mode smuggled 
 // --- the log lines: the "se dit" (criterion 2) -------------------------------
 
 test('describeLostIteration: names the iteration, the cause, and says the run continues', () => {
-  const line = describeLostIteration(recordLostIteration([], 2, spentRead('gh issue list --label sandcastle', GH_503))[0]!, 10);
+  const line = describeLostIteration(recordLostIteration([], 2, failingRead('gh issue list --label sandcastle', GH_503))[0]!, 10);
   assert.ok(line.includes('2/10'), `names the iteration: ${line}`);
   assert.ok(line.includes('outage'), `names the reason: ${line}`);
   assert.ok(line.includes('503') || line.includes('Service Unavailable'), `carries the cause: ${line}`);
@@ -211,23 +226,61 @@ test('describeLostIteration: names the iteration, the cause, and says the run co
 
 test('describeLostIteration: keeps a MULTI-LINE stderr to one line — the banner must not drown', () => {
   const multiline = 'HTTP 503: Service Unavailable\nsecond line of the CLI banner\nthird line\n';
-  const entry = recordLostIteration([], 2, spentRead('gh issue list', multiline))[0]!;
+  const entry = recordLostIteration([], 2, failingRead('gh issue list', multiline))[0]!;
   const line = describeLostIteration(entry, 10);
   assert.equal(line.split('\n').length, 1, `one line: ${line}`);
 });
 
 test('describeIterationLosses: says the count out loud, with the lost iterations named', () => {
-  let tally = recordLostIteration([], 2, spentRead('gh issue list', GH_503));
-  tally = recordLostIteration(tally, 3, spentRead('gh issue list', GH_503));
-  tally = recordLostIteration(tally, 4, spentRead('gh issue list', GH_503));
+  let tally = recordLostIteration([], 2, failingRead('gh issue list', GH_503));
+  tally = recordLostIteration(tally, 3, failingRead('gh issue list', GH_503));
+  tally = recordLostIteration(tally, 4, failingRead('gh issue list', GH_503));
   const line = describeIterationLosses(tally, 10);
   assert.ok(line.includes('3 of 10'), `says the count: ${line}`);
   assert.ok(line.includes('#2, #3, #4'), `names them: ${line}`);
 });
 
 test('describeIterationLosses: a single lost iteration reads in the singular', () => {
-  const line = describeIterationLosses([recordLostIteration([], 2, spentRead('gh issue list', GH_503))[0]!], 10);
-  assert.ok(line.includes('1 of 10'), line);
+  const line = describeIterationLosses(recordLostIteration([], 2, failingRead('gh issue list', GH_503)), 10);
+  assert.ok(line.includes('1 of 10 iteration lost'), line);
+  assert.ok(line.includes('(iteration #2)'), line);
+  // Only the count clause is checked for the plural: the durability sentence that
+  // follows speaks of "earlier iterations", legitimately plural.
+  const head = line.split('.')[0] ?? '';
+  assert.ok(!head.includes('iterations'), `no plural in the count clause: ${head}`);
+  assert.ok(line.includes('It ended before'), `singular verb: ${line}`);
+});
+
+test('describeIterationLosses: the durability note is said ONCE here, not under every loss', () => {
+  // Moved out of describeLostIteration deliberately: repeated ten times it buries
+  // the cause criterion 2 asks for, and it describes branches a lost iteration
+  // never pushed. Here it is end-of-run context, said once (criterion 5).
+  const tally = recordLostIteration([], 2, failingRead('gh issue list', GH_503));
+  assert.ok(describeIterationLosses(tally, 10).includes('#26'), 'the summary carries the resume note');
+  assert.ok(
+    !describeLostIteration(tally[0]!, 10).includes('#26'),
+    'the per-iteration line does not repeat it',
+  );
+});
+
+// --- a throw that is not an Error at all (stress) -----------------------------
+
+test('a read that throws NULL still loses its iteration — never a TypeError that kills the run', () => {
+  for (const thrown of [null, undefined, 'a thrown string', 42]) {
+    const error = readThrowing(thrown);
+    assert.ok(error instanceof HostReadError, `HostReadError for ${String(thrown)}`);
+    // No status, no stderr — #25 calls that an outage, so the boundary absorbs it.
+    assert.equal(error.failure.reason, 'outage', String(thrown));
+    assert.equal(isLostIterationError(error), true, String(thrown));
+    assert.equal(error.message.split('\n').length, 1, error.message);
+  }
+});
+
+test('an object throw with a non-string stderr degrades instead of throwing', () => {
+  const error = readThrowing({ status: 'not a number', stderr: { nope: true } });
+  assert.ok(error instanceof HostReadError);
+  assert.equal(error.failure.reason, 'outage');
+  assert.ok(error.message.includes('no stderr captured'), error.message);
 });
 
 finish();

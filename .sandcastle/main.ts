@@ -48,7 +48,6 @@ import {
 import {
   createHost,
   HOST_TERMS,
-  HostReadError,
   openMrsCommand,
   promptHostArgs,
   inferGitHostFromUrl,
@@ -1826,11 +1825,11 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     // iteration.ts, not in this catch. Nothing already on disk is discarded by
     // taking this path: worktrees/branches the Engine preserved stay put, and a
     // pushed branch without its MR keeps its #26 ledger trace.
+    // The guard is a type predicate, so `error` is a HostReadError past this
+    // line — no cast at the one site the boundary must not get wrong.
     if (!isLostIterationError(error)) throw error;
-    // Narrowed by the guard above: only a spent-transient host read reaches here.
-    const hostError = error as HostReadError;
-    lostIterations = recordLostIteration(lostIterations, iteration, hostError);
-    console.error(describeLostIteration(lostIterations[lostIterations.length - 1]!, cfg.run.maxIterations));
+    lostIterations = recordLostIteration(lostIterations, iteration, error);
+    console.error(describeLostIteration(lostIterations.at(-1)!, cfg.run.maxIterations));
     continue;
   }
 }
@@ -1845,8 +1844,12 @@ if (lostIterations.length > 0) {
 // non-zero so the operator's automation sees the difference — the log above
 // already said it in words.
 if (isRunLost(lostIterations, ranIterations)) {
+  // "no iteration published", not "nothing was published": drainPendingPublishes()
+  // runs BEFORE this loop and may well have opened a previous run's missing MR
+  // (issue #26). Claiming otherwise would send the operator looking for a
+  // publish that did happen.
   console.error(
-    `\nEvery iteration of this run (${ranIterations}) was lost to host failures — nothing was published.`,
+    `\nEvery iteration of this run (${ranIterations}) was lost to host failures — no iteration published.`,
   );
   process.exit(1);
 }

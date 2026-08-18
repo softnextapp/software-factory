@@ -795,11 +795,37 @@ export class HostReadError extends Error {
   }
 }
 
-/** The first line of an error's stderr-or-message, capped — a log cause, not a dump. */
+/**
+ * The first line of an error's stderr-or-message — a log cause, not a dump.
+ *
+ * Reads through `errorFields`, so a `throw null` cannot turn a host failure into
+ * a TypeError: that would escape the boundary as a non-host throw and kill the
+ * run, the exact inversion issue #31 exists to prevent.
+ */
 function firstErrorLine(error: unknown): string {
-  const err = error as Error & { stderr?: string };
-  const text = typeof err.stderr === 'string' && err.stderr !== '' ? err.stderr : err.message ?? '';
+  const { stderr, message } = errorFields(error);
+  const text = stderr !== '' ? stderr : message;
   return text.split('\n')[0]?.trim() || 'no stderr captured';
+}
+
+/**
+ * The three fields an execFileSync throw carries, read defensively: `error` is
+ * whatever the injected read threw, which is not guaranteed to be an object at
+ * all. A non-object throw reads as "no status, no stderr" — which
+ * classifyHostFailure calls an outage, i.e. retryable, the same verdict it gives
+ * a CLI killed before it could write a word.
+ */
+function errorFields(error: unknown): { status: number | null; stderr: string; message: string } {
+  const err = (typeof error === 'object' && error !== null ? error : {}) as {
+    status?: unknown;
+    stderr?: unknown;
+    message?: unknown;
+  };
+  return {
+    status: typeof err.status === 'number' ? err.status : null,
+    stderr: typeof err.stderr === 'string' ? err.stderr : '',
+    message: typeof err.message === 'string' ? err.message : '',
+  };
 }
 
 /**
@@ -824,9 +850,9 @@ export function runHostRead(
     try {
       return read();
     } catch (error) {
-      const err = error as Error & { status?: number | null; stderr?: string };
-      const stderr = typeof err.stderr === 'string' ? err.stderr : err.message ?? '';
-      const failure = classifyHostFailure(typeof err.status === 'number' ? err.status : null, stderr);
+      const fields = errorFields(error);
+      const stderr = fields.stderr !== '' ? fields.stderr : fields.message;
+      const failure = classifyHostFailure(fields.status, stderr);
       if (!failure.retryable || attempt === HOST_READ_ATTEMPTS) {
         throw new HostReadError(verb, failure, error);
       }

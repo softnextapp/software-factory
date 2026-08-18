@@ -823,6 +823,36 @@ test('HostReadError: message names the verb and the reason — readable in a bar
   assert.equal(error.name, 'HostReadError');
 });
 
+test('HostReadError: a cause that is not an Error degrades to a legible line, never a TypeError', () => {
+  // The retry reads (status, stderr, message) off whatever the injected read threw,
+  // and nothing promises that is an object. A TypeError raised while classifying
+  // would leave the retry as a NON-host throw, which the #31 boundary stops the run
+  // on — an outage mistaken for a bug.
+  for (const cause of [null, undefined, 'a thrown string', 7, { stderr: 42 }]) {
+    const error = new HostReadError('gh issue list', { retryable: true, reason: 'outage' }, cause);
+    assert.ok(error.message.includes('no stderr captured'), `${String(cause)}: ${error.message}`);
+    assert.equal(error.message.split('\n').length, 1, error.message);
+  }
+});
+
+test('runHostRead: a read that throws a NON-Error still surfaces as a retryable HostReadError', () => {
+  // No status and no stderr is what classifyHostFailure calls an outage, so the
+  // read burns all its attempts and hands the boundary something it can absorb.
+  const slept: number[] = [];
+  let thrown: unknown;
+  try {
+    runHostRead('issue view 42', () => {
+      throw null;
+    }, { sleep: (ms) => slept.push(ms), log: () => {}, random: () => 0 });
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof HostReadError, `HostReadError, got ${String(thrown)}`);
+  assert.equal(thrown.failure.retryable, true);
+  assert.equal(thrown.failure.reason, 'outage');
+  assert.equal(slept.length, HOST_READ_ATTEMPTS - 1, 'every attempt was spent');
+});
+
 // --- the classifier's remaining corners ------------------------------------
 
 test('classifyHostFailure: GitHub spends its quota as a 403, not a 429 — definitive, but NOT labelled auth', () => {

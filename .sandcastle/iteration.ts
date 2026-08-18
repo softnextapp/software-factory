@@ -36,16 +36,16 @@
 // function here is pure — no CLI, no fs, no process. main.ts owns the try/catch
 // and the log/exit effects; this module only decides. Tests: iteration.test.ts.
 
-import { HostReadError } from './host.ts';
+import { HostReadError, type HostFailureReason } from './host.ts';
 
 /** Why one iteration ended without reaching its publish phase. */
 export interface LostIteration {
   /** The iteration's 1-based number in the run. */
   readonly iteration: number;
-  /** Short stable cause of the underlying failure (HostFailureReason for host reads). */
-  readonly reason: string;
+  /** Short stable cause of the underlying failure — host.ts's closed union, not free text. */
+  readonly reason: HostFailureReason;
   /** The thrown error, kept for the operator-facing log line. */
-  readonly error: Error;
+  readonly error: HostReadError;
 }
 
 /**
@@ -63,8 +63,12 @@ export interface LostIteration {
  *   - a non-host error — a config mistake, a bug, a git failure. Losing an
  *     iteration over those would replace a loud loss with a quiet one, which is
  *     the exact regression the issue warns about.
+ *
+ * A type predicate, not a bare boolean: the caller that acts on `true` needs the
+ * classification off the error, and an `as HostReadError` at the one site the
+ * boundary must not get wrong is a cast the typechecker can hold instead.
  */
-export function isLostIterationError(error: unknown): boolean {
+export function isLostIterationError(error: unknown): error is HostReadError {
   return error instanceof HostReadError && error.failure.retryable;
 }
 
@@ -97,26 +101,39 @@ export function isRunLost(tally: readonly LostIteration[], ran: number): boolean
 
 /**
  * The per-iteration log line — the "se dit" of a lost iteration (criterion 2).
- * One line: the banner above it says where in the run we are; this says what
- * was lost and why, with the error's own first words as the cause.
+ * One line, and only the facts of THIS loss: which iteration, why, and that the
+ * loop goes on. The durability reassurance lives in the end-of-run summary
+ * instead ({@link describeIterationLosses}) — printed once there rather than
+ * repeated under every loss, where it would bury the cause the criterion asks
+ * for under boilerplate about branches this iteration never pushed.
+ *
+ * The cause is the error's first line. HostReadError already builds a one-line
+ * message; the split is the belt that keeps this a single log line whatever the
+ * verb or stderr turns out to contain.
  */
 export function describeLostIteration(lost: LostIteration, maxIterations: number): string {
   const cause = lost.error.message.split('\n')[0]?.trim() || 'no message';
   return (
     `  ✗ iteration ${lost.iteration}/${maxIterations} lost (host ${lost.reason}): ${cause} — ` +
-    `the run continues; already-pushed branches keep their MRs, a pushed branch without ` +
-    `one is resumed by the next run (issue #26).`
+    `the run continues with the next iteration.`
   );
 }
 
 /**
  * The end-of-run summary line when at least one iteration was lost. Says the
- * count out loud so a run that failed 9 times out of 10 cannot read as calm.
+ * count out loud so a run that failed 9 times out of 10 cannot read as calm, and
+ * carries the durability note once: a lost iteration throws on a host READ, all
+ * of which precede the round's first push, so it published nothing and discarded
+ * nothing (criterion 5).
  */
 export function describeIterationLosses(tally: readonly LostIteration[], ran: number): string {
   const which = tally.map((lost) => `#${lost.iteration}`).join(', ');
+  const one = tally.length === 1;
+  const noun = one ? 'iteration' : 'iterations';
   return (
-    `${tally.length} of ${ran} iteration(s) lost to host failures (iteration(s) ${which}). ` +
-    `Lost iterations produced no MR this round; their work, if any, is in the listed branches.`
+    `${tally.length} of ${ran} ${noun} lost to host failures (${noun} ${which}). ` +
+    `${one ? 'It ended' : 'Each ended'} before reaching the publish phase. Earlier iterations ` +
+    `are untouched: pushed branches keep their commits, and a branch pushed without its MR is ` +
+    `resumed by the next run (issue #26).`
   );
 }
