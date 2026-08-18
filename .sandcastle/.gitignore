@@ -11,6 +11,9 @@
 logs/
 worktrees/
 node_modules/
+# Push-but-no-MR resume state (issue #26): a run materializes it when a branch
+# was pushed but its MR never opened; the next round reads it back to resume.
+publish-pending.json
 .pnpm-store/
 # One line per package manager adopt.ts can detect (its LOCKFILES table): the
 # out-of-tree Engine install runs with cwd:.sandcastle/, so whichever manager the
