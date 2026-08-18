@@ -1,11 +1,12 @@
 // Tests for the host abstraction — the module that owns every host-CLI difference
 // (glab vs gh) so main.ts, chain.ts and the role prompts stay host-neutral.
 //
-// Covers the PURE pieces only: argv builders, JSON parsers, prompt-command
-// builders and origin-host inference. The executing wrappers in createHost() are
-// thin shells over execFileSync and are exercised through those builders — they
-// are not unit-tested directly (no live glab/gh). Pure: no network, no CLI, no
-// process.env.
+// Covers the PURE pieces: argv builders, JSON parsers, prompt-command builders
+// and origin-host inference — plus, since issue #25, createHost()'s READ verbs,
+// which take their CLI runner and clock as injectable deps so the retry wiring is
+// a contract test rather than a claim. The WRITE verb (createDraftChangeRequest)
+// stays a thin execFileSync/spawnSync shell and is exercised through its builders
+// only. Pure throughout: no network, no live glab/gh, no process.env.
 // Run: npx tsx .sandcastle/host.test.ts
 import assert from 'node:assert/strict';
 import {
@@ -42,7 +43,6 @@ import {
   HOST_READ_ATTEMPTS,
   HOST_RETRY_BASE_DELAY_MS,
   HOST_RETRY_JITTER_MS,
-  type HostReadAttempt,
 } from './host.ts';
 import { test, throws, finish } from './test-harness.ts';
 
@@ -682,8 +682,14 @@ test('hostRetryPlanFor: named constants are sane (bounded attempts, sub-second b
 // A recording stand-in for the real executor + clock. The runner under test takes
 // them as parameters, so the retry loop is driven deterministically here and only
 // becomes time-based inside createHost().
+/** One executed attempt, as the recorder saw it. Test-only — host.ts has no such notion. */
+interface SeenAttempt {
+  readonly attempt: number;
+  readonly status: number | null;
+  readonly stderr: string;
+}
 interface RecordedRead {
-  readonly attempts: HostReadAttempt[];
+  readonly attempts: SeenAttempt[];
   readonly slept: number[];
   readonly logged: string[];
 }
@@ -691,7 +697,7 @@ const recordedRead = (behaviour: readonly { status: number | null; stderr: strin
   run: () => string;
   state: RecordedRead;
 } => {
-  const state: { attempts: HostReadAttempt[]; slept: number[]; logged: string[] } = {
+  const state: { attempts: SeenAttempt[]; slept: number[]; logged: string[] } = {
     attempts: [],
     slept: [],
     logged: [],
@@ -769,5 +775,141 @@ test('runHostRead: a first-try success never sleeps and never logs', () => {
   assert.deepEqual(state.slept, []);
   assert.deepEqual(state.logged, []);
 });
+
+// --- the classifier's remaining corners ------------------------------------
+
+test('classifyHostFailure: GitHub spends its quota as a 403, not a 429 — definitive, but NOT labelled auth', () => {
+  // gh surfaces the primary rate limit as `HTTP 403: API rate limit exceeded…`.
+  // The issue puts "quota épuisé" among the definitive failures, so it must not
+  // be retried — but calling it `auth` sends the operator hunting for a token
+  // that is perfectly valid.
+  const spent = classifyHostFailure(
+    1,
+    'HTTP 403: API rate limit exceeded for user ID 1234. (https://api.github.com/graphql)\n',
+  );
+  assert.equal(spent.retryable, false, 'an exhausted quota is not retried');
+  assert.equal(spent.reason, 'quota-exhausted');
+  // A plain 403 (missing scope) keeps the auth label.
+  assert.equal(classifyHostFailure(1, 'HTTP 403: Resource not accessible by integration\n').reason, 'auth');
+});
+
+test('classifyHostFailure: a signal-killed CLI (status null, no stderr status) is an outage, not unknown', () => {
+  // execFileSync reports `status: null` when the child died on a signal (OOM
+  // killer, severed pipe) instead of exiting. Retryable either way; the point is
+  // that the retry log names the real cause.
+  const killed = classifyHostFailure(null, 'gh: signal: killed\n');
+  assert.equal(killed.retryable, true);
+  assert.equal(killed.reason, 'outage');
+  // With an exit status present, an unrecognised wording stays `unknown`.
+  assert.equal(classifyHostFailure(1, 'gh: signal: killed\n').reason, 'unknown');
+});
+
+test('classifyHostFailure: a 4xx that is neither auth nor not-found is definitive (client-error)', () => {
+  const unprocessable = classifyHostFailure(1, 'HTTP 422: Validation Failed\n');
+  assert.equal(unprocessable.retryable, false);
+  assert.equal(unprocessable.reason, 'client-error');
+});
+
+test('classifyHostFailure: a 5xx status wins over a definitive-looking word elsewhere in the line', () => {
+  // Ordering guard: the HTTP code is read first, so a 503 body mentioning
+  // "not found" upstream does not get mis-filed as definitive.
+  const gateway = classifyHostFailure(1, 'ERROR: GET https://gitlab.com/api/v4/x: 503 {message: 503 upstream not found}\n');
+  assert.equal(gateway.retryable, true);
+  assert.equal(gateway.reason, 'outage');
+});
+
+test('hostRetryPlanFor: the exponent is capped, so no caller can ask for an unbounded pause', () => {
+  const capped = HOST_RETRY_BASE_DELAY_MS * 2 ** (HOST_READ_ATTEMPTS - 2);
+  assert.equal(hostRetryPlanFor(HOST_READ_ATTEMPTS - 2).delayMs, capped);
+  assert.equal(hostRetryPlanFor(99).delayMs, capped, 'past the bound the delay stops growing');
+  assert.equal(hostRetryPlanFor(-1).delayMs, HOST_RETRY_BASE_DELAY_MS, 'a negative attempt floors at the base');
+});
+
+// --- createHost() wiring: the acceptance criterion itself -------------------
+//
+// The tests above drive runHostRead directly, which proves the LOOP but not that
+// the three verbs the issue names are plugged into it. createHost() takes its CLI
+// runner and its clock as optional deps precisely so this stays a contract test:
+// a future edit that calls execFileSync straight from a verb fails here.
+
+const stubHost = (host: 'gh' | 'glab', script: readonly (string | { fail: string })[]) => {
+  const calls: { cli: string; argv: readonly string[] }[] = [];
+  const slept: number[] = [];
+  const logged: string[] = [];
+  let step = 0;
+  const api = createHost(host, {
+    runCli: (cli, argv) => {
+      calls.push({ cli, argv });
+      const next = script[Math.min(step, script.length - 1)]!;
+      step++;
+      if (typeof next === 'string') return next;
+      const error = new Error(`stub CLI failed:\n${next.fail}`) as Error & {
+        status?: number | null;
+        stderr?: string;
+      };
+      error.status = 1;
+      error.stderr = next.fail;
+      throw error;
+    },
+    effects: { sleep: (ms) => slept.push(ms), log: (line) => logged.push(line), random: () => 0 },
+  });
+  return { api, calls, slept, logged };
+};
+
+// Each CLI's own success shape for the labels read: gh's --jq prints one name per
+// line, glab's --jq prints a JSON array.
+const LABELS_STDOUT = { gh: 'bug\nready-for-agent\n', glab: '["bug","ready-for-agent"]' } as const;
+
+for (const host of ['gh', 'glab'] as const) {
+  test(`createHost(${host}): labelsOf retries a transient failure and returns the recovered labels`, () => {
+    const { api, calls, slept, logged } = stubHost(host, [{ fail: GLAB_503 }, LABELS_STDOUT[host]]);
+    assert.deepEqual(api.labelsOf(42), ['bug', 'ready-for-agent']);
+    assert.equal(calls.length, 2, 'the read was retried');
+    assert.deepEqual(slept, [HOST_RETRY_BASE_DELAY_MS], 'one backoff, jitter pinned to 0');
+    assert.equal(logged.length, 1);
+    assert.ok(logged[0]!.includes(host), `the log names the CLI: ${logged[0]}`);
+  });
+
+  test(`createHost(${host}): openChangeRequests retries a transient failure`, () => {
+    const { api, calls } = stubHost(host, [{ fail: GH_CONN }, '[]']);
+    assert.deepEqual(api.openChangeRequests(), []);
+    assert.equal(calls.length, 2);
+  });
+
+  test(`createHost(${host}): queueIssues retries per label, and a definitive failure stops at once`, () => {
+    const recovered = stubHost(host, [{ fail: GLAB_502 }, '[]']);
+    assert.deepEqual(recovered.api.queueIssues(['ready-for-agent']), []);
+    assert.equal(recovered.calls.length, 2, 'retried');
+
+    const definitive = stubHost(host, [{ fail: GH_401 }, '[]']);
+    assert.throws(() => definitive.api.queueIssues(['ready-for-agent']), /401/);
+    assert.equal(definitive.calls.length, 1, 'no attempt burned on a definitive failure');
+    assert.deepEqual(definitive.slept, []);
+  });
+
+  test(`createHost(${host}): a read that never recovers gives up after HOST_READ_ATTEMPTS`, () => {
+    const { api, calls, slept } = stubHost(host, [{ fail: GH_CONN }]);
+    assert.throws(() => api.labelsOf(42), /error connecting/);
+    assert.equal(calls.length, HOST_READ_ATTEMPTS);
+    assert.equal(slept.length, HOST_READ_ATTEMPTS - 1);
+  });
+
+  test(`createHost(${host}): issueInfoOf retries too, then still degrades to the fallback title`, () => {
+    // The commit message called issueInfoOf "unchanged"; it is in fact routed
+    // through the retry like the other reads. Pinned here so the behaviour is a
+    // decision, not a leftover: retries first, degrade only once they are spent.
+    const { api, calls } = stubHost(host, [{ fail: GH_CONN }]);
+    assert.deepEqual(api.issueInfoOf(42, 'fallback title'), { number: 42, title: 'fallback title' });
+    assert.equal(calls.length, HOST_READ_ATTEMPTS, 'the best-effort read still gets its attempts');
+  });
+
+  test(`createHost(${host}): a first-try success never sleeps — the happy path is untouched`, () => {
+    const { api, calls, slept, logged } = stubHost(host, ['[]']);
+    assert.deepEqual(api.queueIssues(['ready-for-agent']), []);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(slept, []);
+    assert.deepEqual(logged, []);
+  });
+}
 
 finish();

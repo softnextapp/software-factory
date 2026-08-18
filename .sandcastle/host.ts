@@ -628,12 +628,26 @@ function runDraftCreate(cli: 'gh' | 'glab', argv: readonly string[]): void {
 // carries — unit-tested on captured real CLI output like every other parser here.
 // ---------------------------------------------------------------------------
 
+/**
+ * The closed set of causes a classified host failure can carry. It is a LOG
+ * label, not a decision key — `retryable` alone drives the loop — but keeping it
+ * a union means the typechecker, not a doc comment, holds the set.
+ */
+export type HostFailureReason =
+  | 'auth' // 401/403 without a rate-limit wording: the credentials are wrong
+  | 'quota-exhausted' // 403 "API rate limit exceeded": the budget is spent, waiting a backoff won't refill it
+  | 'quota' // 429: a rate window that resets — worth waiting out
+  | 'not-found' // 404/410, or gh's GraphQL "could not resolve to an issue…"
+  | 'client-error' // any other 4xx: a request-shape problem repeating cannot fix
+  | 'outage' // 5xx, severed connection, transport refusal/timeout, signal-killed CLI
+  | 'unknown'; // unrecognised wording — retried, deliberately (see below)
+
 /** What a failed host read is, once classified. `reason` rides into the retry log. */
 export interface HostFailure {
   /** True when another attempt could plausibly succeed (5xx, outage, quota window). */
   readonly retryable: boolean;
-  /** Short stable cause for the log line — 'auth' | 'not-found' | 'quota' | 'outage' | 'unknown'. */
-  readonly reason: string;
+  /** Short stable cause for the log line; see {@link HostFailureReason}. */
+  readonly reason: HostFailureReason;
 }
 
 /**
@@ -661,6 +675,13 @@ export function classifyHostFailure(status: number | null, stderr: string): Host
       return { retryable: true, reason: code === 429 ? 'quota' : 'outage' };
     }
     if (code === 401 || code === 403) {
+      // GitHub spends its primary quota as a 403, not a 429 ("API rate limit
+      // exceeded for user…"). Definitive either way — the issue asks that an
+      // exhausted quota not be retried — but the log must not call it 'auth',
+      // or the operator goes hunting for a token that is perfectly fine.
+      if (code === 403 && /rate limit/i.test(text)) {
+        return { retryable: false, reason: 'quota-exhausted' };
+      }
       // Bad credentials / missing scope — no amount of retrying re-auths the CLI.
       return { retryable: false, reason: 'auth' };
     }
@@ -684,8 +705,13 @@ export function classifyHostFailure(status: number | null, stderr: string): Host
   if (/error connecting/i.test(text) || /\bdial tcp\b|\bi\/o timeout\b|\bcontext deadline exceeded\b/.test(text) || text.trim() === '') {
     return { retryable: true, reason: 'outage' };
   }
-  // Unrecognised wording with no status: fail toward the retry, not the run — an
-  // unknown transient is the exact loss this classifier exists to prevent, and an
+  // No HTTP status in the text AND no exit status: execFileSync reports
+  // `status: null` when the CLI died on a signal (SIGKILL from an OOM killer, a
+  // severed pipe) rather than exiting. That is an outage in every practical
+  // sense, and naming it so keeps the retry log honest.
+  if (status === null) return { retryable: true, reason: 'outage' };
+  // Unrecognised wording: fail toward the retry, not the run — an unknown
+  // transient is the exact loss this classifier exists to prevent, and an
   // unknown-but-definitive failure still surfaces after the bounded attempts.
   return { retryable: true, reason: 'unknown' };
 }
@@ -713,18 +739,13 @@ export interface HostRetryPlan {
  * number of failures so far). Exposed for tests; the runner below consumes it.
  */
 export function hostRetryPlanFor(attempt: number, random: () => number = Math.random): HostRetryPlan {
-  const exp = Math.min(attempt, HOST_READ_ATTEMPTS - 2); // cap the exponent with the attempt bound
+  // The runner never asks past HOST_READ_ATTEMPTS - 2, but a direct caller could;
+  // the cap keeps the longest possible pause a named constant rather than 2**n.
+  const exp = Math.max(0, Math.min(attempt, HOST_READ_ATTEMPTS - 2));
   return {
     delayMs: HOST_RETRY_BASE_DELAY_MS * 2 ** exp,
     jitterMs: Math.floor(random() * (HOST_RETRY_JITTER_MS + 1)),
   };
-}
-
-/** What one executed attempt of a host read looked like — the runner's log input. */
-export interface HostReadAttempt {
-  readonly attempt: number;
-  readonly status: number | null;
-  readonly stderr: string;
 }
 
 /** The host-facing effects runHostRead needs; injected so tests drive them purely. */
@@ -796,13 +817,31 @@ export interface Host {
   queueIssues(labels: readonly string[]): QueueIssue[];
 }
 
-export function createHost(host: GitHost): Host {
+/**
+ * The two impure things createHost()'s READ verbs touch, injected so the wiring
+ * itself — "labelsOf / openChangeRequests / queueIssues go through the retry" —
+ * is a contract test rather than a claim. Production passes neither and gets
+ * execFileSync + the real clock; the tests pass a stub CLI and a recording clock.
+ * The WRITE verb (createDraftChangeRequest) is deliberately not routed here: a
+ * retried create could open two PRs.
+ */
+export interface CreateHostDeps {
+  /** Run the host CLI and return its stdout; throws execFileSync-shaped errors. */
+  readonly runCli?: (cli: 'gh' | 'glab', argv: readonly string[]) => string;
+  /** sleep/log/random for the retry loop. */
+  readonly effects?: HostReadEffects;
+}
+
+export function createHost(host: GitHost, deps: CreateHostDeps = {}): Host {
+  const runCli =
+    deps.runCli ?? ((cli, argv) => execFileSync(cli, argv, { encoding: 'utf8' }));
+  const effects = deps.effects ?? defaultHostReadEffects;
   // One read = one retrying runHostRead. The verb string names the exact CLI
   // invocation in the retry log, so a slow run reads back unambiguously.
   const ghRead = (verb: string, argv: readonly string[]): string =>
-    runHostRead(`gh ${verb}`, () => execFileSync('gh', argv, { encoding: 'utf8' }));
+    runHostRead(`gh ${verb}`, () => runCli('gh', argv), effects);
   const glabRead = (verb: string, argv: readonly string[]): string =>
-    runHostRead(`glab ${verb}`, () => execFileSync('glab', argv, { encoding: 'utf8' }));
+    runHostRead(`glab ${verb}`, () => runCli('glab', argv), effects);
 
   if (host === 'gh') {
     return {
