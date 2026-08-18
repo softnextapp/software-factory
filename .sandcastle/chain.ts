@@ -276,6 +276,95 @@ function quoteList(branches: readonly string[]): string {
   return branches.map((branch) => `\`${branch}\``).join(', ');
 }
 
+// ---------------------------------------------------------------------------
+// Planner chain mode (issue #30)
+//
+// What the previous wave got wrong: CHAIN_MODE used to be read off the operator's
+// flag (`cfg.run.chain ? 'on' : 'off'`), i.e. the INTENT. But plan-prompt.md
+// relaxes the `Blocked by:` rule when it reads `on` — a ticket blocked by a
+// still-open issue becomes workable "because the stack puts the blocker's code
+// under the branch". Promise the planner a mode no branch will honour, and it
+// selects tickets whose designated inheritance is not in the tree the
+// implementer receives. Observed 17 Aug 2026: the planner asked for the previous
+// ticket's branch as base, "en mode chaîné, ce code est déjà sous la branche";
+// chainableBases named no base those tickets derived, main.ts fell back to the
+// trunk, and the run had to be stopped by hand.
+//
+// The mode therefore states a fact about the ROUND, and derives from the #24
+// predicate plus the bases the round's QUEUED tickets derive:
+//
+//   - chain off the config                    → `off` (nobody asked; no warning);
+//   - chain on + a queued chainable base      → `on`, behaviour unchanged;
+//   - chain on but NO queued ticket derives
+//     a chainable base                        → `off`, and a message saying the
+//                                               mode was downgraded and why —
+//                                               every possible selection builds
+//                                               unchained, so the relaxed
+//                                               `Blocked by:` rule would be a
+//                                               lie even though the config is
+//                                               feasible (#24 accepted exactly
+//                                               this shape as legal).
+//
+// Computed per iteration, from the queue the planner is about to see: the plan
+// does not exist yet when the mode is substituted into the prompt, so the queue
+// is the round's reality. The queue's bases are derived host-side from each
+// issue's labels — the same authoritative source resolveBase uses — never from
+// the planner's advisory `base`.
+// ---------------------------------------------------------------------------
+
+/** What `{{CHAIN_MODE}}` in plan-prompt.md should be, given what the round can build. */
+export type PlannerChainMode = 'on' | 'off';
+
+/**
+ * The decision main.ts prints and substitutes. `downgraded`/`message` are
+ * absent on every non-degraded path: `message` exists to be logged, and there
+ * is nothing to say when the mode matches the operator's ask.
+ */
+export type PlannerChainDecision =
+  | { mode: 'on' }
+  | { mode: 'off'; downgraded: boolean; message: string };
+
+/**
+ * Derive the chain mode the planner is TOLD from the feasibility verdict (the
+ * #24 predicate — must the run chain at all?) crossed with the bases the
+ * round's queued tickets derive. Pure; main.ts supplies `queueBases` from the
+ * host-side label walk and owns the logging.
+ *
+ * An EMPTY queue is deliberately not a downgrade: it selects nothing, so no
+ * selection can rest on a missing stack, and the empty plan ends the round
+ * before any mode matters.
+ */
+export function decidePlannerChainMode(cfg: {
+  feasibility: ChainFeasibility;
+  queueBases: readonly string[];
+}): PlannerChainDecision {
+  // `off` (chain not asked) and `no-chainable-base` (the run was refused before
+  // the planner) both mean no stack exists to promise. Neither is a downgrade:
+  // in the first nobody asked, in the second main.ts threw already.
+  if (!cfg.feasibility.feasible) return { mode: 'off', downgraded: false, message: '' };
+  const chainable: readonly string[] = cfg.feasibility.chainable;
+  const chainableQueueBases = cfg.queueBases.filter((base) => chainable.includes(base));
+  if (chainableQueueBases.length > 0) return { mode: 'on' };
+  // The queue cannot chain: every ticket it holds derives a base outside
+  // `chainable`. Distinct from #24's refusal — there a base COULD chain but no
+  // ticket derives it; here the tickets themselves are the missing half. The
+  // mode falls to `off`, matching what every branch of this round will build.
+  if (cfg.queueBases.length === 0) return { mode: 'on' };
+  return {
+    mode: 'off',
+    downgraded: true,
+    message:
+      `CHAIN_MODE rétrogradé à \`off\` : aucune base des tickets en file ne peut chaîner.\n` +
+      `  - bases dérivées par les tickets en file : ${quoteList(cfg.queueBases)} ;\n` +
+      `  - bases chaînables (\`chainableBases\`) : ${quoteList(chainable)}.\n` +
+      `Le chaînage reste demandé (\`SANDCASTLE_CHAIN\`) et la configuration est valide (#24), ` +
+      `mais ce round-ci bâtira sans pile : le planner raisonne en mode \`off\`, la règle ` +
+      `\`Blocked by:\` n'est pas assouplie, et chaque ticket partira de sa base de label.\n` +
+      `Reprenez le ticket sur la branche chaînable (label \`labelBases\`), ou ajoutez la base ` +
+      `des tickets en file à \`chainableBases\` (config.ts).`,
+  };
+}
+
 /**
  * The per-ticket warning for a base outside `chainableBases`: names the ticket,
  * its base, and the consequence — this ticket forks from and targets the plain

@@ -9,6 +9,7 @@ import {
   decideBaseSync,
   derivableBases,
   decideChainFeasibility,
+  decidePlannerChainMode,
   buildUnchainableBaseWarning,
   type OpenMergeRequest,
 } from './chain.ts';
@@ -299,6 +300,91 @@ test('unchainable-base warning: an empty chainableBases still warns (nothing is 
 
 test('unchainable-base warning: a base chainable among several is still silent', () => {
   assert.equal(buildUnchainableBaseWarning(7, 'main', ['epic/a', 'main', 'epic/b']), '');
+});
+
+// --- planner chain mode (issue #30) ------------------------------------------
+//
+// CHAIN_MODE must state what the round CAN build, not what the operator asked
+// for: plan-prompt.md relaxes `Blocked by:` when it reads `on`, so an `on` the
+// run cannot honour lets the planner pick tickets on a foundation no branch will
+// have. The input is the #24 verdict (feasible ⇒ chain on + a derivable base
+// chainable; the refusal case never reaches the planner) plus the bases the
+// ROUND's queued tickets derive — the reality the selection is made against.
+
+test('planner mode: chain asked and feasible → on (the `Blocked by:` relaxation keeps applying)', () => {
+  assert.deepEqual(
+    decidePlannerChainMode({
+      feasibility: { feasible: true, chainable: ['main'] },
+      queueBases: ['main'],
+    }),
+    { mode: 'on' },
+  );
+});
+
+test('planner mode: feasibility off (chain not asked) → off, whatever the queue', () => {
+  // The `off` verdict is not a degradation and never warns — the round is simply not
+  // chained; nobody asked for a stack.
+  assert.deepEqual(
+    decidePlannerChainMode({ feasibility: { feasible: false, reason: 'off' }, queueBases: ['main'] }),
+    { mode: 'off', downgraded: false, message: '' },
+  );
+});
+
+test('planner mode: chain asked, feasible, but no queued ticket derives a chainable base → off', () => {
+  // The exact incident shape (17 Aug 2026): chainableBases non-empty (so #24's startup
+  // guard passes), but the round's tickets all derive `main` while only the epic chains.
+  // The mode must say `off` — no stack the planner could rely on will exist.
+  const r = decidePlannerChainMode({
+    feasibility: { feasible: true, chainable: ['epic/rgaa-accessibilite'] },
+    queueBases: ['main'],
+  });
+  assert.equal(r.mode, 'off');
+  assert.ok(r.downgraded, 'must report the downgrade');
+  // The cause names the two sets — the queue's bases and the chainable ones — so the
+  // log alone tells the operator which tickets to relabel (or which base to chain).
+  assert.ok(r.message.includes('`main`'), 'must quote the base the queue derives');
+  assert.ok(
+    r.message.includes('`epic/rgaa-accessibilite`'),
+    'must quote the chainable base no ticket derives',
+  );
+});
+
+test('planner mode: one queued ticket on the chainable base is enough → on', () => {
+  // Feasibility is about the CONFIG; the mode is about the ROUND. A queue mixing
+  // `main` tickets and one epic ticket still chains (that ticket's branch is real).
+  assert.deepEqual(
+    decidePlannerChainMode({
+      feasibility: { feasible: true, chainable: ['epic/rgaa-accessibilite'] },
+      queueBases: ['main', 'epic/rgaa-accessibilite'],
+    }),
+    { mode: 'on' },
+  );
+});
+
+test('planner mode: an empty queue is no downgrade — on (nothing to select yet)', () => {
+  // The first iteration of a fresh round, or a drained backlog. An empty queue cannot
+  // name a chainable base, but it also selects nothing: degrading here would report a
+  // downgrade the round's tickets disprove, and an iteration that re-plans after a
+  // publish would flip modes mid-run for no observable difference.
+  assert.deepEqual(
+    decidePlannerChainMode({
+      feasibility: { feasible: true, chainable: ['epic/rgaa-accessibilite'] },
+      queueBases: [],
+    }),
+    { mode: 'on' },
+  );
+});
+
+test('planner mode: a refused run never reaches the planner, but the predicate stays total', () => {
+  // main.ts throws the no-chainable-base refusal before Phase 1; this pins that the
+  // predicate would not crash (nor lie with `on`) if ever composed with that verdict.
+  assert.deepEqual(
+    decidePlannerChainMode({
+      feasibility: { feasible: false, reason: 'no-chainable-base', message: 'refused' },
+      queueBases: ['main'],
+    }),
+    { mode: 'off', downgraded: false, message: '' },
+  );
 });
 
 finish();

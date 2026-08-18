@@ -314,8 +314,8 @@ The Factory resolves a **`FactoryConfig`** from two layers:
 | `SANDCASTLE_PROFILE` | `split` | Which profile runs: `split` or `opus`. An unknown value throws and names the valid profiles. |
 | `SANDCASTLE_MAX_ITERATIONS` | `10` | Maximum rounds before the loop stops. Must be a positive integer. |
 | `SANDCASTLE_MAX_PARALLEL` | `4` | Max issues worked concurrently in Phase 2. Positive integer. **Forced to `1` when `SANDCASTLE_CHAIN=1`** (a stack is built one MR at a time). |
-| `SANDCASTLE_CHAIN` | off | `1`/`true` (case-insensitive) → on; everything else → off. On, a round forks from the head of the open-MR stack and stacks its MR — see [Chained](#modes) below. **Refuses at startup** (before the planner runs) when no base of the round can chain — `chainableBases` empty or naming no base a ticket derives — with a message naming both `labelBases` and `chainableBases`: neither setting suffices alone. |
-| `SANDCASTLE_DRYRUN` | off | `1`/`true` → on. Prints the resolved wiring (profile, per-role model/effort/env with tokens masked, base-branch checks, chain state) and exits. Launches nothing. Renders the **same chain verdict as a live run** — the startup refusal fires here too, and the chain report names the derivable bases that would not chain (the live per-ticket warnings). |
+| `SANDCASTLE_CHAIN` | off | `1`/`true` (case-insensitive) → on; everything else → off. On, a round forks from the head of the open-MR stack and stacks its MR — see [Chained](#modes) below. **Refuses at startup** (before the planner runs) when no base of the round can chain — `chainableBases` empty or naming no base a ticket derives — with a message naming both `labelBases` and `chainableBases`: neither setting suffices alone. When the config is feasible but **no queued ticket derives a chainable base**, the round still runs and the planner is told `CHAIN_MODE: off` (the mode states what the round can build, not what was asked) — the log says the mode was downgraded, with the cause. |
+| `SANDCASTLE_DRYRUN` | off | `1`/`true` → on. Prints the resolved wiring (profile, per-role model/effort/env with tokens masked, base-branch checks, chain state) and exits. Launches nothing. Renders the **same chain verdict as a live run** — the startup refusal fires here too, the chain report names the derivable bases that would not chain (the live per-ticket warnings), and `plannerMode` states the mode the planner would receive over tonight's queue (the **effective** mode, downgrades included — not the requested one). |
 | `SANDCASTLE_ONLY` | unset | A comma list of positive issue numbers to restrict the round to (e.g. `42` or `42,43`). The planner is told the allow-list, and `main.ts` **enforces** it on the result — issues outside the list are dropped even if the planner proposed them. If none match, the round stops. |
 | `SANDCASTLE_FORCE` | off | `1`/`true` → on. **Requires `SANDCASTLE_ONLY`** (config throws otherwise). Tells the planner to re-propose the `ONLY` issues even if they already have an open MR or appear resolved — a deliberate re-run. |
 
@@ -381,8 +381,12 @@ fenced in v0.1 until the Merger module lands.
   The mode **declares itself**: a run with no chainable base refuses at startup
   (before any agent) rather than silently building unchained, and a ticket whose
   base is outside `chainableBases` gets a per-ticket warning in the log — it runs
-  unchained and will not see the stack. `SANDCASTLE_DRYRUN=1` returns the same
-  verdict, not a more optimistic one.
+  unchained and will not see the stack. The planner is told the mode the round
+  **can build** (`CHAIN_MODE` derives from the feasibility verdict crossed with
+  the bases the queued tickets derive): asked-but-unbuildable reads `off`, the
+  log states the downgrade — the relaxed `Blocked by:` rule never rests on a
+  stack no branch will have. `SANDCASTLE_DRYRUN=1` returns the same verdict, not
+  a more optimistic one.
 
 ## Auth token isolation
 

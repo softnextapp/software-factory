@@ -41,6 +41,7 @@ import {
   resolveChainedBase,
   decideBaseSync,
   decideChainFeasibility,
+  decidePlannerChainMode,
   derivableBases,
   buildUnchainableBaseWarning,
   type OpenMergeRequest,
@@ -56,6 +57,7 @@ import {
   hostTokenKey,
   hostTokenMissingMessage,
   type Host,
+  type QueueIssue,
 } from './host.ts';
 import {
   buildMrDescription,
@@ -987,6 +989,29 @@ const sweepDeadBranches = (protectedBranches: ReadonlySet<string>): void => {
   }
 };
 
+// The distinct bases a round's tickets derive, from the labels the queue listing
+// already carries (baseForLabels — the same authoritative walk the per-issue base
+// resolution below uses). Shared by the planner-mode derivation (issue #30) and the
+// dry run's chain report, so the two can never disagree about what "the queue"
+// derives.
+//
+// `SANDCASTLE_ONLY` narrows the input the same way it narrows the round: an
+// operator-restricted round's tickets are queue ∩ ONLY (applyOnly enforces that
+// on the plan), so the mode must be derived over exactly that set — otherwise a
+// round restricted to one `main` ticket could still be told `on` because a
+// DIFFERENT queued ticket carries the epic label. Order follows the queue;
+// deduped. Empty (nothing queued, or ONLY matching nothing) is handled by
+// decidePlannerChainMode's empty-queue rule.
+const queueIssueBases = (queue: readonly QueueIssue[]): string[] => [
+  ...new Set(
+    queue
+      .filter((issue) => cfg.run.only === null || cfg.run.only.includes(issue.number))
+      .map((issue) =>
+        baseForLabels(issue.labels, cfg.project.labelBases, cfg.project.baseBranch),
+      ),
+  ),
+];
+
 // What resolveBase() would return tonight, for the dry run. Read-only: no fetch, no
 // local ref created. Never throws — a dry run on a machine where glab is not authed
 // must still print the profile wiring it was mainly asked about.
@@ -997,6 +1022,13 @@ const sweepDeadBranches = (protectedBranches: ReadonlySet<string>): void => {
 // round's tickets CAN derive but that will never chain, so the per-ticket warning
 // of the live run is visible in the dry run too — same verdict, not a more
 // optimistic one (issue #24, criterion 4).
+//
+// `plannerMode` is the mode the live run would hand the planner over THIS queue
+// (issue #30, criterion 5): the effective mode, not the requested one. Same
+// predicate, same queue walk — the dry run cannot report a healthier mode than
+// the round would run. The queue read itself is best-effort like the stack walk
+// (an unauthed glab still gets the wiring report); null = could not read, and the
+// mode is left to the live run to state.
 //
 // The per-root stack walk goes under its own `stacks` key rather than overwriting
 // `chainableBases`: one key holding a branch-name list on the error path and objects
@@ -1010,6 +1042,19 @@ const chainDryRun = (): Record<string, unknown> => {
     chainableBases: bases,
     unchainableDerivableBases: derivable.filter((base) => !bases.includes(base)),
   };
+  let queueBases: string[] | null;
+  try {
+    queueBases = queueIssueBases(host.queueIssues(cfg.project.queueLabels));
+  } catch (error) {
+    queueBases = null;
+    report.queueError = `could not read the queue — ${(error as Error).message}`;
+  }
+  if (queueBases !== null) {
+    const mode = decidePlannerChainMode({ feasibility: CHAIN_FEASIBILITY, queueBases });
+    report.queueBases = queueBases;
+    report.plannerMode = mode.mode;
+    if (mode.mode === 'off' && mode.downgraded) report.downgraded = mode.message;
+  }
   try {
     const openMrs = host.openChangeRequests();
     return {
@@ -1363,6 +1408,20 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     }
   }
 
+  // The chain mode the planner is told, derived from what this round can build
+  // (issue #30) — see decidePlannerChainMode in chain.ts. Computed from the
+  // planner's own queue (the plan does not exist yet), with each ticket's base
+  // derived from the labels the queue listing already carries — the same
+  // authoritative source the base-resolution below uses, never the planner's
+  // advisory `base` field. No extra host read: QueueIssue ships the labels.
+  const plannerChain = decidePlannerChainMode({
+    feasibility: CHAIN_FEASIBILITY,
+    queueBases: queueIssueBases(plannerQueue),
+  });
+  if (plannerChain.mode === 'off' && plannerChain.downgraded) {
+    console.warn(`  ⛓ ⚠ chain: ${plannerChain.message}`);
+  }
+
   const plan = await sandcastle.run({
     sandbox: docker({ env: envFor('planner') }),
     name: 'planner',
@@ -1374,13 +1433,20 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     // branch underneath, so the same issue is workable. Same queue, opposite answer;
     // the planner cannot read process.env, so the mode is passed in.
     //
+    // That mode is a fact about THIS round, not the operator's flag (issue #30):
+    // `on` here relaxes `Blocked by:`, so promising a stack no branch will have
+    // lets the planner select tickets on an inheritance that is not in the tree.
+    // decidePlannerChainMode crosses the #24 feasibility verdict with the bases
+    // the queued tickets actually derive, and a downgrade is logged — with its
+    // cause — before the prompt is even built.
+    //
     // ONLY/FORCE are the same kind of run-knob the planner cannot see. ONLY tells it
     // the round is restricted to specific issue numbers (it should propose from that
     // set); FORCE tells it to re-propose them even if they already have an open MR.
     // main.ts still enforces ONLY on the result (see applyOnly below) — the planner
     // is an agent — so a value here is guidance, not trust.
     promptArgs: {
-      CHAIN_MODE: cfg.run.chain ? 'on' : 'off',
+      CHAIN_MODE: plannerChain.mode,
       ONLY: cfg.run.only === null ? 'none' : cfg.run.only.join(', '),
       FORCE: cfg.run.force ? 'on' : 'off',
       ISSUE_QUEUE_JSON: JSON.stringify(plannerQueue),

@@ -20,6 +20,10 @@ normal base. That MR's unmerged work is therefore **already present** in the tre
 implementer receives. When it is `off`, each issue is branched from its normal base
 and sees none of the open MRs.
 
+This value is **what the round can actually build**, not what was requested: the loop
+derives it from the bases this round's tickets can chain on. Treat it as the truth
+about where branches will fork from — never reason "chained mode was requested, so…"
+
 ## Operator restriction this round
 
 - `SANDCASTLE_ONLY`: **{{ONLY}}** (a comma list of issue numbers, or `none`).
