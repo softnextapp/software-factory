@@ -375,6 +375,30 @@ test('planner mode: an empty queue is no downgrade — on (nothing to select yet
   );
 });
 
+test('planner mode: a queue matching the second of several chainable bases → on', () => {
+  // `chainable` is a list, not a single root: matching ANY entry is enough, and the
+  // trunk sitting first in derivable order must not shadow an epic match.
+  assert.deepEqual(
+    decidePlannerChainMode({
+      feasibility: { feasible: true, chainable: ['main', 'epic/rgaa-accessibilite'] },
+      queueBases: ['epic/rgaa-accessibilite'],
+    }),
+    { mode: 'on' },
+  );
+});
+
+test('planner mode: the downgrade message quotes each base once, even on a raw per-ticket list', () => {
+  // plan.ts's queueChainBases dedupes, but the message is operator-facing text: a
+  // caller passing one entry per ticket must not get "`main`, `main`, `main`".
+  const r = decidePlannerChainMode({
+    feasibility: { feasible: true, chainable: ['epic/rgaa-accessibilite'] },
+    queueBases: ['main', 'main', 'main'],
+  });
+  assert.equal(r.mode, 'off');
+  assert.ok(r.downgraded);
+  assert.ok(r.message.includes('en file : `main` ;'), r.message);
+});
+
 test('planner mode: a refused run never reaches the planner, but the predicate stays total', () => {
   // main.ts throws the no-chainable-base refusal before Phase 1; this pins that the
   // predicate would not crash (nor lie with `on`) if ever composed with that verdict.

@@ -67,7 +67,13 @@ import {
   type CommitInfo,
   type DiffStat,
 } from './mr-body.ts';
-import { baseForLabels, parsePlan, applyOnly, type PlannedIssue } from './plan.ts';
+import {
+  baseForLabels,
+  parsePlan,
+  applyOnly,
+  queueChainBases,
+  type PlannedIssue,
+} from './plan.ts';
 import { loadConfig, type Provider, type Role } from './config.ts';
 import {
   buildRunBranch,
@@ -989,28 +995,18 @@ const sweepDeadBranches = (protectedBranches: ReadonlySet<string>): void => {
   }
 };
 
-// The distinct bases a round's tickets derive, from the labels the queue listing
-// already carries (baseForLabels — the same authoritative walk the per-issue base
-// resolution below uses). Shared by the planner-mode derivation (issue #30) and the
+// The distinct bases a round's tickets derive (issue #30). The rule itself —
+// labels → base, narrowed by SANDCASTLE_ONLY, deduped — is pure and lives in
+// plan.ts beside baseForLabels, where plan.test.ts holds it; this closure only
+// binds it to this run's config. Shared by the planner-mode derivation and the
 // dry run's chain report, so the two can never disagree about what "the queue"
 // derives.
-//
-// `SANDCASTLE_ONLY` narrows the input the same way it narrows the round: an
-// operator-restricted round's tickets are queue ∩ ONLY (applyOnly enforces that
-// on the plan), so the mode must be derived over exactly that set — otherwise a
-// round restricted to one `main` ticket could still be told `on` because a
-// DIFFERENT queued ticket carries the epic label. Order follows the queue;
-// deduped. Empty (nothing queued, or ONLY matching nothing) is handled by
-// decidePlannerChainMode's empty-queue rule.
-const queueIssueBases = (queue: readonly QueueIssue[]): string[] => [
-  ...new Set(
-    queue
-      .filter((issue) => cfg.run.only === null || cfg.run.only.includes(issue.number))
-      .map((issue) =>
-        baseForLabels(issue.labels, cfg.project.labelBases, cfg.project.baseBranch),
-      ),
-  ),
-];
+const queueIssueBases = (queue: readonly QueueIssue[]): string[] =>
+  queueChainBases(queue, {
+    labelBases: cfg.project.labelBases,
+    baseBranch: cfg.project.baseBranch,
+    only: cfg.run.only,
+  });
 
 // What resolveBase() would return tonight, for the dry run. Read-only: no fetch, no
 // local ref created. Never throws — a dry run on a machine where glab is not authed
@@ -1053,7 +1049,10 @@ const chainDryRun = (): Record<string, unknown> => {
     const mode = decidePlannerChainMode({ feasibility: CHAIN_FEASIBILITY, queueBases });
     report.queueBases = queueBases;
     report.plannerMode = mode.mode;
-    if (mode.mode === 'off' && mode.downgraded) report.downgraded = mode.message;
+    // Its own key, and not `downgraded`: the decision's `downgraded` is a boolean,
+    // and one name holding a flag in the code and a paragraph in the printed report
+    // is the kind of ambiguity the `stacks` key was split out to avoid.
+    if (mode.mode === 'off' && mode.downgraded) report.plannerModeDowngrade = mode.message;
   }
   try {
     const openMrs = host.openChangeRequests();

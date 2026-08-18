@@ -66,6 +66,51 @@ export function baseForLabels(
   return defaultBase;
 }
 
+/**
+ * The subset of a queued issue this module needs to derive a base: its number (for
+ * the `SANDCASTLE_ONLY` narrowing) and its labels. `host.ts`'s `QueueIssue`
+ * satisfies it structurally, so plan.ts keeps importing nothing.
+ */
+export interface QueueTicket {
+  readonly number: number;
+  readonly labels: readonly string[];
+}
+
+/**
+ * The distinct bases a round's queued tickets derive — the input to the planner's
+ * chain mode (issue #30, `decidePlannerChainMode` in chain.ts) and to the dry
+ * run's chain report.
+ *
+ * Each ticket's base comes from {@link baseForLabels}, the same authoritative walk
+ * main.ts runs per planned issue — never the planner's advisory `base`.
+ *
+ * `only` narrows the input exactly as it narrows the round ({@link applyOnly}
+ * enforces the same restriction on the plan): a round restricted to one `main`
+ * ticket must not be told the chain is on because a DIFFERENT queued ticket
+ * carries the epic label. `null` (env unset) is an unrestricted round.
+ *
+ * Order follows the queue, deduped — the result is quoted back to the operator in
+ * the downgrade message, so a repeated base would read as noise. Empty (nothing
+ * queued, or `only` matching nothing) is a legitimate answer and is what
+ * `decidePlannerChainMode` treats as "no downgrade".
+ */
+export function queueChainBases(
+  queue: readonly QueueTicket[],
+  cfg: {
+    labelBases: Readonly<Record<string, string>>;
+    baseBranch: string;
+    only: readonly number[] | null;
+  },
+): string[] {
+  const allow = cfg.only === null ? null : new Set(cfg.only);
+  const bases = new Set<string>();
+  for (const ticket of queue) {
+    if (allow !== null && !allow.has(ticket.number)) continue;
+    bases.add(baseForLabels(ticket.labels, cfg.labelBases, cfg.baseBranch));
+  }
+  return [...bases];
+}
+
 // Extract and parse the <plan> block. Throws when the tag is absent (the planner
 // misbehaved — fail the iteration loudly). An explicit empty issues list is valid
 // and signals the backlog is drained.

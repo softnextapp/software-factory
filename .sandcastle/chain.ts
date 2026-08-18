@@ -312,13 +312,13 @@ function quoteList(branches: readonly string[]): string {
 // the planner's advisory `base`.
 // ---------------------------------------------------------------------------
 
-/** What `{{CHAIN_MODE}}` in plan-prompt.md should be, given what the round can build. */
-export type PlannerChainMode = 'on' | 'off';
-
 /**
- * The decision main.ts prints and substitutes. `downgraded`/`message` are
- * absent on every non-degraded path: `message` exists to be logged, and there
- * is nothing to say when the mode matches the operator's ask.
+ * The value `{{CHAIN_MODE}}` takes in plan-prompt.md, plus why when it is not the
+ * mode the operator asked for. `mode: 'on'` carries nothing else — there is
+ * nothing to log when the mode matches the ask — so the union makes the caller
+ * narrow before it can read a cause. On the `off` arm, `downgraded` says whether
+ * the ask was overruled (false when chaining was never requested, or the run was
+ * refused upstream) and `message` is the log line, empty unless `downgraded`.
  */
 export type PlannerChainDecision =
   | { mode: 'on' }
@@ -342,20 +342,26 @@ export function decidePlannerChainMode(cfg: {
   // the planner) both mean no stack exists to promise. Neither is a downgrade:
   // in the first nobody asked, in the second main.ts threw already.
   if (!cfg.feasibility.feasible) return { mode: 'off', downgraded: false, message: '' };
+  // Nothing queued (or nothing left after SANDCASTLE_ONLY): no selection can rest
+  // on a missing stack, so the ask stands and no downgrade is reported. Checked
+  // first because it is the one `off`-looking input that is NOT a degradation.
+  if (cfg.queueBases.length === 0) return { mode: 'on' };
   const chainable: readonly string[] = cfg.feasibility.chainable;
-  const chainableQueueBases = cfg.queueBases.filter((base) => chainable.includes(base));
-  if (chainableQueueBases.length > 0) return { mode: 'on' };
+  if (cfg.queueBases.some((base) => chainable.includes(base))) return { mode: 'on' };
   // The queue cannot chain: every ticket it holds derives a base outside
   // `chainable`. Distinct from #24's refusal — there a base COULD chain but no
   // ticket derives it; here the tickets themselves are the missing half. The
   // mode falls to `off`, matching what every branch of this round will build.
-  if (cfg.queueBases.length === 0) return { mode: 'on' };
+  //
+  // The quoted lists are de-duped: plan.ts's queueChainBases already dedupes, but
+  // the message is operator-facing free text and must not read as noise if this
+  // predicate is ever handed a raw per-ticket list.
   return {
     mode: 'off',
     downgraded: true,
     message:
       `CHAIN_MODE rétrogradé à \`off\` : aucune base des tickets en file ne peut chaîner.\n` +
-      `  - bases dérivées par les tickets en file : ${quoteList(cfg.queueBases)} ;\n` +
+      `  - bases dérivées par les tickets en file : ${quoteList([...new Set(cfg.queueBases)])} ;\n` +
       `  - bases chaînables (\`chainableBases\`) : ${quoteList(chainable)}.\n` +
       `Le chaînage reste demandé (\`SANDCASTLE_CHAIN\`) et la configuration est valide (#24), ` +
       `mais ce round-ci bâtira sans pile : le planner raisonne en mode \`off\`, la règle ` +
