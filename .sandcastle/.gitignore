@@ -1,0 +1,15 @@
+# Runtime artifacts a run materializes locally — never part of the config.
+# The config layer is TRACKED on purpose (issue #29): config.ts holds project
+# decisions (labelBases, chainableBases, queue labels, base branch) that belong
+# in review and in history — diffable, restorable, visible to every clone and
+# to agents working in linked worktrees. Only what a machine generates below
+# stays out: secrets (.env*), logs, agent worktrees, the out-of-tree Engine
+# install (#22) and its standalone lockfiles (#23). The examples are negated
+# back in so `git archive` keeps shipping the templates.
+.env*
+!.env*.example
+logs/
+worktrees/
+node_modules/
+pnpm-lock.yaml
+package-lock.json

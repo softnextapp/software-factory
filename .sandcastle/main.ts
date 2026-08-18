@@ -87,9 +87,10 @@ type RunResult = Awaited<ReturnType<Sandbox['run']>>;
 // {model, base URL, token key, reasoning effort}; a role is planner / implementer /
 // reviewer (a `merger` joins only under MERGE_STRATEGY=agent, out of scope for v0.1).
 // Which profile is active is a parameter of the RUN (SANDCASTLE_PROFILE), never a
-// state of this file: the same regime has to hold across repos, and .sandcastle/ is
-// gitignored in consumer repos — so an edited main.ts cannot be reverted with `git
-// checkout --`. A regime you cannot undo is worse than a verbose command line.
+// state of this file: the same regime has to hold across repos, and the config
+// layer is tracked in every consumer (issue #29) — an edited main.ts or config.ts
+// is reverted with `git checkout --` like any other file. A regime you cannot
+// undo is worse than a verbose command line.
 //
 // Diversity invariant (CONDITIONAL on the profile, enforced by config.ts):
 //   - `split`: the reviewer runs a different model than the implementer, so it does

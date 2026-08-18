@@ -2,7 +2,7 @@
 // counterpart to the greenfield `git clone && rm -rf .git && git init` in README
 // §Setup. Solves GitHub issue #3: until now, adopting `.sandcastle/` into a repo
 // that already has its own history/remote was an undocumented reverse-engineering
-// exercise (copy the tracked files, wire the Engine, ignore locally).
+// exercise (copy the tracked files, wire the Engine, version the config).
 //
 // This script does all three, plus the two things a real consumer also needs to
 // actually run `main.ts`: it wires the full Factory runtime (the Engine + the
@@ -18,9 +18,10 @@
 // copies the `.sandcastle/` config layer ONCE and leaves the consumer owning it.
 //
 // Pure helpers (detectPackageManager, hasPnpmWorkspace, pmAddArgs, consumerRootIsCjs,
-// buildExcludePatch, engineRuntimeDeps, computeMissing, toSpecs, parseArgs) are
-// exported for the contract test; main() does the fs/spawn side effects and runs
-// only when the file is invoked directly (see the guard at the bottom).
+// wholeSandcastleLine, findWholeDirIgnores, wholeDirIgnoreWarning, engineRuntimeDeps,
+// computeMissing, toSpecs, parseArgs) are exported for the contract test; main() does
+// the fs/spawn side effects and runs only when the file is invoked directly (see the
+// guard at the bottom).
 import { execFileSync } from 'node:child_process';
 import {
   existsSync,
@@ -118,22 +119,48 @@ export function consumerRootIsCjs(consumerPkgJson: string | null): boolean {
 }
 
 /**
- * Idempotent patch for `.git/info/exclude`: append `.sandcastle/` only if it is not
- * already ignored. Returns the text to append (and whether to append at all).
+ * Is this ignore line the pre-#29 whole-directory rule (`.sandcastle/` or
+ * `.sandcastle`)? Such a line — wherever it lives — keeps the entire config
+ * layer out of git, which is exactly the posture issue #29 retires: `config.ts`
+ * and its `labelBases`/`chainableBases` decisions are project decisions and
+ * belong in history. Exact match on the trimmed line: a subpath rule
+ * (`.sandcastle/.env*`) or a comment mentioning the directory is NOT the
+ * whole-dir rule, and must not be flagged as one.
  */
-export function buildExcludePatch(excludeText: string | null): {
-  append: boolean;
-  content: string;
-} {
-  const present = (excludeText ?? '')
+export function wholeSandcastleLine(line: string): boolean {
+  const t = line.trim();
+  return t === '.sandcastle/' || t === '.sandcastle';
+}
+
+/**
+ * Every whole-dir `.sandcastle/` ignore line in an ignore file's text, in file
+ * order — the pre-#29 legacy adoption must DETECT rather than write (see
+ * `wholeDirIgnoreWarning`). Null (no file) → empty, never throws.
+ */
+export function findWholeDirIgnores(ignoreText: string | null): string[] {
+  return (ignoreText ?? '')
     .split('\n')
     .map((l) => l.trim())
-    .filter(Boolean)
-    .some((l) => l === '.sandcastle/' || l === '.sandcastle');
-  if (present) return { append: false, content: '' };
-  // Avoid a leading blank line if the file already ends in a newline (or is empty).
-  const sep = excludeText && excludeText.length > 0 && !excludeText.endsWith('\n') ? '\n' : '';
-  return { append: true, content: `${sep}.sandcastle/\n` };
+    .filter((l) => wholeSandcastleLine(l));
+}
+
+/**
+ * The warning adopt prints when a whole-dir `.sandcastle/` ignore survives in
+ * the consumer (its `.git/info/exclude`, or its tracked `.gitignore`): such a
+ * line silently undoes the #29 posture — `git add .sandcastle/` then refuses
+ * the config with no visible reason. Adoption never edits the file behind the
+ * user's back (a local exclude is someone's machine, not ours; a tracked
+ * .gitignore is the consumer's to commit), so the warning carries the exact
+ * gesture: remove the named line(s) from the named file, then re-stage.
+ */
+export function wholeDirIgnoreWarning(file: string, lines: readonly string[]): string {
+  return (
+    `${file} still ignores the whole .sandcastle/ directory (issue #29):\n` +
+    lines.map((l) => `    ${l}\n`).join('') +
+    `  The orchestration config (.sandcastle/config.ts) is a project deliverable and stays\n` +
+    `  tracked. Remove the line(s) above from that file, then re-run:\n` +
+    `    git add .sandcastle/ && git commit -m "chore: track the orchestration config"`
+  );
 }
 
 /** The Factory runtime grouped by where it belongs in the consumer: deps vs devDeps. */
@@ -506,21 +533,71 @@ function main(): void {
     info('③ consumer root is already ESM — shim still ships with .sandcastle/ as a belt-and-braces.');
   }
 
-  // 4. Ignore `.sandcastle/` locally without touching the consumer's tracked .gitignore.
+  // 4. Version the orchestration config in the consumer's repo (issue #29).
+  //    Pre-#29 adoption excluded the whole `.sandcastle/` directory via a LOCAL
+  //    `.git/info/exclude` line — so `config.ts` (its `labelBases`/`chainableBases`
+  //    are project decisions: fork bases, MR targets) was never tracked, never
+  //    reviewed, invisible to any fresh clone, unrestorable by `git checkout --`,
+  //    and untouchable by an agent working in a linked worktree (the config existed
+  //    only in the main clone). The Factory's own posture — only runtime artifacts
+  //    are ignored — is what a consumer gets now.
+  //
+  //    The artifact boundary itself needs no work here: step 1's copy ships the
+  //    tracked `.sandcastle/.gitignore` (`.env*`, `logs/`, `worktrees/`, the
+  //    out-of-tree Engine install) alongside the config, and it is scoped to
+  //    `.sandcastle/`, so the consumer's root ignore files stay untouched. What
+  //    remains is staging — putting `config.ts` under git in THIS clone — and
+  //    flagging any pre-#29 whole-dir rule that would quietly defeat both.
   const excludePath = join(consumerRoot, '.git', 'info', 'exclude');
-  if (existsSync(excludePath)) {
-    const current = readFileSync(excludePath, 'utf8');
-    const patch = buildExcludePatch(current);
-    if (patch.append) {
-      info('④ ignore .sandcastle/ locally (append to .git/info/exclude; tracked .gitignore untouched)');
-      writeFileSync(excludePath, current + patch.content);
-    } else {
-      info('④ .sandcastle/ already ignored in .git/info/exclude — skip.');
+  const rootGitignorePath = join(consumerRoot, '.gitignore');
+  const legacyIgnores: { file: string; lines: string[] }[] = [];
+  for (const file of [excludePath, rootGitignorePath]) {
+    if (!existsSync(file)) continue;
+    const lines = findWholeDirIgnores(readFileSync(file, 'utf8'));
+    if (lines.length) legacyIgnores.push({ file, lines });
+  }
+  if (legacyIgnores.length) {
+    // Warned, never fixed behind the user's back: a local exclude is someone's
+    // machine, a tracked .gitignore is the consumer's to commit. The message
+    // carries the exact gesture (see wholeDirIgnoreWarning).
+    for (const { file, lines } of legacyIgnores) {
+      warn(wholeDirIgnoreWarning(file, lines));
+    }
+  }
+  if (existsSync(join(consumerRoot, '.git'))) {
+    // Stage the config layer the boundary leaves trackable. `git add -- .sandcastle/`
+    // respects the ignore rules in effect, so secrets (.env*) and artifacts
+    // (logs/, worktrees/, the Engine install) stay out by construction — never
+    // `git add -f`, which would defeat the boundary this step exists to establish.
+    // The consumer commits; adoption does not commit on their behalf (ADR-0002:
+    // the clone is theirs from the first minute).
+    try {
+      execFileSync('git', ['-C', consumerRoot, 'add', '--', '.sandcastle/'], { stdio: 'pipe' });
+      info(
+        '④ staged .sandcastle/ — the config is versioned in the consumer (issue #29); only .env*, logs/, worktrees/ and the Engine install stay ignored.',
+      );
+      info('    commit it yourself, e.g.: git commit -m "chore: track the orchestration config"');
+    } catch (err) {
+      // Staging can fail only when a whole-dir rule still ignores the directory —
+      // either one of the legacy lines warned about above (the operator has not
+      // removed it yet) or one in a file this step does not read (e.g. a global
+      // core.excludesFile). git's own hint here is `add -f`, which is exactly wrong
+      // (it would stage the secrets the boundary exists to keep out), so point at
+      // the named lines / the probe that locates the rule instead.
+      warn(
+        `④ could not stage .sandcastle/ — a whole-dir ignore rule still covers it:\n` +
+          `    ${(err as Error).message.split('\n')[0]}\n` +
+          (legacyIgnores.length
+            ? `  Remove the line(s) warned about above, then re-run: git -C ${consumerRoot} add -- .sandcastle/\n`
+            : `  Locate the rule with: git -C ${consumerRoot} check-ignore -v -- .sandcastle/config.ts\n` +
+              `  (it names the file and line), remove it, and re-run: git -C ${consumerRoot} add -- .sandcastle/\n`) +
+          `  Do NOT use \`git add -f\` — it would stage .env* secrets along with the config.`,
+      );
     }
   } else {
     warn(
-      `No ${excludePath} — could not ignore .sandcastle/ locally (not a git repo, or an unusual layout).\n` +
-        '  Add `.sandcastle/` to your .gitignore yourself, or run `git init` first.',
+      `No ${join(consumerRoot, '.git')} — .sandcastle/ is copied but NOT staged (not a git repo, or an unusual layout).\n` +
+        `  Run \`git init\` and \`git add -- .sandcastle/\` yourself; the artifact boundary ships in .sandcastle/.gitignore.`,
     );
   }
 
@@ -540,6 +617,8 @@ function main(): void {
   info('      cp <factory>/templates/CLAUDE.md   <consumer>/CLAUDE.md');
   info('      cp <factory>/templates/CONTEXT.md  <consumer>/CONTEXT.md   # domain glossary (delete if you have none yet)');
   info('  - Configure identity:    $EDITOR <consumer>/.sandcastle/config.ts');
+  info('      The config is TRACKED in your repo (issue #29) — review the identity change');
+  info('      like any other code: git diff, then commit it.');
   info('  - Authenticate the host: gh auth login      # or: glab auth login (GitHub vs GitLab)');
   info('      then set `gitHost` in config.ts to match — the loop warns if it disagrees with origin.');
   info('  - Dry-run first:         SANDCASTLE_DRYRUN=1 npx tsx <consumer>/.sandcastle/main.ts');
