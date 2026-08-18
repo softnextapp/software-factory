@@ -22,7 +22,7 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/plan.ts` | Parses the planner's `<plan>` JSON; label → base resolution. |
 | `.sandcastle/chain.ts` | Chained-MR base resolution — the pure, host-agnostic stack walk. |
 | `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, work-queue enumeration, and the prompt-time command strings). |
-| `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts. |
+| `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts, and states the issue's fate (`Closes #n` on the default branch, an explicit why-not note on any other base). |
 | `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
 | `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |
@@ -281,8 +281,8 @@ The Factory resolves a **`FactoryConfig`** from two layers:
 | `SANDCASTLE_PROFILE` | `split` | Which profile runs: `split` or `opus`. An unknown value throws and names the valid profiles. |
 | `SANDCASTLE_MAX_ITERATIONS` | `10` | Maximum rounds before the loop stops. Must be a positive integer. |
 | `SANDCASTLE_MAX_PARALLEL` | `4` | Max issues worked concurrently in Phase 2. Positive integer. **Forced to `1` when `SANDCASTLE_CHAIN=1`** (a stack is built one MR at a time). |
-| `SANDCASTLE_CHAIN` | off | `1`/`true` (case-insensitive) → on; everything else → off. On, a round forks from the head of the open-MR stack and stacks its MR — see [Chained](#modes) below. |
-| `SANDCASTLE_DRYRUN` | off | `1`/`true` → on. Prints the resolved wiring (profile, per-role model/effort/env with tokens masked, base-branch checks, chain state) and exits. Launches nothing. |
+| `SANDCASTLE_CHAIN` | off | `1`/`true` (case-insensitive) → on; everything else → off. On, a round forks from the head of the open-MR stack and stacks its MR — see [Chained](#modes) below. **Refuses at startup** (before the planner runs) when no base of the round can chain — `chainableBases` empty or naming no base a ticket derives — with a message naming both `labelBases` and `chainableBases`: neither setting suffices alone. |
+| `SANDCASTLE_DRYRUN` | off | `1`/`true` → on. Prints the resolved wiring (profile, per-role model/effort/env with tokens masked, base-branch checks, chain state) and exits. Launches nothing. Renders the **same chain verdict as a live run** — the startup refusal fires here too, and the chain report names the derivable bases that would not chain (the live per-ticket warnings). |
 | `SANDCASTLE_ONLY` | unset | A comma list of positive issue numbers to restrict the round to (e.g. `42` or `42,43`). The planner is told the allow-list, and `main.ts` **enforces** it on the result — issues outside the list are dropped even if the planner proposed them. If none match, the round stops. |
 | `SANDCASTLE_FORCE` | off | `1`/`true` → on. **Requires `SANDCASTLE_ONLY`** (config throws otherwise). Tells the planner to re-propose the `ONLY` issues even if they already have an open MR or appear resolved — a deliberate re-run. |
 
@@ -300,7 +300,7 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 | `baseBranch` | `string` | `'main'` | The project trunk. A live run fast-forwards each base to `origin` before agents fork, so a round never builds on stale code; a base curated locally ahead of origin is kept as-is (#14). |
 | `labelBases` | `Record<string,string>` | `{}` | Issue label → base branch. Empty ⇒ every issue forks from `baseBranch`. |
 | `queueLabels` | `string[]` | `['sandcastle', 'ready-for-agent']` | Queue trigger labels — an open issue carrying ANY of these is candidate work. Default accepts both so the Factory (`sandcastle`) and captable (`ready-for-agent`) queue with no relabelling; narrow per consumer (#15). |
-| `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Empty ⇒ chaining is inert even with `SANDCASTLE_CHAIN=1`. |
+| `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Must name at least one base the round's tickets can derive (a `labelBases` value, or `baseBranch`) when `SANDCASTLE_CHAIN=1` — otherwise the run **refuses at startup**, naming both `labelBases` and `chainableBases`. A ticket whose derived base is not listed still runs, **unchained, with a per-ticket warning** in the log. |
 | `assignee` | `string \| null` | `'@me'` | Host assignee. gh accepts `@me`; a GitLab consumer gives a real username (glab wants one). `null` ⇒ leave the MR/PR unassigned. |
 | `worktreeExclude` | `string[]` | `['.pnpm-store/']` | Gitignore patterns for generated artifacts (package-manager stores, …) the Engine's "uncommitted changes" check would otherwise flag in an agent worktree. Written to the shared `.git/info/exclude`, so a tracked-but-uncommitted change still warns (#20). |
 
@@ -345,6 +345,11 @@ fenced in v0.1 until the Merger module lands.
 - **Chained** — stacks MRs instead of fanning out: ticket N forks from the head of
   N-1's draft MR. `SANDCASTLE_CHAIN=1`, restricted to `chainableBases`, one issue
   per round. Keeps long EPICs reviewable when the loop outpaces human review.
+  The mode **declares itself**: a run with no chainable base refuses at startup
+  (before any agent) rather than silently building unchained, and a ticket whose
+  base is outside `chainableBases` gets a per-ticket warning in the log — it runs
+  unchained and will not see the stack. `SANDCASTLE_DRYRUN=1` returns the same
+  verdict, not a more optimistic one.
 
 ## Auth token isolation
 
