@@ -23,11 +23,11 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/chain.ts` | Chained-MR base resolution — the pure, host-agnostic stack walk. |
 | `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, work-queue enumeration, and the prompt-time command strings). |
 | `.sandcastle/publish.ts` | The publish ledger — a durable trace of a pushed branch whose MR/PR creation failed, drained by the next run (issue #26). |
-| `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts. |
+| `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts, and states the issue's fate (`Closes #n` on the default branch, an explicit why-not note on any other base). |
 | `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
 | `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |
-| `.sandcastle/adopt.ts` | One-command in-place adoption into an existing repo — see [Adopt into an existing repo](#adopt-into-an-existing-repo). |
+| `.sandcastle/adopt.ts` | One-command in-place adoption into an existing repo — copies the config layer, wires the runtime, and puts the config under git in the consumer. See [Adopt into an existing repo](#adopt-into-an-existing-repo). |
 | `.claude/skills/` | The vendored Matt Pocock skills — see [Vendored skills](#vendored-skills). |
 | `skills-lock.json` | Manifest of record for the vendored skills (source + path + content hash each). |
 | `templates/` | Project-context skeletons a consumer fills in after cloning — see [Project context](#consuming-the-factory-clone-and-own). |
@@ -149,8 +149,9 @@ with one command, run from the Factory root:
 npx tsx .sandcastle/adopt.ts /path/to/your-repo   # add --force to re-sync from upstream later
 ```
 
-It does four things, none of which touch the consumer's tracked `.gitignore` or its
-root `package.json` / lockfile:
+It does four things, none of which touch the consumer's tracked root `.gitignore`,
+its root `package.json` / lockfile, or its history (adoption stages; it never
+commits on your behalf):
 
 1. **Copy `.sandcastle/`** — tracked Factory files only (`git archive HEAD`), so the
    copy is secret-free by construction. The Factory's own contract tests
@@ -184,8 +185,21 @@ root `package.json` / lockfile:
    own `{"type":"module"}` package.json. It lands with the step-1 copy and makes
    `main.ts` transpile regardless of your repo's root `package.json` (issue #8) — CJS or
    ESM alike. Adopt repairs it in place only if a stale copy is somehow missing it.
-4. **Ignore `.sandcastle/` locally** — appends to `.git/info/exclude`, so the Factory
-   config stays untracked without editing your committed `.gitignore`.
+4. **Version the config** (issue #29) — `.sandcastle/` is **staged** into your repo, and
+   it stays there: the orchestration configuration is a project deliverable, reviewed
+   and diffed like any other code. `config.ts` carries project decisions —
+   `labelBases` and `chainableBases` decide fork bases and MR targets — that were
+   previously invisible: unversioned, they were neither re-readable in review,
+   restorable with `git checkout --`, nor visible to a fresh clone, and an agent
+   isolated in a linked worktree could not touch them at all. The artifact boundary
+   ships with the copy as a nested, scoped `.sandcastle/.gitignore` (`.env*`, `logs/`,
+   `worktrees/`, the out-of-tree Engine install), so secrets never become tracked —
+   this is exactly the posture the Factory holds on itself. Your root `.gitignore` and
+   `.git/info/exclude` are left alone. A repo adopted **before** this change carries a
+   whole-dir `.sandcastle/` line in its `.git/info/exclude`; adopt reads both that file and
+   your root `.gitignore`, recognises every spelling of the rule (`.sandcastle/`,
+   `/.sandcastle/`, `.sandcastle/*`, `.sandcastle/**`) and prints the exact line to remove —
+   it never edits your ignore files behind your back.
 
 After adopting, fill in the project-context skeletons (they ship in the Factory's
 `templates/`, not in the copy) and then follow [Setup](#setup) from the **Authenticate**
@@ -198,6 +212,14 @@ cp templates/CONTEXT.md /path/to/your-repo/CONTEXT.md   # domain glossary (delet
 $EDITOR /path/to/your-repo/.sandcastle/config.ts
 SANDCASTLE_DRYRUN=1 npx tsx /path/to/your-repo/.sandcastle/main.ts
 ```
+
+> **The configuration is a project deliverable.** Everything under `.sandcastle/`
+> except the runtime artifacts (`.env*`, `logs/`, `worktrees/`, the Engine install)
+> is tracked in your repo from the moment you adopt — `config.ts` included. Edit it,
+> review the diff, and commit it like any other change to your project: a base-branch
+> or queue-label decision made there is exactly as review-worthy as the code it
+> governs. The same boundary file (`.sandcastle/.gitignore`) is what keeps the
+> secret files out — never bypass it with `git add -f` on `.sandcastle/`.
 
 > **`.sandcastle/` is the whole copy.** Adoption ships only the orchestration layer —
 > the same config-only boundary as a greenfield clone ([ADR-0001](docs/adr/0001-factory-scope-config-only.md)).
@@ -292,8 +314,8 @@ The Factory resolves a **`FactoryConfig`** from two layers:
 | `SANDCASTLE_PROFILE` | `split` | Which profile runs: `split` or `opus`. An unknown value throws and names the valid profiles. |
 | `SANDCASTLE_MAX_ITERATIONS` | `10` | Maximum rounds before the loop stops. Must be a positive integer. |
 | `SANDCASTLE_MAX_PARALLEL` | `4` | Max issues worked concurrently in Phase 2. Positive integer. **Forced to `1` when `SANDCASTLE_CHAIN=1`** (a stack is built one MR at a time). |
-| `SANDCASTLE_CHAIN` | off | `1`/`true` (case-insensitive) → on; everything else → off. On, a round forks from the head of the open-MR stack and stacks its MR — see [Chained](#modes) below. |
-| `SANDCASTLE_DRYRUN` | off | `1`/`true` → on. Prints the resolved wiring (profile, per-role model/effort/env with tokens masked, base-branch checks, chain state) and exits. Launches nothing. |
+| `SANDCASTLE_CHAIN` | off | `1`/`true` (case-insensitive) → on; everything else → off. On, a round forks from the head of the open-MR stack and stacks its MR — see [Chained](#modes) below. **Refuses at startup** (before the planner runs) when no base of the round can chain — `chainableBases` empty or naming no base a ticket derives — with a message naming both `labelBases` and `chainableBases`: neither setting suffices alone. |
+| `SANDCASTLE_DRYRUN` | off | `1`/`true` → on. Prints the resolved wiring (profile, per-role model/effort/env with tokens masked, base-branch checks, chain state) and exits. Launches nothing. Renders the **same chain verdict as a live run** — the startup refusal fires here too, and the chain report names the derivable bases that would not chain (the live per-ticket warnings). |
 | `SANDCASTLE_ONLY` | unset | A comma list of positive issue numbers to restrict the round to (e.g. `42` or `42,43`). The planner is told the allow-list, and `main.ts` **enforces** it on the result — issues outside the list are dropped even if the planner proposed them. If none match, the round stops. |
 | `SANDCASTLE_FORCE` | off | `1`/`true` → on. **Requires `SANDCASTLE_ONLY`** (config throws otherwise). Tells the planner to re-propose the `ONLY` issues even if they already have an open MR or appear resolved — a deliberate re-run. |
 
@@ -311,7 +333,7 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 | `baseBranch` | `string` | `'main'` | The project trunk. A live run fast-forwards each base to `origin` before agents fork, so a round never builds on stale code; a base curated locally ahead of origin is kept as-is (#14). |
 | `labelBases` | `Record<string,string>` | `{}` | Issue label → base branch. Empty ⇒ every issue forks from `baseBranch`. |
 | `queueLabels` | `string[]` | `['sandcastle', 'ready-for-agent']` | Queue trigger labels — an open issue carrying ANY of these is candidate work. Default accepts both so the Factory (`sandcastle`) and captable (`ready-for-agent`) queue with no relabelling; narrow per consumer (#15). |
-| `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Empty ⇒ chaining is inert even with `SANDCASTLE_CHAIN=1`. |
+| `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Must name at least one base the round's tickets can derive (a `labelBases` value, or `baseBranch`) when `SANDCASTLE_CHAIN=1` — otherwise the run **refuses at startup**, naming both `labelBases` and `chainableBases`. A ticket whose derived base is not listed still runs, **unchained, with a per-ticket warning** in the log. |
 | `assignee` | `string \| null` | `'@me'` | Host assignee. gh accepts `@me`; a GitLab consumer gives a real username (glab wants one). `null` ⇒ leave the MR/PR unassigned. |
 | `worktreeExclude` | `string[]` | `['.pnpm-store/']` | Gitignore patterns for generated artifacts (package-manager stores, …) the Engine's "uncommitted changes" check would otherwise flag in an agent worktree. Written to the shared `.git/info/exclude`, so a tracked-but-uncommitted change still warns (#20). |
 
@@ -356,6 +378,11 @@ fenced in v0.1 until the Merger module lands.
 - **Chained** — stacks MRs instead of fanning out: ticket N forks from the head of
   N-1's draft MR. `SANDCASTLE_CHAIN=1`, restricted to `chainableBases`, one issue
   per round. Keeps long EPICs reviewable when the loop outpaces human review.
+  The mode **declares itself**: a run with no chainable base refuses at startup
+  (before any agent) rather than silently building unchained, and a ticket whose
+  base is outside `chainableBases` gets a per-ticket warning in the log — it runs
+  unchained and will not see the stack. `SANDCASTLE_DRYRUN=1` returns the same
+  verdict, not a more optimistic one.
 
 ## Auth token isolation
 

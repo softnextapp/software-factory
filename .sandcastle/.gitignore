@@ -1,0 +1,27 @@
+# Runtime artifacts a run materializes locally — never part of the config.
+# The config layer is TRACKED on purpose (issue #29): config.ts holds project
+# decisions (labelBases, chainableBases, queue labels, base branch) that belong
+# in review and in history — diffable, restorable, visible to every clone and
+# to agents working in linked worktrees. Only what a machine generates below
+# stays out: secrets (.env*), logs, agent worktrees, the out-of-tree Engine
+# install (#22) with its local store and standalone lockfiles (#23). The examples are negated
+# back in so `git archive` keeps shipping the templates.
+.env*
+!.env*.example
+logs/
+worktrees/
+node_modules/
+# Push-but-no-MR resume state (issue #26): a run materializes it when a branch
+# was pushed but its MR never opened; the next round reads it back to resume.
+publish-pending.json
+.pnpm-store/
+# One line per package manager adopt.ts can detect (its LOCKFILES table): the
+# out-of-tree Engine install runs with cwd:.sandcastle/, so whichever manager the
+# consumer uses writes ITS lockfile right here. Listing only npm's and pnpm's
+# would let a yarn or bun consumer commit a generated lockfile the moment step 4
+# stages the directory — the very leak #23 closed.
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+bun.lock
+bun.lockb
