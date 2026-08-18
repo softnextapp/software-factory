@@ -27,17 +27,13 @@
 // to do once it runs. `verification` stays what it always was — what the agent RAN;
 // `test_steps` is what the HUMAN must run. Conflating the two makes both worthless.
 //
+// Right under the header the body states WHAT HAPPENS TO THE ISSUE — `Closes #n`, or
+// an explicit "this MR will NOT close #n, and here is who owns the closing". That one
+// line is DERIVED, and the rationale for it lives on `decideIssueClosure` (issue #27).
+//
 // Everything here is pure and synchronous: the callers collect the raw strings, this
 // module turns them into a title and a markdown body. Tests: `npx tsx
 // .sandcastle/mr-body.test.ts`.
-//
-// The body also states, right under the header, WHAT HAPPENS TO THE ISSUE (issue #27):
-// `Closes #n` when the MR targets the project's default branch, or an explicit
-// "this MR will NOT close #n, and here is who owns the closing" when it targets any
-// other base (a staging base, a stacked branch). Both hosts close an issue only when
-// the carrying MR merges into the default branch — so on every other base the defect
-// was not the missing keyword but the silence: nothing warned the reviewer that the
-// issue would outlive the merge.
 //
 // This is the Factory's canonical copy. It replaces the three near-identical
 // per-instance duplicates (api/.sandcastle/mr-body.mts, back-office/ and
@@ -173,7 +169,9 @@ export interface MrBodyInput {
   base: string;
   /** The project trunk (`ProjectConfig.baseBranch`). The closure decision compares
    *  `base` against THIS — not against `origin/HEAD` or a hardcoded name — so a
-   *  consumer whose trunk is `master` or `develop` gets the right answer too. */
+   *  consumer whose trunk is `master` or `develop` gets the right answer too. Blank or
+   *  absent ⇒ no keyword and the body says the trunk is unknown (see
+   *  {@link decideIssueClosure}), never a `Closes` the merge would ignore. */
   defaultBranch: string;
   summary: MrSummary | null;
   /** Set when a `<mr-summary>` block was present but unusable — surfaced in the body. */
@@ -447,17 +445,44 @@ export interface ClosureDecision {
  * (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved) is closed and
  * has no translatable equivalent — « Ferme #5 » cross-links but closes nothing.
  * The NOTE around it is prose and may be French, like the rest of the body.
+ *
+ * Either name missing (a consumer config with no `baseBranch`, an older caller that
+ * does not pass `defaultBranch`) is the one case where neither answer is honest: the
+ * file's robustness rule applies, so we degrade to "no keyword, close by hand"
+ * rather than emit a `Closes` the merge will not honour — two blank strings compare
+ * equal, and that equality would otherwise become a false promise.
  */
-export function decideIssueClosure(base: string, defaultBranch: string, issueNumber: number): ClosureDecision {
-  if (base === defaultBranch) {
+export function decideIssueClosure(
+  base: string,
+  defaultBranch: string,
+  issueNumber: number,
+): ClosureDecision {
+  // Trimmed on purpose: the two names come from different sources (an issue's
+  // resolved base vs the project config), and a stray space must not read as a
+  // different branch.
+  const target = (base ?? '').trim();
+  const trunk = (defaultBranch ?? '').trim();
+
+  if (!target || !trunk) {
+    return {
+      closes: false,
+      line:
+        `**Fermeture de l’issue** : la branche par défaut du projet n’a pas pu être ` +
+        `déterminée — cette MR ne porte donc aucun mot-clé de fermeture et ne fermera ` +
+        `**pas** #${issueNumber}. À fermer à la main après la fusion.`,
+    };
+  }
+
+  if (target === trunk) {
     return { closes: true, line: `Closes #${issueNumber}` };
   }
+
   return {
     closes: false,
     line:
-      `**Fermeture de l’issue** : cette MR cible \`${base}\`, pas \`${defaultBranch}\` — ` +
+      `**Fermeture de l’issue** : cette MR cible \`${target}\`, pas \`${trunk}\` — ` +
       `elle ne fermera **pas** #${issueNumber}. La fermeture revient à la MR ` +
-      `\`${base} → ${defaultBranch}\`, ou se fait à la main.`,
+      `\`${target} → ${trunk}\`, ou se fait à la main.`,
   };
 }
 
@@ -726,6 +751,11 @@ export function buildMrDescription(input: MrBodyInput): string {
   // is the one line the merge itself acts on (issue #27). `Closes #n` only when the
   // target IS the default branch; every other base gets the why-not note instead,
   // never a keyword that would silently do nothing.
+  //
+  // Scope of that guarantee: it covers THIS line. The AUTHORED sections below are
+  // rendered verbatim, so an implementer who writes "fixes #12" in `why` still hands
+  // the host a real keyword — a pre-existing property of the authored half, not
+  // something this line can undo. Scrubbing agent prose is a separate decision.
   parts.push(decideIssueClosure(base, defaultBranch, issue.number).line);
 
   // A stacked MR is the single most misread shape in chained mode: merged in the
