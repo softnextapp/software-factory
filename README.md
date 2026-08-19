@@ -386,7 +386,70 @@ fenced in v0.1 until the Merger module lands.
   the bases the queued tickets derive): asked-but-unbuildable reads `off`, the
   log states the downgrade — the relaxed `Blocked by:` rule never rests on a
   stack no branch will have. `SANDCASTLE_DRYRUN=1` returns the same verdict, not
-  a more optimistic one.
+  a more optimistic one. For turning it on, see
+  [Enabling Chained mode](#enabling-chained-mode-step-by-step) below.
+
+### Enabling Chained mode (step by step)
+
+Chained is opt-in **twice**: a config field designates the bases that may carry a
+stack, and the env var activates the mode for the run. Neither suffices alone —
+the startup guard names both settings when one is missing.
+
+**1. Designate a chainable base in `config.ts`.** A chainable base must be one the
+round's tickets can derive — a `labelBases` value, or `baseBranch` itself. The
+intended shape is a **per-effort staging branch**, not the trunk: the stack head
+is picked by "most recent open MR", a rule that is safe on a private staging
+branch and nowhere else — on the trunk it would adopt whatever unrelated MR
+happens to be open (a colleague's, a bot's) as the next ticket's foundation.
+
+```ts
+// .sandcastle/config.ts — DEFAULT_PROJECT_CONFIG
+labelBases:      { 'epic:rgaa': 'epic/rgaa-accessibilite' }, // the effort's issues carry the label
+chainableBases:  ['epic/rgaa-accessibilite'],                 // …and that base may carry a stack
+```
+
+A flat repo (no `labelBases`) may chain on its trunk — `chainableBases: ['main']`
+— accepting that any open MR against `main` becomes the stack head.
+
+**2. Check the verdict with a dry run.** The startup refusal fires identically
+here and in a live run — the dry run returns the *same* verdict, never a more
+optimistic one:
+
+```sh
+SANDCASTLE_CHAIN=1 SANDCASTLE_DRYRUN=1 npx tsx .sandcastle/main.ts
+```
+
+With no derivable base chainable, this exits non-zero naming both `labelBases`
+and `chainableBases` — fix step 1. When feasible, the report's `chain` block
+names the chainable bases, the derivable bases that will not chain
+(`unchainableDerivableBases` — the live run's per-ticket warnings, visible before
+any agent runs), per chainable base the stack as it stands (`wouldForkFrom`, the
+MR list, any `rivals` — two MRs on the same base, the most recent won), and
+`plannerMode`: the **effective** mode the planner would receive over tonight's
+queue, downgrades included — feasible config whose queued tickets all derive
+unchainable bases reads `off`, not `on`.
+
+**3. Run.**
+
+```sh
+SANDCASTLE_CHAIN=1 npx tsx .sandcastle/main.ts
+```
+
+One issue per round (`SANDCASTLE_MAX_PARALLEL` is forced to `1`): the first
+ticket of a wave forks from the chainable base as usual and opens the stack's
+root MR against it; every subsequent round forks from — and targets — the head of
+that stack. The log narrates the walk (`no open MR on … — starting a new stack`,
+`N unmerged MR(s) stacked on …`, `forking from and targeting …`). A ticket whose
+derived base is outside `chainableBases` still runs — unchained, with the
+per-ticket warning: the startup guard proved the round *can* chain, not that
+every ticket does.
+
+**4. Review bottom-up.** A stack is only as healthy as its lowest unmerged MR:
+merge from the root up (merging the head first would drag the root's commits in
+under the wrong name), expect the host to retarget the MR above when a merge
+deletes the source branch (a kept branch means retargeting by hand), and know
+that a rejected ticket poisons everything stacked above it. That trade —
+merge-order freedom for the ability to keep going — is the mode's whole point.
 
 ## Auth token isolation
 
