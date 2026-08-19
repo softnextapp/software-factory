@@ -6,7 +6,7 @@
 // signature-contract cases. Pure: no network, no process.env.
 // Run: npx tsx .sandcastle/plan.test.ts
 import assert from 'node:assert/strict';
-import { baseForLabels, parsePlan, applyOnly } from './plan.ts';
+import { baseForLabels, parsePlan, applyOnly, queueChainBases } from './plan.ts';
 import { test, throws, finish } from './test-harness.ts';
 
 // A representative project: a trunk plus one label-routed epic base. allowedBases is
@@ -166,6 +166,59 @@ test('only with a single entry restricts to that one issue', () => {
   const r = applyOnly(PLANNED, [42]);
   assert.equal(r.kept.length, 1);
   assert.equal(r.kept[0]?.number, 42);
+});
+
+// --- queueChainBases (the round's bases, issue #30) --------------------------
+//
+// The half of the planner-chain-mode derivation that reads the ROUND: labels →
+// base, narrowed by SANDCASTLE_ONLY, deduped. chain.test.ts holds the verdict
+// taken over these bases; these cases hold the bases themselves — a wrong list
+// here makes a correct predicate say `on` on a round that cannot chain.
+
+const CHAIN_CFG = { labelBases: LABEL_BASES, baseBranch: 'main', only: null };
+const QUEUE = [
+  { number: 7, labels: ['sandcastle'] },
+  { number: 8, labels: ['sandcastle', 'accessibilite'] },
+  { number: 9, labels: ['sandcastle'] },
+];
+
+test('queueChainBases: the distinct bases of the queue, queue order, deduped', () => {
+  // #7 and #9 both derive the trunk; `main` must appear once — the list is quoted
+  // back to the operator in the downgrade message.
+  assert.deepEqual(queueChainBases(QUEUE, CHAIN_CFG), ['main', 'epic/rgaa-accessibilite']);
+});
+
+test('queueChainBases: an empty queue derives no base (no throw, no phantom trunk)', () => {
+  assert.deepEqual(queueChainBases([], CHAIN_CFG), []);
+});
+
+test('queueChainBases: a ticket with no labels at all falls back to the trunk', () => {
+  assert.deepEqual(queueChainBases([{ number: 7, labels: [] }], CHAIN_CFG), ['main']);
+});
+
+test('queueChainBases: ONLY narrows the round — the epic ticket outside the list is not counted', () => {
+  // The trap SANDCASTLE_ONLY opens: a round restricted to the `main` ticket must not
+  // inherit #8's epic base, or the mode would read `on` over a round that builds on
+  // the trunk alone.
+  assert.deepEqual(queueChainBases(QUEUE, { ...CHAIN_CFG, only: [7] }), ['main']);
+});
+
+test('queueChainBases: ONLY keeping the epic ticket derives the epic base alone', () => {
+  assert.deepEqual(queueChainBases(QUEUE, { ...CHAIN_CFG, only: [8] }), [
+    'epic/rgaa-accessibilite',
+  ]);
+});
+
+test('queueChainBases: ONLY matching nothing queued derives no base', () => {
+  // Not a crash and not the trunk: an empty round, which decidePlannerChainMode
+  // deliberately treats as "no downgrade" (it selects nothing).
+  assert.deepEqual(queueChainBases(QUEUE, { ...CHAIN_CFG, only: [999] }), []);
+});
+
+test('queueChainBases: an empty labelBases map derives the trunk only', () => {
+  // The Factory's own config (labelBases: {}) — a flat repo cannot produce a second
+  // base however its tickets are labelled.
+  assert.deepEqual(queueChainBases(QUEUE, { ...CHAIN_CFG, labelBases: {} }), ['main']);
 });
 
 finish();
