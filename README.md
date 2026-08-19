@@ -20,9 +20,12 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/config.ts` | The canonical config surface — `RunConfig` × `ProjectConfig` → `FactoryConfig`. |
 | `.sandcastle/main.ts` | The **Orchestration**: the converged `plan → implement+review → publish` loop. |
 | `.sandcastle/plan.ts` | Parses the planner's `<plan>` JSON; label → base resolution. |
+| `.sandcastle/{plan,implement,review}-prompt.md` | The three agent prompts the Engine's `promptFile` loads — the planner's receives the queue inline and the effective `CHAIN_MODE`/`ONLY`/`FORCE` knobs. |
 | `.sandcastle/chain.ts` | Chained-MR base resolution — the pure, host-agnostic stack walk. |
-| `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, work-queue enumeration, and the prompt-time command strings). |
+| `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, work-queue enumeration, and the prompt-time command strings). Host reads retry on transient failure (#25) and classify their failure as transient vs definitive (#31). |
 | `.sandcastle/publish.ts` | The publish ledger — a durable trace of a pushed branch whose MR/PR creation failed, drained by the next run (issue #26). |
+| `.sandcastle/iteration.ts` | The per-iteration failure boundary — the pure decision of whether a failure loses its iteration or stops the run (issue #31). `main.ts` owns the try/catch. |
+| `.sandcastle/branch-sweep.ts` | Per-run unique branch names (`-r<run>` suffix) and the startup sweep of dead runs' empty branches (issue #28). |
 | `.sandcastle/mr-body.ts` | Builds Draft-MR titles + descriptions from agent output + git/host facts, and states the issue's fate (`Closes #n` on the default branch, an explicit why-not note on any other base). |
 | `.sandcastle/Dockerfile.base` | The universal Sandcastle runtime base image recipe — the layer every consumer image is built `FROM`. See [Sandbox image](#sandbox-image). |
 | `.sandcastle/*.test.ts` | Contract tests (run with `npm test`). |
@@ -61,6 +64,16 @@ merged-and-deleted, trace cleared). While a trace is pending, its issue is held 
 of the planner queue so the ticket is never re-implemented on a duplicate branch
 (issue #26). `SANDCASTLE_FORCE=1 SANDCASTLE_ONLY=<n>` bypasses the hold — the
 operator asked for the re-run.
+
+A failure inside the loop is **bounded to its iteration** (issue #31): a host
+read that outlives its retries (#25's backoff spent on a long-enough outage)
+ends its *iteration*, not the run — the next iteration's first act is a fresh
+queue read on a host that may have healed, and everything delivered before the
+failure stays. A **definitive** host failure (bad credentials, exhausted quota)
+or any non-host throw (a config error, a bug in the loop) still stops the run —
+retrying ten iterations on an invalid token is ten losses, not ten chances.
+Lost iterations are counted and named in the log, never silent, and a run that
+lost *all* of them exits non-zero.
 
 The **Agent roles** are Planner, Implementer, Reviewer — plus an optional Merger
 (only under `MERGE_STRATEGY=agent`, fenced in v0.1). The active **Profile** fixes
@@ -121,7 +134,7 @@ $EDITOR .sandcastle/.env.secrets
 
 # 5b. Provide the host-CLI token so the in-sandbox `gh`/`glab` the planner/implementer
 #     run is authed. resolveEnv merges .env into every sandbox — no main.ts patch needed.
-#     Set the var matching your gitHost: GH_TOKEN (gh) / GITLAB_TOKEN (glab). Skip for `local`.
+#     Set the var matching your gitHost: GH_TOKEN (gh) / GITLAB_TOKEN (glab).
 cp .sandcastle/.env.example .sandcastle/.env                    # optional fallback
 echo "GH_TOKEN=$(gh auth token)" >> .sandcastle/.env            # or GITLAB_TOKEN=$(glab auth token)
 
@@ -425,11 +438,13 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 | `profiles` | `Profiles` | see below | Per-profile role → provider bindings. |
 | `mergeStrategy` | `'agent' \| 'human'` | `'human'` | Who merges. `human` = Draft MRs await review (v0.1). `agent` = a Merger auto-merges (fenced). |
 | `commitStyle` | `'ralph' \| 'conventional'` | `'conventional'` | MR title style. `conventional` keeps titles valid Conventional Commit headers. |
-| `gitHost` | `'gh' \| 'glab'` | `'gh'` | Host integration (`gh` = GitHub, `glab` = GitLab). Both are wired in v0.1 — see `host.ts`. |
+| `gitHost` | `'gh' \| 'glab' \| 'local'` | `'gh'` | Host integration (`gh` = GitHub, `glab` = GitLab). Both are wired in v0.1 — see `host.ts`. `'local'` is token-exempt but **fenced** — see [v0.1 scope](#v01-scope). |
 | `baseBranch` | `string` | `'main'` | The project trunk. A live run fast-forwards each base to `origin` before agents fork, so a round never builds on stale code; a base curated locally ahead of origin is kept as-is (#14). |
 | `labelBases` | `Record<string,string>` | `{}` | Issue label → base branch. Empty ⇒ every issue forks from `baseBranch`. |
 | `queueLabels` | `string[]` | `['sandcastle', 'ready-for-agent']` | Queue trigger labels — an open issue carrying ANY of these is candidate work. Default accepts both so the Factory (`sandcastle`) and captable (`ready-for-agent`) queue with no relabelling; narrow per consumer (#15). |
 | `chainableBases` | `string[]` | `[]` | Bases eligible for Chained mode. Must name at least one base the round's tickets can derive (a `labelBases` value, or `baseBranch`) when `SANDCASTLE_CHAIN=1` — otherwise the run **refuses at startup**, naming both `labelBases` and `chainableBases`. A ticket whose derived base is not listed still runs, **unchained, with a per-ticket warning** in the log. |
+| `hooks` | `SandboxHooks` | `{}` | Sandbox lifecycle hooks (install / `sandbox-setup`). The Factory ships none — the toolchain is repo-specific; a consumer sets one here instead of editing `main.ts` (#19). |
+| `copyToWorktree` | `string[]` | `['node_modules']` | Paths copied from the host worktree into each sandbox. A pnpm repo sets `[]` — pnpm rejects a host-copied `node_modules` (`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`, #19). |
 | `assignee` | `string \| null` | `'@me'` | Host assignee. gh accepts `@me`; a GitLab consumer gives a real username (glab wants one). `null` ⇒ leave the MR/PR unassigned. |
 | `worktreeExclude` | `string[]` | `['.pnpm-store/']` | Gitignore patterns for generated artifacts (package-manager stores, …) the Engine's "uncommitted changes" check would otherwise flag in an agent worktree. Written to the shared `.git/info/exclude`, so a tracked-but-uncommitted change still warns (#20). |
 
@@ -598,7 +613,7 @@ that safe):
 # .sandcastle/.env  (gitignored — resolveEnv merges this into every sandbox)
 GH_TOKEN=...        # gitHost: 'gh' (default)
 GITLAB_TOKEN=...    # gitHost: 'glab'
-# gitHost: 'local' → none (no host CLI, no token required)
+# 'local' needs no host token — but it is fenced in v0.1 (see v0.1 scope).
 ```
 
 `main.ts` resolves the host token **env-first against `.env`** (not `.env.secrets` —
@@ -654,6 +669,7 @@ self-hosted loop runs); a GitLab project flips `gitHost: 'glab'` in `config.ts`.
 | Capability | Guard | Status |
 |---|---|---|
 | `mergeStrategy: 'agent'` (the auto-merging Merger role) | `main.ts` throws if `mergeStrategy !== 'human'` | Follow-up module. |
+| `gitHost: 'local'` (no tracker, no host CLI) | `main.ts` throws if `gitHost` is neither `'gh'` nor `'glab'` | Token-exempt already (the token layer knows `'local'`); the no-tracker loop is a follow-up. |
 
 `gitHost: 'gh'` is **no longer fenced** — the GitHub host landed in `host.ts`, and the
 loop warns at startup when `gitHost` disagrees with the `origin` remote's host.
@@ -663,11 +679,17 @@ loop warns at startup when `gitHost` disagrees with the `origin` remote's host.
 ## Developing
 
 ```sh
-npm test          # config + tokens + plan + chain + host + skills-lock + dockerfile-base + adopt + esm-shim contract tests
+npm test          # every .sandcastle/*.test.ts, one process per file via test-harness.ts
 npm run typecheck # tsc --noEmit over .sandcastle/
 npm run skills:check  # verify .claude/skills/ against skills-lock.json
 npm run image:check   # verify .sandcastle/Dockerfile.base against the universal-runtime contract
+SANDCASTLE_DRYRUN=1 npx tsx .sandcastle/main.ts   # config smoke: print the resolved wiring, launch nothing
 ```
+
+A new `*.test.ts` must be added to the `test` script in `package.json` — the
+script is an explicit per-file list, not a glob. Every `.sandcastle/*.ts` change
+must keep the config smoke green — it is the cheapest end-to-end read of the
+config surface.
 
 Tests are pure (no network, no secrets, no `process.env`) and use `node:assert/strict`
 under `tsx` — no test framework dependency. Each `*.test.ts` runs as its own process
