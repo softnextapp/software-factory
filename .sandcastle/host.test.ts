@@ -40,6 +40,7 @@ import {
   classifyHostFailure,
   hostRetryPlanFor,
   runHostRead,
+  HostReadError,
   HOST_READ_ATTEMPTS,
   HOST_RETRY_BASE_DELAY_MS,
   HOST_RETRY_JITTER_MS,
@@ -774,6 +775,82 @@ test('runHostRead: a first-try success never sleeps and never logs', () => {
   assert.equal(run(), '[]');
   assert.deepEqual(state.slept, []);
   assert.deepEqual(state.logged, []);
+});
+
+// --- the throw's SHAPE (issue #31) -------------------------------------------
+//
+// The per-iteration boundary in main.ts discriminates on the #25 classification
+// the spent retry carries OUT with it, so the throw must be a HostReadError
+// with verb + failure + the original error as `cause` — not the raw
+// execFileSync error, whose (status, stderr) happen to carry the same facts but
+// promise nothing. Pinned here so the seam the boundary consumes is a contract.
+
+test('runHostRead: a spent retry throws a HostReadError carrying the classification out (issue #31)', () => {
+  const { run } = recordedRead([{ status: 1, stderr: GLAB_503 }]);
+  let thrown: unknown;
+  try {
+    run();
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof HostReadError, `HostReadError, got ${String(thrown)}`);
+  assert.equal(thrown.verb, 'issue view 42');
+  assert.equal(thrown.failure.retryable, true);
+  assert.equal(thrown.failure.reason, 'outage');
+  // The original execFileSync-shaped error rides along, stderr intact.
+  assert.ok((thrown.cause as { stderr?: string }).stderr?.includes('503'));
+});
+
+test('runHostRead: a definitive failure ALSO throws HostReadError, with retryable=false', () => {
+  const { run } = recordedRead([{ status: 1, stderr: GH_401 }]);
+  let thrown: unknown;
+  try {
+    run();
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof HostReadError);
+  assert.equal(thrown.failure.retryable, false);
+  assert.equal(thrown.failure.reason, 'auth');
+  // One line: the iteration boundary prints this verbatim under its banner.
+  assert.equal(thrown.message.split('\n').length, 1, thrown.message);
+});
+
+test('HostReadError: message names the verb and the reason — readable in a bare stack', () => {
+  const error = new HostReadError('gh issue list --label sandcastle', { retryable: true, reason: 'outage' }, new Error('x'));
+  assert.ok(error.message.includes('gh issue list --label sandcastle'), error.message);
+  assert.ok(error.message.includes('outage'), error.message);
+  assert.equal(error.name, 'HostReadError');
+});
+
+test('HostReadError: a cause that is not an Error degrades to a legible line, never a TypeError', () => {
+  // The retry reads (status, stderr, message) off whatever the injected read threw,
+  // and nothing promises that is an object. A TypeError raised while classifying
+  // would leave the retry as a NON-host throw, which the #31 boundary stops the run
+  // on — an outage mistaken for a bug.
+  for (const cause of [null, undefined, 'a thrown string', 7, { stderr: 42 }]) {
+    const error = new HostReadError('gh issue list', { retryable: true, reason: 'outage' }, cause);
+    assert.ok(error.message.includes('no stderr captured'), `${String(cause)}: ${error.message}`);
+    assert.equal(error.message.split('\n').length, 1, error.message);
+  }
+});
+
+test('runHostRead: a read that throws a NON-Error still surfaces as a retryable HostReadError', () => {
+  // No status and no stderr is what classifyHostFailure calls an outage, so the
+  // read burns all its attempts and hands the boundary something it can absorb.
+  const slept: number[] = [];
+  let thrown: unknown;
+  try {
+    runHostRead('issue view 42', () => {
+      throw null;
+    }, { sleep: (ms) => slept.push(ms), log: () => {}, random: () => 0 });
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof HostReadError, `HostReadError, got ${String(thrown)}`);
+  assert.equal(thrown.failure.retryable, true);
+  assert.equal(thrown.failure.reason, 'outage');
+  assert.equal(slept.length, HOST_READ_ATTEMPTS - 1, 'every attempt was spent');
 });
 
 // --- the classifier's remaining corners ------------------------------------
