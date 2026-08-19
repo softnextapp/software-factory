@@ -247,11 +247,31 @@ Everything gitignored inside `.sandcastle/` is therefore **gone, not overwritten
 
 | File in the consumer | Recoverable from the consumer's git? | Before re-syncing |
 |---|---|---|
-| `config.ts` — the project identity (`gitHost`, `labelBases`, `queueLabels`, `assignee`, providers…) | Yes — tracked since #29 | Nothing, but see step 2 |
+| `config.ts` — the project identity (`gitHost`, `labelBases`, `queueLabels`, `assignee`, providers…) | Yes — tracked since #29 | Nothing, but see step 3 |
 | `.env` (host-CLI token), `.env.secrets` (provider tokens) | No — ignored by design | Copy out of the tree |
 | `Dockerfile` — the project layer | Yes **iff committed** | Commit it if it is not |
 | `publish-pending.json` — the publish ledger (issue #26) | No — ignored | Copy out if present and non-empty |
 | `logs/`, `worktrees/` | Regenerable | Nothing |
+
+One gesture covers every row — copy the whole directory out of the tree, and
+delete the copy when done (it holds the tokens):
+
+```sh
+cp -r /path/to/consumer/.sandcastle /tmp/consumer-sandcastle-backup
+```
+
+Which rows git actually answers for depends on the consumer's **posture** —
+check before relying on it (run inside the consumer):
+
+```sh
+git ls-files .sandcastle/ | wc -l    # 0 → adopted BEFORE #29: nothing tracked
+```
+
+A consumer adopted **before #29** ignores the whole directory (a
+`.git/info/exclude` or root `.gitignore` line — adopt warns about it and names
+the line) and tracks **nothing**: for it the backup is the only recovery path
+for `config.ts` and `Dockerfile` too, and step 3 restores from the backup
+instead of from git.
 
 And never re-sync while a run is active — live worktrees and a non-empty ledger
 belong to that run.
@@ -263,13 +283,26 @@ its own working tree is irrelevant; only its `HEAD` matters):
 npx tsx .sandcastle/adopt.ts /path/to/consumer --force
 ```
 
-**3. Restore the project identity.** `git checkout -- .sandcastle/config.ts`
-brings the consumer's own config back — the re-sync only touched the working
-tree, not the consumer's history. **Caveat:** when the Factory release added
-config fields, the restored file may be incomplete for the new `main.ts`;
-start from the freshly copied `config.ts` instead and re-apply the project
-identity on top (`git diff` between the two shows exactly the drift). Restore
-the backed-up `.env` / `.env.secrets` / `publish-pending.json` too.
+**3. Restore the project identity, then diff it against the fresh copy.**
+Post-#29 consumer (config tracked): `git checkout -- .sandcastle/config.ts`
+brings yours back — the re-sync only touched the working tree, not the
+consumer's history — and since adopt re-staged the Factory's fresh copy,
+`git diff -- .sandcastle/config.ts` shows exactly the drift, in both
+directions. Pre-#29 consumer (nothing tracked): restore from the backup
+(`config.ts` and the project `Dockerfile`), and diff against the fresh copy
+before overwriting it:
+
+```sh
+diff /tmp/consumer-sandcastle-backup/config.ts /path/to/consumer/.sandcastle/config.ts
+```
+
+Read the diff before deciding: if it shows only the consumer's identity values,
+the restored file is complete — keep it. If it shows **new Factory-side
+fields** (a config surface this release added), the old file is incomplete for
+the new `main.ts` — start from the freshly copied `config.ts` instead and
+re-apply the identity (`gitHost`, `labelBases`, `queueLabels`, `assignee`,
+providers…) on top. Restore the backed-up `.env` / `.env.secrets` /
+`publish-pending.json` in the same pass.
 
 **4. Validate and commit, from the consumer root:**
 
@@ -282,6 +315,12 @@ Adopt stages; it never commits on the consumer's behalf. The re-sync lands as an
 ordinary reviewed change — the config is a project deliverable (issue #29, step 4
 of the adopt list above), and an upstream sync is exactly as review-worthy as the
 code it governs.
+
+A pre-#29 consumer should **migrate here** rather than stay on the backup-only
+posture: adopt's warning names the exact whole-dir ignore line to remove
+(`.git/info/exclude` or the root `.gitignore`) — remove it, and this step's
+staging turns the config into a tracked deliverable, so the **next** re-sync
+recovers `config.ts` from git instead of from a `/tmp` copy.
 
 ### Sandbox image
 
