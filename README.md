@@ -158,8 +158,9 @@ commits on your behalf):
    (`*.test.ts` / `*.spec.ts`) and test harness are stripped from the copy, so a
    consumer's test runner (vitest/jest) doesn't collect them as red files (issue #22).
    It refuses to clobber an already-adopted `.sandcastle/`; `--force` re-syncs from the
-   Factory HEAD (this overwrites the tracked files, including `config.ts` — back up
-   local edits first).
+   Factory HEAD — and it **deletes the consumer's whole `.sandcastle/` first,
+   gitignored files included**, before re-copying. See
+   [Re-syncing a consumer after Factory changes](#re-syncing-a-consumer-after-factory-changes).
 2. **Wire the runtime** — two locations, chosen so the consumer's tracked root manifest
    stays clean (issue #22):
    - **Dev tools** (`tsx` / `typescript` / `@types/node`) → your repo's **root**. These
@@ -225,6 +226,62 @@ SANDCASTLE_DRYRUN=1 npx tsx /path/to/your-repo/.sandcastle/main.ts
 > the same config-only boundary as a greenfield clone ([ADR-0001](docs/adr/0001-factory-scope-config-only.md)).
 > The project-context skeletons (`templates/CLAUDE.md`, `templates/CONTEXT.md`) and
 > your sandbox project layer (`.sandcastle/Dockerfile`) are yours to add afterward.
+
+### Re-syncing a consumer after Factory changes
+
+Consumption is clone-and-own ([ADR-0002](docs/adr/0002-consumption-template-model.md)):
+drift after adoption is expected, and pulling upstream improvements in is a manual
+gesture — the same command that adopted the consumer, re-run with `--force`. The
+procedure below is written from the consumer's side and is self-contained: an agent
+(or human) in the consumer repo needs only a Factory clone at the revision to adopt.
+
+**Prerequisite — Factory side.** The changes (bug fixes, features) must be
+**committed on the Factory's `main`**: the copy streams `git archive HEAD`, so
+Factory work still sitting in a working tree does not travel.
+
+**1. Back up what `--force` destroys.** `--force` does not merge — it deletes the
+consumer's whole `.sandcastle/` directory before re-copying the tracked Factory
+files, re-stripping the Factory's dev-only tests (issue #22), re-wiring the
+runtime (the out-of-tree Engine install is rebuilt), and re-staging `.sandcastle/`.
+Everything gitignored inside `.sandcastle/` is therefore **gone, not overwritten**:
+
+| File in the consumer | Recoverable from the consumer's git? | Before re-syncing |
+|---|---|---|
+| `config.ts` — the project identity (`gitHost`, `labelBases`, `queueLabels`, `assignee`, providers…) | Yes — tracked since #29 | Nothing, but see step 2 |
+| `.env` (host-CLI token), `.env.secrets` (provider tokens) | No — ignored by design | Copy out of the tree |
+| `Dockerfile` — the project layer | Yes **iff committed** | Commit it if it is not |
+| `publish-pending.json` — the publish ledger (issue #26) | No — ignored | Copy out if present and non-empty |
+| `logs/`, `worktrees/` | Regenerable | Nothing |
+
+And never re-sync while a run is active — live worktrees and a non-empty ledger
+belong to that run.
+
+**2. Run the re-sync from the Factory root** (a clone at the revision you want —
+its own working tree is irrelevant; only its `HEAD` matters):
+
+```sh
+npx tsx .sandcastle/adopt.ts /path/to/consumer --force
+```
+
+**3. Restore the project identity.** `git checkout -- .sandcastle/config.ts`
+brings the consumer's own config back — the re-sync only touched the working
+tree, not the consumer's history. **Caveat:** when the Factory release added
+config fields, the restored file may be incomplete for the new `main.ts`;
+start from the freshly copied `config.ts` instead and re-apply the project
+identity on top (`git diff` between the two shows exactly the drift). Restore
+the backed-up `.env` / `.env.secrets` / `publish-pending.json` too.
+
+**4. Validate and commit, from the consumer root:**
+
+```sh
+SANDCASTLE_DRYRUN=1 npx tsx .sandcastle/main.ts   # resolved wiring, launches nothing
+git status      # adopt re-staged .sandcastle/ — review the diff, then commit it
+```
+
+Adopt stages; it never commits on the consumer's behalf. The re-sync lands as an
+ordinary reviewed change — the config is a project deliverable (issue #29, step 4
+of the adopt list above), and an upstream sync is exactly as review-worthy as the
+code it governs.
 
 ### Sandbox image
 
