@@ -1377,6 +1377,26 @@ if (cfg.run.dryRun) {
           ? { required: false, reason: 'local (no tracker) — no host token needed' }
           : { required: true, key: hostToken.key, ...tokenStatus(hostToken) },
       hostMismatch: warnHostMismatch(),
+      // The pre-MR report phase (revue issue #26). Reported here for the same reason as
+      // `hooks` above: a consumer must be able to confirm the wiring — the skill name, the
+      // mounts, the env the sandbox will see — WITHOUT launching a sandbox, which is the
+      // only other way to find out. Env KEYS only, never values: a consumer's report env
+      // is where an instance secret would live.
+      report:
+        cfg.project.report === null
+          ? {
+              enabled: false,
+              hint: 'set project.report to run a client skill between the push and the MR',
+            }
+          : {
+              enabled: true,
+              skill: cfg.project.report.skill,
+              role: cfg.project.report.role,
+              promptFile: cfg.project.report.promptFile,
+              mounts: cfg.project.report.mounts.map((m) => `${m.hostPath} → ${m.sandboxPath}`),
+              envKeys: Object.keys(cfg.project.report.env),
+              idleTimeoutSeconds: cfg.project.report.idleTimeoutSeconds,
+            },
       // The publish ledger (issue #26): reported, never drained, in a dry run —
       // a dry run must not open MRs. Says what a live run would resume.
       pendingPublishes: pendingFileSummary(pending),
