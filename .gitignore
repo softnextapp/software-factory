@@ -1,5 +1,8 @@
 # Dependencies
-node_modules/
+# No trailing slash: a git worktree gets `node_modules` as a SYMLINK to the main
+# checkout, and `node_modules/` (directory-only) does not match a symlink — which
+# is how one got committed once.
+node_modules
 
 # The .sandcastle/ artifact boundary lives in .sandcastle/.gitignore — the same
 # tracked file adoption ships to a consumer (issue #29): the config layer IS

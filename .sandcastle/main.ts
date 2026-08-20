@@ -95,6 +95,14 @@ import {
 } from './branch-sweep.ts';
 import { ensureWorktreeExclude } from './worktree-exclude.ts';
 import {
+  classifyReport,
+  renderReport,
+  reportCrashed,
+  reportPromptArgs,
+  shouldRunReport,
+  type ReportOutcome,
+} from './report.ts';
+import {
   decideResume,
   dropPendingIssues,
   pendingFileSummary,
@@ -570,6 +578,59 @@ const commitsOn = (base: string, branch: string): CommitInfo[] => {
 
 // Three dots: the diff against the MERGE BASE, which is what GitLab shows in the
 // Changes tab. Two dots would fold in whatever landed on the base meanwhile.
+// --- The pre-MR report phase (revue issue #26, parcours P2) -------------------
+// Runs between the push and the MR creation, in its own sandbox, only when a
+// consumer configured `project.report`. Everything decidable about it lives in
+// report.ts — this is the side effect and nothing else.
+//
+// It borrows a core role's provider rather than owning one: a report is a
+// reading-and-explaining job, the same shape as the review, and adding a fourth
+// provider slot would make every consumer configure a model for a phase most of
+// them will never enable.
+const runReportPhase = async (input: {
+  readonly issue: { number: number; title: string; base: string };
+  readonly branch: string;
+  readonly changedLines: number;
+}): Promise<ReportOutcome | null> => {
+  const report = cfg.project.report;
+  if (report === null) return null;
+  const skill = report.skill;
+  try {
+    const result = await sandcastle.run({
+      name: `report #${input.issue.number}`,
+      agent: agentFor(report.role),
+      // The branch is already pushed, so a throwaway worktree at its head is all
+      // the phase needs — and `run` (not `createSandbox`) is what guarantees it
+      // cannot leave a commit behind on the branch the reviewer just approved.
+      sandbox: docker({
+        env: { ...envFor(report.role), ...report.env },
+        // The Engine mounts only the worktree, so a skill symlinked into the
+        // host's ~/.claude/skills is invisible in here. A consumer that wants one
+        // mounts the RESOLVED directory — and, just as importantly, mounts the
+        // durable drop where a failed publish leaves its replayable package. A
+        // package written inside the sandbox dies with the sandbox, which is the
+        // exact loss the degraded path exists to prevent.
+        mounts: report.mounts,
+      }),
+      promptFile: report.promptFile,
+      promptArgs: reportPromptArgs({
+        issueNumber: input.issue.number,
+        issueTitle: input.issue.title,
+        branch: input.branch,
+        base: input.issue.base,
+        changedLines: input.changedLines,
+        skill,
+      }),
+      idleTimeoutSeconds: report.idleTimeoutSeconds,
+    });
+    return classifyReport(skill, result.stdout);
+  } catch (error) {
+    // Never rethrown. The MR is the work; the report is a courtesy. A crash here
+    // becomes a line in the MR body — the same posture the reviewer already has.
+    return reportCrashed(skill, error);
+  }
+};
+
 const diffstatOf = (base: string, branch: string): DiffStat => {
   try {
     const lines = execFileSync('git', ['diff', '--numstat', `${base}...${branch}`], {
@@ -1792,6 +1853,35 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           console.error(`  ⚠ #${issue.number}: ${summaryError} — MR body will say so.`);
         }
         const commits = commitsOn(issue.base, branch);
+        const diffstat = diffstatOf(issue.base, branch);
+
+        // The report phase, between the push and the MR (revue issue #26). It runs
+        // here and not earlier because the skill explains a branch that EXISTS on
+        // origin — a report whose links point at a branch nobody can fetch is worth
+        // less than none. And not later, because its url belongs in the body below.
+        //
+        // Its failure boundary is inside runReportPhase, which never throws. That
+        // matters more than it looks: this `try` is the one whose `catch` records a
+        // PendingPublish trace, and `pushed` is already true. An escaping error would
+        // be filed as "the MR creation failed" for an MR that was never attempted —
+        // the next run would then drain a ledger entry describing a phase, not a
+        // publish. See publish.ts and iteration.ts for who owns which failure.
+        let report: ReportOutcome | null = null;
+        if (shouldRunReport(cfg.project.report, commits.length)) {
+          console.log(`  · #${issue.number}: rapport de revue (${cfg.project.report!.skill})…`);
+          report = await runReportPhase({
+            issue: { number: issue.number, title: issue.title, base: issue.base },
+            branch,
+            changedLines: diffstat.insertions + diffstat.deletions,
+          });
+          const rendered = renderReport(report);
+          console.log(
+            report?.kind === 'published'
+              ? `  · #${issue.number}: rapport publié — ${report.url}`
+              : `  ⚠ #${issue.number}: ${rendered ? rendered.split('\n').pop() : 'pas de rapport'}`,
+          );
+        }
+
         const issueInfo = host.issueInfoOf(issue.number, issue.title);
         mrTitle = buildMrTitle({
           style: titleStyle,
@@ -1816,7 +1906,8 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
             resolved: extractReviewLedger(reviewStdout, 'resolved').data,
           },
           commits,
-          diffstat: diffstatOf(issue.base, branch),
+          diffstat,
+          report,
           run: {
             profile: cfg.run.profile,
             implementerModel: modelFor('implementer'),

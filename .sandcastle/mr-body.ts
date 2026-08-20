@@ -95,6 +95,7 @@ export interface MrSummary {
  * predicate, no repo knowledge in the renderer. That is what keeps the three copies
  * of this file byte-identical.
  */
+import { renderReport, type ReportOutcome } from './report.ts';
 export interface TestingRecipe {
   /** Get the branch running here, in order. Rendered as GitLab task-list items. */
   steps: string[];
@@ -183,6 +184,12 @@ export interface MrBodyInput {
   /** Omitted only by a caller that has no recipe to give — the section then rests on
    *  the agent's own words alone, and says so. */
   testing?: TestingRecipe | undefined;
+  /** What the pre-MR report phase produced, or `null`/absent when no consumer enabled it.
+   *  Note the asymmetry, and it is deliberate: a phase that is OFF renders nothing, while a
+   *  phase that RAN AND FAILED renders its reason. Collapsing the two would let a broken
+   *  report look exactly like a report nobody asked for — the failure mode this whole
+   *  optional phase is most likely to hide. See report.ts. */
+  report?: ReportOutcome | null | undefined;
 }
 
 /** How a repo wants its MR titles shaped. `conventional` repos run commitlint (and
@@ -729,7 +736,7 @@ function renderDiffstat(diffstat: DiffStat): string {
  * know why the MR exists, what happens to its issue, and where to look.
  */
 export function buildMrDescription(input: MrBodyInput): string {
-  const { issue, branch, base, defaultBranch, summary, summaryError, review, commits, diffstat, run, testing } =
+  const { issue, branch, base, defaultBranch, summary, summaryError, review, commits, diffstat, run, testing, report } =
     input;
   const parts: string[] = [];
 
@@ -766,6 +773,13 @@ export function buildMrDescription(input: MrBodyInput): string {
         `Merger d’abord la MR de \`${base}\`, puis celle-ci — de bas en haut.`,
     );
   }
+
+  // The review report, high in the body and before the diff — that is the whole point of
+  // producing it: a reviewer who has not opened the code yet is exactly the reader it was
+  // written for. Above the authored sections, because it is the only part of this body a
+  // reviewer can consume without already knowing the change.
+  const reportSection = renderReport(report ?? null);
+  if (reportSection) parts.push(reportSection);
 
   // --- Authored: intent ---
   if (summary?.why) parts.push(`## Pourquoi\n\n${summary.why}`);

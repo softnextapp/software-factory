@@ -27,6 +27,9 @@
  * enum is wider — none, minimal — but `claude --effort` never offers them, so a
  * provider can never send them; they are omitted on purpose.)
  */
+import type { ReportConfig } from './report.ts';
+export type { ReportConfig };
+
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /**
@@ -129,6 +132,14 @@ export interface ProjectConfig {
    *  linked worktree; the tracked `.gitignore` is untouched), so a genuinely uncommitted
    *  TRACKED change still warns. Default: the pnpm local store; extend per consumer. */
   readonly worktreeExclude: readonly string[];
+  /** The pre-MR report phase: a client skill that explains the pushed branch, publishes a
+   *  report, and hands back one url that rides into the MR body (revue issue #26, parcours P2).
+   *  Default `null` — the phase does not exist until a consumer names a skill. It has to be
+   *  off by default: `adopt --force` copies main.ts and config.ts into every consumer, and
+   *  most of them have no such skill and no platform to publish to (ADR-0004, optional
+   *  modules). What the skill IS stays project context (ADR-0003): the Factory only knows
+   *  "run it in a sandbox, take a url off stdout, never let its failure cost the MR". */
+  readonly report: ReportConfig | null;
 }
 
 /** Per-run knobs, read from env. */
@@ -211,6 +222,9 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
   // observed cause of the spurious "uncommitted changes" warning (issue #20). See
   // worktree-exclude.ts; extend here for yarn/npm build caches without editing main.ts.
   worktreeExclude: ['.pnpm-store/'],
+  // No report phase. A consumer that has one (a publishing platform plus a client skill)
+  // fills this in; everyone else keeps a run that never spends a sandbox on it. See report.ts.
+  report: null,
 };
 
 // ---------------------------------------------------------------------------
