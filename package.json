@@ -4,7 +4,7 @@
   "type": "module",
   "description": "SoftNext shared Sandcastle factory config layer. See CONTEXT.md.",
   "scripts": {
-    "test": "tsx .sandcastle/config.test.ts && tsx .sandcastle/tokens.test.ts && tsx .sandcastle/plan.test.ts && tsx .sandcastle/chain.test.ts && tsx .sandcastle/host.test.ts && tsx .sandcastle/mr-body.test.ts && tsx .sandcastle/skills-lock.test.ts && tsx .sandcastle/dockerfile-base.test.ts && tsx .sandcastle/adopt.test.ts && tsx .sandcastle/consumer-ignore.test.ts && tsx .sandcastle/esm-shim.test.ts && tsx .sandcastle/image.test.ts && tsx .sandcastle/worktree-exclude.test.ts && tsx .sandcastle/branch-sweep.test.ts && tsx .sandcastle/publish.test.ts && tsx .sandcastle/iteration.test.ts",
+    "test": "tsx .sandcastle/config.test.ts && tsx .sandcastle/tokens.test.ts && tsx .sandcastle/plan.test.ts && tsx .sandcastle/chain.test.ts && tsx .sandcastle/host.test.ts && tsx .sandcastle/mr-body.test.ts && tsx .sandcastle/skills-lock.test.ts && tsx .sandcastle/dockerfile-base.test.ts && tsx .sandcastle/adopt.test.ts && tsx .sandcastle/consumer-ignore.test.ts && tsx .sandcastle/esm-shim.test.ts && tsx .sandcastle/image.test.ts && tsx .sandcastle/worktree-exclude.test.ts && tsx .sandcastle/branch-sweep.test.ts && tsx .sandcastle/publish.test.ts && tsx .sandcastle/iteration.test.ts && tsx .sandcastle/report.test.ts",
     "typecheck": "tsc --noEmit -p .sandcastle/tsconfig.json",
     "skills:check": "tsx .sandcastle/skills-lock.ts",
     "skills:lock": "tsx .sandcastle/skills-lock.ts --update",

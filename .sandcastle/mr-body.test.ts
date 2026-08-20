@@ -133,6 +133,38 @@ const input = (over: Partial<MrBodyInput> = {}): MrBodyInput => ({
   ...over,
 });
 
+// --- buildMrDescription: the report section ---------------------------------
+//
+// renderReport is tested on its own in report.test.ts; what is only decidable HERE
+// is that the assembled body distinguishes the two absences and puts the link above
+// the authored sections. A phase that is OFF must render nothing at all — otherwise a
+// consumer with no report skill reads a body claiming a report went missing.
+
+test('a body with no report phase says nothing about a report at all', () => {
+  const body = buildMrDescription(input());
+  assert.ok(!body.includes('Rapport de revue'), body);
+});
+
+test('a report that failed says so in the body — the two absences are not the same absence', () => {
+  const body = buildMrDescription(
+    input({ report: { kind: 'failed', skill: 'explain-diff', reason: 'la skill est muette' } }),
+  );
+  assert.ok(body.includes('Rapport de revue'), body);
+  assert.ok(body.includes('la skill est muette'), body);
+});
+
+test('a published report rides above the authored sections — it is what a reviewer can read first', () => {
+  const url = 'https://revue.exemple.fr/r/x';
+  const body = buildMrDescription(
+    input({
+      report: { kind: 'published', skill: 'explain-diff', url },
+      summary: { why: 'parce que' },
+    }),
+  );
+  assert.ok(body.includes(url), body);
+  assert.ok(body.indexOf(url) < body.indexOf('## Pourquoi'), body);
+});
+
 test('a body targeting the default branch carries the closure keyword right under the header', () => {
   const body = buildMrDescription(input());
   // The keyword line must be there verbatim — it is what the host parses at merge.

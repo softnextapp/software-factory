@@ -121,6 +121,13 @@ test('DEFAULT_PROJECT_CONFIG ships no install hook and copies node_modules', () 
   assert.deepEqual(DEFAULT_PROJECT_CONFIG.copyToWorktree, ['node_modules']);
 });
 
+test('DEFAULT_PROJECT_CONFIG ships the report phase OFF', () => {
+  // `adopt --force` copies config.ts into every consumer, and most have no report skill
+  // and no platform to publish to. This one default travels the furthest of any in this
+  // file, so it is pinned here rather than inferred from shouldRunReport (ADR-0004).
+  assert.equal(DEFAULT_PROJECT_CONFIG.report, null);
+});
+
 test('DEFAULT_PROJECT_CONFIG ignores the pnpm local store in worktrees', () => {
   // A pnpm consumer's `pnpm install` materializes `.pnpm-store/`; untracked it trips the
   // Engine's "uncommitted changes" check (issue #20). The Factory ships the pnpm store as
