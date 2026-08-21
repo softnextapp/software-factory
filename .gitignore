@@ -12,3 +12,10 @@ node_modules
 
 # Local Claude settings (per-developer)
 .claude/settings.local.json
+
+# Claude Code's own worktree directory (`EnterWorktree`) — per-developer, and it
+# is not where a run puts its agent worktrees (those live under
+# `.sandcastle/worktrees/`, ignored by `.sandcastle/.gitignore`). Left untracked
+# it counts toward the `gh pr create` "N uncommitted changes" line at publish,
+# which reads like left-behind agent work (issue #21).
+.worktrees/
