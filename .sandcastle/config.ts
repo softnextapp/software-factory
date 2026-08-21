@@ -171,7 +171,7 @@ export interface FactoryConfig {
 // adds a `merger` binding to each profile (see config.test.ts).
 // ---------------------------------------------------------------------------
 
-const GLM_MODEL = 'glm-5.2[1m]';
+const GLM_MODEL = 'glm-5.3[1m]';
 const OPUS_MODEL = 'claude-opus-5';
 const ZAI_BASE_URL = 'https://api.z.ai/api/anthropic';
 
@@ -180,7 +180,9 @@ export const DEFAULT_PROVIDERS: ProviderTable = {
     model: GLM_MODEL,
     tokenKey: 'ANTHROPIC_AUTH_TOKEN',
     baseUrl: ZAI_BASE_URL,
-    effort: 'max',
+    // Split mode's default effort (issue #43). Effort follows the provider, and `zai`
+    // is bound only by the `split` profile — so this IS the effort Split runs at.
+    effort: 'low',
   },
   anthropic: {
     model: OPUS_MODEL,

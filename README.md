@@ -493,7 +493,7 @@ Edit `DEFAULT_PROJECT_CONFIG` to describe *your* repo.
 
 A **provider** is the quadruplet `{ model, baseUrl, tokenKey, effort }`:
 
-- `model` — e.g. `glm-5.2[1m]`, `claude-opus-5`.
+- `model` — e.g. `glm-5.3[1m]`, `claude-opus-5`.
 - `baseUrl` — `null` is meaningful: it omits `ANTHROPIC_BASE_URL`, which is what makes
   claude-code hit `api.anthropic.com` (the Anthropic provider). A non-null value points
   at a compatible endpoint (z.ai).
@@ -506,7 +506,7 @@ A **provider** is the quadruplet `{ model, baseUrl, tokenKey, effort }`:
 
 ```ts
 providers: {
-  zai:       { model: 'glm-5.2[1m]', baseUrl: 'https://api.z.ai/api/anthropic', tokenKey: 'ANTHROPIC_AUTH_TOKEN',    effort: 'max'    },
+  zai:       { model: 'glm-5.3[1m]', baseUrl: 'https://api.z.ai/api/anthropic', tokenKey: 'ANTHROPIC_AUTH_TOKEN',    effort: 'low'    },
   anthropic: { model: 'claude-opus-5', baseUrl: null,                            tokenKey: 'CLAUDE_CODE_OAUTH_TOKEN', effort: 'medium' },
 }
 
@@ -524,9 +524,9 @@ fenced in v0.1 until the Merger module lands.
 
 ### Modes
 
-- **Split** (default) — Implementer on GLM (z.ai), Reviewer on Claude Opus
-  (Anthropic). Cross-provider by construction: the reviewer does not share the
-  author's blind spots.
+- **Split** (default) — Implementer on GLM 5.3 at effort `low` (z.ai), Reviewer on
+  Claude Opus (Anthropic). Cross-provider by construction: the reviewer does not
+  share the author's blind spots.
 - **Opus** — all roles on Opus, for high-stakes tickets. `SANDCASTLE_PROFILE=opus`.
   Works mechanically (it is just another profile); not specially tested.
 - **Chained** — stacks MRs instead of fanning out: ticket N forks from the head of
