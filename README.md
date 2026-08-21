@@ -97,8 +97,31 @@ report: {
   ],
   env: { REVUE_PAQUETS: '/home/agent/paquets' },
   idleTimeoutSeconds: 1800,
+  // The keys the skill needs to reach a publishable instance. Names only — the run
+  // checks them BEFORE spending the sandbox, and prints keys, never values.
+  requiredEnv: ['REVUE_URL', 'REVUE_TOKEN'],
 }
 ```
+
+**It says, before spending, whether it can publish** (issue #47). A report sandbox costs
+half an hour, and without a precheck the phase discovered only at the end that it had no
+instance to publish to — naming the symptom ("that is not a url a reviewer can open")
+rather than the cause. `requiredEnv` names the keys the skill dials; the run resolves them
+the way the Engine does — a key reaches the sandbox only if `report.env` carries it, or if
+`.sandcastle/.env` **declares** it (its value may then come from the environment; a
+variable merely exported in your shell never arrives) — and renders the verdict at startup
+and in `SANDCASTLE_DRYRUN=1`, keys only. An unreachable phase is **skipped and stated in
+the MR body**, never fatal: a courtesy does not get to fail a run. Declaring nothing is
+allowed and reported as `unverifiable`, which is the honest answer, not a healthy one.
+
+**The report agent never touches your working copy.** The phase runs in a throwaway
+worktree on the pushed branch (`branchStrategy: { type: 'branch' }`), not in the Engine's
+bind-mount default (`head`), which would mount the operator's checkout writable and take
+its current branch. The worktree shares the repository's object database, so the diff the
+report explains — `BASE_BRANCH...BRANCH` — stays readable. What the strategy does not buy:
+a commit the agent makes still lands on the local branch, and nothing here deletes it —
+nothing pushes after this phase, so it never reaches the open MR, but that half stays a
+prompt instruction rather than a mechanism.
 
 **Its failure never costs the MR.** The MR is the work; the report is a courtesy — and
 since the phase moved after the create, that is structural rather than careful: the MR is

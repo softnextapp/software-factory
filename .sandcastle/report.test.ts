@@ -8,10 +8,13 @@
 import assert from 'node:assert/strict';
 import {
   classifyReport,
+  decideReportReadiness,
+  reportBranchStrategy,
   isReviewableUrl,
   renderReport,
   reportCrashed,
   reportPromptArgs,
+  reportSkipped,
   shouldRunReport,
   type ReportConfig,
 } from './report.ts';
@@ -167,6 +170,105 @@ test('shouldRunReport: off by default — no config, no phase (ADR-0004)', () =>
 test('shouldRunReport: an empty branch gets no report — a sandbox to explain nothing', () => {
   assert.equal(shouldRunReport(CONFIG, 0), false);
   assert.equal(shouldRunReport(CONFIG, 1), true);
+});
+
+// --- reportBranchStrategy (issue #47) ---------------------------------------
+
+test('reportBranchStrategy: never `head` — the host working copy is not the report sandbox', () => {
+  // The whole point of the criterion: `head` bind-mounts the operator's checkout
+  // and takes ITS current branch. Omitting the strategy in main.ts is what
+  // silently selected it (the Engine's bind-mount default), so the seam exists to
+  // make the choice explicit and testable.
+  const strategy = reportBranchStrategy({ branch: 'issue-47-rapport', base: 'main' });
+  assert.notEqual(strategy.type, 'head');
+  // `merge-to-head` is the other trap: it would MERGE whatever the report agent
+  // committed back into the branch the host has checked out.
+  assert.notEqual(strategy.type as string, 'merge-to-head');
+  assert.equal(strategy.type, 'branch');
+});
+
+test('reportBranchStrategy: the worktree sits on the pushed branch, forked from its base', () => {
+  // The agent explains `BASE_BRANCH...BRANCH`; a worktree on the branch itself is
+  // what keeps that diff readable — a strategy that put it anywhere else would
+  // take away the very diff the prompt names.
+  const strategy = reportBranchStrategy({ branch: 'issue-47-rapport', base: 'develop' });
+  assert.equal(strategy.branch, 'issue-47-rapport');
+  assert.equal(strategy.baseBranch, 'develop');
+});
+
+// --- decideReportReadiness (issue #47) --------------------------------------
+
+const READY_CONFIG: ReportConfig = { ...CONFIG, requiredEnv: ['REVUE_URL', 'REVUE_TOKEN'] };
+
+test('decideReportReadiness: a key carried by the report env reaches the sandbox', () => {
+  const verdict = decideReportReadiness({
+    config: { ...READY_CONFIG, env: { REVUE_URL: 'https://revue.exemple.fr', REVUE_TOKEN: 'jeton' } },
+    dotEnv: {},
+    processEnv: {},
+  });
+  assert.equal(verdict.verdict, 'ready');
+});
+
+test('decideReportReadiness: a key declared in .env resolves through the environment', () => {
+  // resolveEnv reads `.sandcastle/.env` and falls back to process.env PER DECLARED
+  // KEY — an empty declaration plus an exported value is a working wiring.
+  const verdict = decideReportReadiness({
+    config: READY_CONFIG,
+    dotEnv: { REVUE_URL: 'https://revue.exemple.fr', REVUE_TOKEN: '' },
+    processEnv: { REVUE_TOKEN: 'jeton' },
+  });
+  assert.equal(verdict.verdict, 'ready');
+});
+
+test('decideReportReadiness: exported but NOT declared in .env is unreachable — the trap', () => {
+  // The whole reason this precheck is worth a sandbox's price: the Engine merges
+  // only the keys `.sandcastle/.env` DECLARES. A token exported in the operator's
+  // shell looks set on the host and never arrives in the sandbox.
+  const verdict = decideReportReadiness({
+    config: READY_CONFIG,
+    dotEnv: { REVUE_URL: 'https://revue.exemple.fr' },
+    processEnv: { REVUE_TOKEN: 'jeton' },
+  });
+  assert.equal(verdict.verdict, 'unreachable');
+  assert.deepEqual(verdict.verdict === 'unreachable' ? verdict.missing : [], ['REVUE_TOKEN']);
+});
+
+test('decideReportReadiness: the verdict names the KEY and never the value', () => {
+  const verdict = decideReportReadiness({
+    config: READY_CONFIG,
+    dotEnv: { REVUE_TOKEN: 'glpat-un-secret-qui-ne-doit-pas-fuir' },
+    processEnv: { REVUE_URL: 'https://revue.exemple.fr' },
+  });
+  assert.equal(verdict.verdict, 'unreachable');
+  const message = verdict.verdict === 'unreachable' ? verdict.message : '';
+  assert.match(message, /REVUE_URL/);
+  assert.ok(!message.includes('glpat-un-secret-qui-ne-doit-pas-fuir'), message);
+  assert.ok(!message.includes('https://revue.exemple.fr'), message);
+});
+
+test('decideReportReadiness: nothing declared is unverifiable, not healthy', () => {
+  // A consumer who declared no key gets an honest "cannot say" — printing `ready`
+  // would be a healthy-looking verdict nobody checked.
+  const verdict = decideReportReadiness({ config: CONFIG, dotEnv: {}, processEnv: {} });
+  assert.equal(verdict.verdict, 'unverifiable');
+  assert.match(verdict.verdict === 'unverifiable' ? verdict.message : '', /requiredEnv/);
+});
+
+test('decideReportReadiness: an unreachable phase is skipped, never fatal', () => {
+  // Criterion 6: a negative verdict does not fail the run and does not happen in
+  // silence. `reportSkipped` is the outcome the MR body states — the CAUSE (no
+  // publishable instance in this sandbox), not the symptom classifyReport would
+  // have reported half an hour later.
+  const verdict = decideReportReadiness({ config: READY_CONFIG, dotEnv: {}, processEnv: {} });
+  assert.equal(verdict.verdict, 'unreachable');
+  const outcome = reportSkipped(SKILL, verdict.verdict === 'unreachable' ? verdict.message : '');
+  assert.equal(outcome.kind, 'failed');
+  const section = renderReport(outcome)!;
+  assert.match(section, /## Rapport de revue/);
+  // And it reads as a skip, not as a crash — both take the `failed` branch.
+  assert.match(section, /n'a pas été lancée/);
+  assert.match(section, /REVUE_URL/);
+  assert.match(section, /REVUE_TOKEN/);
 });
 
 // --- renderReport ------------------------------------------------------------

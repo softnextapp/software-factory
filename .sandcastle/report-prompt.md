@@ -30,7 +30,11 @@ branch: a report without a clickable MR is still worth reading.
    *why*: a report that paraphrases the diff serves no one.
 3. **Change nothing in this repository.** No commit, no file left behind, no
    screenshot pushed. The product is a url. Your working files belong outside
-   the repo, in the skill's own working directory.
+   the repo, in the skill's own working directory. You are in a throwaway
+   worktree on the pushed branch, not in the operator's checkout — so nothing you
+   write reaches their repository. A commit, though, would still land on the local
+   branch, and nothing here deletes it: that one is on you. Read the diff, write
+   the report, leave the tree as you found it.
 
 ## How to hand back the result
 
