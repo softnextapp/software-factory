@@ -103,11 +103,15 @@ import {
 } from './run-summary.ts';
 import {
   classifyReport,
+  decideReportReadiness,
   renderReport,
+  reportBranchStrategy,
   reportCrashed,
   reportPromptArgs,
+  reportSkipped,
   shouldRunReport,
   type ReportOutcome,
+  type ReportReadiness,
 } from './report.ts';
 import {
   decideResume,
@@ -321,6 +325,37 @@ try {
   // No .env — the common case on a fresh checkout.
 }
 const dotEnv: Record<string, string> = dotEnvRaw !== undefined ? parseEnvFile(dotEnvRaw) : {};
+
+// ---------------------------------------------------------------------------
+// Report reachability (issue #47)
+//
+// The report phase costs a half-hour sandbox and only discovers at the END that
+// it had no way to publish — and the reason it then renders names the symptom
+// ("that is not a url a reviewer can open") instead of the cause. So it says so
+// HERE, before anything is spent, exactly as `chainableBases` refuses an
+// impossible chain before the planner (issue #24).
+//
+// Two differences from the chain guard, both deliberate: this verdict never
+// throws (a courtesy phase does not get to fail a run — it announces itself and
+// is skipped), and it is computed against `.sandcastle/.env` rather than the
+// operator's shell, because the Engine's `resolveEnv` merges only the keys that
+// file DECLARES. It reads values only to tell empty from non-empty; what it
+// returns and prints is keys.
+//
+// Placed above the dry-run block so `SANDCASTLE_DRYRUN=1` renders the SAME
+// verdict as the live run.
+// ---------------------------------------------------------------------------
+const REPORT_READINESS: ReportReadiness | null =
+  cfg.project.report === null
+    ? null
+    : decideReportReadiness({
+        config: cfg.project.report,
+        dotEnv,
+        processEnv: process.env,
+      });
+if (REPORT_READINESS !== null && REPORT_READINESS.verdict !== 'ready') {
+  console.warn(`  📖 ⚠ report: ${REPORT_READINESS.message}`);
+}
 
 // .env token-key guard (startup fence, like gitHost / mergeStrategy above). A PROVIDER
 // token key in .env leaks into every sandbox under env-first → 401; fail loudly before
@@ -603,17 +638,37 @@ const runReportPhase = async (input: {
   readonly changedLines: number;
   /** The MR/PR the report explains — `null` only when the create could not be named. */
   readonly mr: ChangeRequestRef | null;
+  /** The startup verdict on whether this phase can publish at all (issue #47).
+   *  Passed in, not read from the module scope, so the decision to spend a
+   *  sandbox arrives through the same door as everything else the phase needs. */
+  readonly readiness: ReportReadiness | null;
 }): Promise<ReportOutcome | null> => {
   const report = cfg.project.report;
   if (report === null) return null;
   const skill = report.skill;
+  // Said before the sandbox, not after it (issue #47). An unreachable phase is
+  // skipped, never fatal: the outcome is a stated absence in the MR body naming
+  // the cause, which is the same shape any other absence takes — see reportSkipped.
+  if (input.readiness?.verdict === 'unreachable') {
+    return reportSkipped(skill, input.readiness.message);
+  }
   try {
     const result = await sandcastle.run({
       name: `report #${input.issue.number}`,
       agent: agentFor(report.role),
-      // The branch is already pushed, so a throwaway worktree at its head is all
-      // the phase needs — and `run` (not `createSandbox`) is what guarantees it
-      // cannot leave a commit behind on the branch the reviewer just approved.
+      // WITHOUT this, the Engine's bind-mount default is `{ type: 'head' }`: the
+      // operator's working copy, mounted writable, on whatever branch it happens
+      // to be. "Change nothing in this repository" was then a line in a prompt
+      // rather than a mechanism (issue #47). A throwaway worktree on the pushed
+      // branch keeps `BASE_BRANCH...BRANCH` readable — same object database — and
+      // keeps everything the agent writes out of the host tree.
+      branchStrategy: reportBranchStrategy({ branch: input.branch, base: input.issue.base }),
+      // What the strategy does NOT buy: a commit the agent makes still lands on the
+      // local pushed branch (`branch` means "commits land here"; there is no
+      // merge-back and no temp-branch deletion). Nothing pushes after this phase, so
+      // such a commit never reaches the open MR — but it is the prompt, not the
+      // mechanism, that keeps the branch clean. What the mechanism DOES guarantee is
+      // the criterion the issue asked for: the operator's checkout is not the sandbox.
       sandbox: docker({
         env: { ...envFor(report.role), ...report.env },
         // The Engine mounts only the worktree, so a skill symlinked into the
@@ -1432,6 +1487,12 @@ if (cfg.run.dryRun) {
               mounts: cfg.project.report.mounts.map((m) => `${m.hostPath} → ${m.sandboxPath}`),
               envKeys: Object.keys(cfg.project.report.env),
               idleTimeoutSeconds: cfg.project.report.idleTimeoutSeconds,
+              // Whether the phase can reach a publishable instance AT ALL, rendered
+              // here so a dry run gives the same verdict a live run acts on (issue
+              // #47). Keys only, like `envKeys` above: this is where an instance
+              // secret would live, and a dry run prints none of them.
+              requiredEnv: cfg.project.report.requiredEnv ?? [],
+              publishable: REPORT_READINESS,
             },
       // The publish ledger (issue #26): reported, never drained, in a dry run —
       // a dry run must not open MRs. Says what a live run would resume.
@@ -2135,6 +2196,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         branch,
         changedLines: facts.changedLines,
         mr: created,
+        readiness: REPORT_READINESS,
       });
       const rendered = renderReport(report);
       console.log(

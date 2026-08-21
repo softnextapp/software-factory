@@ -76,6 +76,17 @@ export interface ReportConfig {
   /** Give up after this many seconds. A report is a courtesy; it does not get to
    *  hold a run hostage. */
   readonly idleTimeoutSeconds: number;
+  /**
+   * The env KEYS the skill needs to reach a publishable instance — the platform's
+   * address, its credential, whatever this consumer's skill actually dials
+   * (issue #47). Names only: the Factory never learns what a value means, and
+   * `decideReportReadiness` never reads one.
+   *
+   * Declared here so the run can say, BEFORE it spends a half-hour sandbox,
+   * whether the phase has any way to publish. Omitted (or empty) is allowed and
+   * yields an HONEST `unverifiable` verdict, not a healthy-looking one.
+   */
+  readonly requiredEnv?: readonly string[];
 }
 
 /** What the phase produced, as the MR body needs to state it. */
@@ -191,6 +202,112 @@ function truncate(value: string, max = 120): string {
 export function reportCrashed(skill: string, error: unknown): ReportOutcome {
   const reason = error instanceof Error ? error.message : String(error);
   return { kind: 'failed', skill, reason: truncate(reason, 300) };
+}
+
+/**
+ * The outcome of a phase the run refused to start (issue #47).
+ *
+ * Same shape as any other absence — the MR body states it — but the reason names
+ * the CAUSE (this sandbox had no way to reach a publishable instance) rather than
+ * the symptom a spent sandbox would have produced half an hour later ("that is
+ * not a url a reviewer can open"). Not a crash: nothing ran.
+ */
+export function reportSkipped(skill: string, reason: string): ReportOutcome {
+  // The prefix is what keeps a skip from reading like a crash: both render through
+  // the `failed` branch, and a reviewer must be able to tell "nothing ran, and here
+  // is what was missing" from "it ran and broke".
+  return { kind: 'failed', skill, reason: truncate(`la phase n'a pas été lancée — ${reason}`, 300) };
+}
+
+/**
+ * Can this phase reach a publishable instance from inside its sandbox?
+ *
+ * The `chainableBases` precedent (issue #24, chain.ts): a run that cannot
+ * possibly succeed says so BEFORE it spends anything, and the dry run renders the
+ * same verdict. Here the price is a thirty-minute sandbox whose failure is only
+ * discovered at the end.
+ *
+ * The resolution mirrors the Engine's `resolveEnv` exactly, because that — not
+ * the operator's shell — is what the sandbox will see:
+ *
+ *   - a key in `report.env` arrives via `docker({ env })`; always reaches it;
+ *   - a key DECLARED in `.sandcastle/.env` arrives with its file value, or with
+ *     `process.env`'s when the declaration is empty (the Engine's per-key
+ *     fallback);
+ *   - a key merely exported in the operator's shell and NOT declared in `.env`
+ *     never arrives. That is the trap this verdict exists to catch: it looks set
+ *     on the host and is absent in the sandbox.
+ *
+ * Values are read only to tell empty from non-empty, and none is ever returned:
+ * the verdict names keys, so it is printable in a dry run (issue #47, criterion 5).
+ */
+export type ReportReadiness =
+  /** Every declared key reaches the sandbox. */
+  | { readonly verdict: 'ready'; readonly checked: readonly string[] }
+  /** Nothing was declared, so nothing could be checked — stated, not dressed up. */
+  | { readonly verdict: 'unverifiable'; readonly message: string }
+  /** At least one declared key never reaches the sandbox. The phase is skipped. */
+  | { readonly verdict: 'unreachable'; readonly missing: readonly string[]; readonly message: string };
+
+export function decideReportReadiness(input: {
+  readonly config: ReportConfig;
+  /** Parsed `.sandcastle/.env` — the ONE file the Engine merges into a sandbox. */
+  readonly dotEnv: Readonly<Record<string, string>>;
+  /** The host environment, consulted only as the Engine's per-declared-key fallback. */
+  readonly processEnv: Readonly<Record<string, string | undefined>>;
+}): ReportReadiness {
+  const required = input.config.requiredEnv ?? [];
+  if (required.length === 0) {
+    return {
+      verdict: 'unverifiable',
+      message:
+        "la phase de rapport ne déclare aucune clé (`requiredEnv`) : impossible de dire avant le " +
+        "sandbox si elle peut joindre une instance publiable. Elle est tentée quand même.",
+    };
+  }
+  const reaches = (key: string): boolean => {
+    const fromReportEnv = input.config.env[key];
+    if (typeof fromReportEnv === 'string' && fromReportEnv !== '') return true;
+    // Declaration in .env is what makes the key flow at all; its value may come
+    // from the file or, when the declaration is empty, from the environment.
+    if (!Object.prototype.hasOwnProperty.call(input.dotEnv, key)) return false;
+    return (input.dotEnv[key] ?? '') !== '' || (input.processEnv[key] ?? '') !== '';
+  };
+  const missing = required.filter((key) => !reaches(key));
+  if (missing.length === 0) return { verdict: 'ready', checked: required };
+  return {
+    verdict: 'unreachable',
+    missing,
+    message:
+      `aucune instance publiable n'est joignable depuis ce sandbox — ${missing.join(', ')} ` +
+      `n'y arrive pas. Une clé n'atteint le sandbox que si \`report.env\` la porte, ou si ` +
+      `\`.sandcastle/.env\` la DÉCLARE (sa valeur peut alors venir de l'environnement).`,
+  };
+}
+
+/**
+ * The branch strategy the report sandbox runs under (issue #47).
+ *
+ * Explicit, and in this module, because the Engine's DEFAULT for a bind-mount
+ * provider is `{ type: 'head' }` — which bind-mounts the operator's working copy
+ * and takes its current branch. Omitting the option (what main.ts did before)
+ * therefore handed the report agent write access to the real repository, and
+ * "change nothing in this repository" was a line in a prompt rather than a
+ * mechanism. `merge-to-head` is no better: it merges whatever the agent committed
+ * back into the branch the host has checked out.
+ *
+ * `{ type: 'branch' }` puts the agent in a throwaway worktree under
+ * `.sandcastle/worktrees/`, on the branch that was just pushed. The worktree
+ * shares the repository's object database, so `BASE_BRANCH...BRANCH` — the diff
+ * the prompt names — stays readable; `baseBranch` only matters on the path where
+ * the branch does not exist locally.
+ */
+export function reportBranchStrategy(input: { readonly branch: string; readonly base: string }): {
+  readonly type: 'branch';
+  readonly branch: string;
+  readonly baseBranch: string;
+} {
+  return { type: 'branch', branch: input.branch, baseBranch: input.base };
 }
 
 /**
