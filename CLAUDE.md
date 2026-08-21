@@ -43,7 +43,11 @@ real consumer, run a round) happens at human-review time — see the review lane
   `.sandcastle/test-harness.ts`; a new test file must be added to the `test`
   script in `package.json`.
 - **Language**: code, comments, README, ADRs and commit messages are English.
-  Issue titles are French — quote them verbatim, never translate.
+  Issue titles are French — quote them verbatim, never translate. One exception,
+  and only one: **the body of an own skill under `skills/` is French** (it is read
+  by an operator working in French); its test, its code comments and its commit
+  message stay English. Role prompts (the `*-prompt.md` files in `.sandcastle/`)
+  are not skills and stay English.
 - The glossary in [CONTEXT.md](CONTEXT.md) is the naming authority (Factory vs
   Engine vs instance; Orchestration; roles; modes). Do not coin synonyms.
 

@@ -674,6 +674,12 @@ function main(): void {
   info('  - Authenticate the host: gh auth login      # or: glab auth login (GitHub vs GitLab)');
   info('      then set `gitHost` in config.ts to match — the loop warns if it disagrees with origin.');
   info('  - Dry-run first:         SANDCASTLE_DRYRUN=1 npx tsx <consumer>/.sandcastle/main.ts');
+  // The operator skill is NOT copied into the consumer (adoption ships .sandcastle/ only):
+  // it belongs on the workstation that drives any instance, so a per-consumer copy would
+  // just be a per-consumer stale copy. See docs/adr/0006 + the README "Our own skills".
+  info('  - (Optional) Install the operator skill on THIS workstation — it helps Claude');
+  info('    translate "traite le ticket #42 en AFK" into correct gestures on any instance:');
+  info('      cp -r <factory>/skills/sandcastle-run ~/.claude/skills/');
 }
 
 // Run only when invoked directly, not when imported by the test suite.
