@@ -95,7 +95,33 @@ SANDCASTLE_ONLY=42 npx tsx .sandcastle/main.ts > .sandcastle/logs/run-42.log 2>&
 tail -f .sandcastle/logs/run-42.log
 ```
 
-### 4. Toute édition de `config.ts` se fait confirmer
+### 4. Lire la fin du run — le bloc `=== Run summary ===`
+
+Un run ne se termine plus par « All done » : il imprime des compteurs (itérations
+menées, MR publiées, tickets abandonnés) et **la cause nommée de chaque abandon**
+(`implementer-failed`, `no-commits`, `push-failed`, `mr-not-opened`,
+`host-unavailable`, ou `unknown` quand le run ne sait pas). Le mode chaîné y est
+donné tel qu'il a été **appliqué**, pas tel qu'il a été demandé.
+
+Le code de sortie porte le même verdict — c'est lui qu'on lit dans un script :
+
+| Code | Verdict | Ce que ça veut dire |
+| --- | --- | --- |
+| `0` | `published` | Au moins une MR est ouverte grâce à ce run. |
+| `1` | `sterile` | Le run avait du travail et rien n'en est sorti. Un `SANDCASTLE_ONLY` qui ne matche rien compte comme du travail : l'opérateur a nommé des tickets et n'en a eu aucun. |
+| `1` | `all-iterations-lost` | **Toutes** les itérations ont été perdues sur l'hôte. Le code reste `1` même si la reprise du ledger a ouvert la MR d'un run précédent. |
+| `1` | `published, then died` | Le run a publié, puis une panne définitive l'a arrêté. |
+| `2` | `idle` | Il n'y avait rien à faire : la file était vide. Ni échec, ni succès. |
+
+Ne conclus jamais « le run a réussi » sur la seule absence d'erreur dans le log :
+lis le verdict. Un `1` sur `implementer-failed`, `host-unavailable` ou
+`all-iterations-lost` se relance tel quel ; un `1` sur `mr-not-opened` **ne se
+relance pas** — la branche est poussée et le run suivant ouvrira la MR manquante
+tout seul (relancer dupliquerait le ticket). Un `2` avec `SANDCASTLE_ONLY` est
+impossible : si ton ticket n'a pas été pioché, tu auras un `1` sur
+`only-no-match`, et la cause est presque toujours le label de file manquant.
+
+### 5. Toute édition de `config.ts` se fait confirmer
 
 Propose le diff, attends l'accord. L'identité est tracée dans le dépôt du consommateur
 et une erreur y contamine **tous** les runs suivants — pas seulement celui-ci. « En

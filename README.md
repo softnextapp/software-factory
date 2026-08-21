@@ -119,6 +119,48 @@ retrying ten iterations on an invalid token is ten losses, not ten chances.
 Lost iterations are counted and named in the log, never silent, and a run that
 lost *all* of them exits non-zero.
 
+### How a run ends
+
+The last thing a run prints is a **summary block**, not `All done` (issue #32) — a
+run that shipped nothing must not read like one that opened three MRs:
+
+```
+=== Run summary ===
+  iterations         2 of 10 run (1 lost to a host failure: iteration 2 (outage))
+  MRs published      1 — #41 (issue-41-x-r7-1 → main)
+  MRs resumed        1 — #39 (a previous run's pushed branch, finished by the ledger drain)
+  tickets abandoned  1
+      mr-not-opened      #44
+        · #44 (iteration 1): pushed `issue-44-z-r7-1`, PR creation failed (trace recorded): HTTP 503
+  chained mode       requested on, applied off
+  stopped because    the queue was empty — the backlog is drained
+  verdict            published (exit 0)
+```
+
+Every abandoned ticket is attributed to a **named cause** —
+`implementer-failed`, `no-commits`, `push-failed`, `mr-not-opened`,
+`host-unavailable` — and a ticket whose cause was never recorded is reported
+`unknown` rather than filed under the nearest one. `chained mode` reports the
+mode the rounds **applied**, beside the one the flag requested; the two are
+allowed to disagree (see [Modes](#modes)).
+
+The **exit code** carries the same verdict, for whatever launched the run:
+
+| Code | Verdict | Meaning |
+| --- | --- | --- |
+| `0` | `published` | At least one MR/PR is open because of this run. |
+| `1` | `sterile` | The run had work and no MR came out of it. `SANDCASTLE_ONLY` matching nothing counts as work: the operator named tickets and got none. |
+| `1` | `all-iterations-lost` | Every iteration it ran was lost to the host — #31's criterion 4. Checked **before** "an MR is open", because the ledger drain runs first and may have opened a *previous* run's MR; that must not exit 0. |
+| `1` | `published, then died` | It published, then a definitive failure ended it. |
+| `2` | `idle` | There was nothing to do: the queue was empty. Not a failure, and not a success either. |
+
+The aggregation is a pure fold in `run-summary.ts` (`summarizeRun`), the block
+above is a pure rendering of it (`renderRunSummary`), and the code is a pure
+verdict on it (`exitCodeFor`). `main.ts` only appends the facts and performs the
+two effects. Notably, the abandonment list is **derived** — planned tickets minus
+published ones — so a ticket cannot fall out of the books by a site forgetting to
+count it; it falls out as `unknown`.
+
 The **Agent roles** are Planner, Implementer, Reviewer — plus an optional Merger
 (only under `MERGE_STRATEGY=agent`, fenced in v0.1). The active **Profile** fixes
 the provider and reasoning effort for every role.

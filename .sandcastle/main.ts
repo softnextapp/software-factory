@@ -95,6 +95,12 @@ import {
 } from './branch-sweep.ts';
 import { ensureWorktreeExclude } from './worktree-exclude.ts';
 import {
+  summarizeRun,
+  renderRunSummary,
+  exitCodeFor,
+  type RunEvent,
+} from './run-summary.ts';
+import {
   classifyReport,
   renderReport,
   reportCrashed,
@@ -814,7 +820,7 @@ const syncBaseToOrigin = (base: string): void => {
 // the startup guard already proved at least one base chains, but this ticket derives
 // another one, and the run silently degrading to unchained FOR THIS TICKET is the
 // fact the operator needs in the log — ticket by ticket, not as a round-level remark.
-const resolveBase = (issueNumber: number, labelBase: string): string => {
+const resolveBase = (issueNumber: number, labelBase: string, iteration: number): string => {
   if (!cfg.run.chain) return labelBase;
   // The helper re-checks membership (it returns '' for a chainable base, so it is safe
   // to call anywhere); branching on its result rather than on the list keeps the
@@ -822,6 +828,10 @@ const resolveBase = (issueNumber: number, labelBase: string): string => {
   const unchainable = buildUnchainableBaseWarning(issueNumber, labelBase, cfg.project.chainableBases);
   if (unchainable !== '') {
     console.warn(`  ⛓ ⚠ chain: ${unchainable}`);
+    // The round is chained and this ticket is not — the summary reports the mode
+    // APPLIED, not the one asked for (issue #32, criterion 4), and a per-ticket
+    // downgrade is part of what was applied.
+    runEvents.push({ kind: 'chain-ticket-unchained', iteration, issue: issueNumber });
     return labelBase;
   }
 
@@ -1183,6 +1193,20 @@ const warnHostMismatch = (): { configured: string; originHost: string | null; ok
 };
 
 // ---------------------------------------------------------------------------
+// The run's books (issue #32)
+//
+// `All done.` and exit 0 used to end every run, whatever it did — the 17 Aug 2026
+// run that published nothing because its model provider was severed ended exactly
+// like an evening that opened three MRs. The sites below append flat facts to this
+// list; run-summary.ts folds them into counters, names each abandonment's cause,
+// and decides the exit code. Nothing here interprets: appending is all main.ts does.
+//
+// Declared this early because the FIRST appender is the publish-ledger drain
+// below, which runs before the loop.
+// ---------------------------------------------------------------------------
+const runEvents: RunEvent[] = [];
+
+// ---------------------------------------------------------------------------
 // Publish ledger (issue #26)
 //
 // A branch pushed whose Draft MR/PR creation failed is not orphaned: the failed
@@ -1304,6 +1328,10 @@ const drainPendingPublishes = (): void => {
         assignee: cfg.project.assignee,
       });
       erase();
+      // Counted apart from this run's own publishes (issue #32): an MR IS open
+      // because of this run, so the verdict is not sterile — but the work behind
+      // it belongs to the run that pushed the branch.
+      runEvents.push({ kind: 'resumed', issue: trace.issue });
       console.log(`  ✓ #${trace.issue}: ${hostTerms.cr} opened — trace cleared.`);
     } catch (error) {
       pending = recordPendingPublish(without(), { ...trace, reason: String(error) });
@@ -1484,10 +1512,15 @@ ensureWorktreeExclude(process.cwd(), cfg.project.worktreeExclude);
 // source of truth for the end-of-run summary and the all-lost verdict.
 let lostIterations: LostIteration[] = [];
 let ranIterations = 0;
+// The definitive failure that ended the run, if one did (issue #32). Held rather
+// than thrown so the summary below is printed BEFORE the stack the operator also
+// needs — a run that died having published two MRs must still report them.
+let fatal: unknown = null;
 
 for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${cfg.run.maxIterations} ===\n`);
   ranIterations += 1;
+  runEvents.push({ kind: 'iteration-started', iteration });
   try {
     // -------------------------------------------------------------------------
     // Phase 1: Plan
@@ -1530,6 +1563,10 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     if (plannerChain.mode === 'off' && plannerChain.downgraded) {
       console.warn(`  ⛓ ⚠ chain: ${plannerChain.message}`);
     }
+    // The mode this round APPLIES, which is what the summary reports — the
+    // operator's flag is recorded separately, and the two disagreeing is the
+    // whole point of criterion 4.
+    runEvents.push({ kind: 'chain-decided', iteration, mode: plannerChain.mode });
 
     const plan = await sandcastle.run({
       sandbox: docker({ env: envFor('planner') }),
@@ -1566,6 +1603,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     const parsed = parsePlan(plan.stdout, ALLOWED_BASES);
     if (parsed.length === 0) {
       console.log('Planner returned no issues. Stopping.');
+      runEvents.push({ kind: 'stopped', reason: 'queue-empty' });
       break;
     }
 
@@ -1589,6 +1627,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           `  ⊘ SANDCASTLE_ONLY=${onlyList}: none of the planned issues match the allow-list. ` +
             `Stopping — if the issue is not in the open queue, the planner cannot pick it.`,
         );
+        runEvents.push({ kind: 'stopped', reason: 'only-no-match' });
         break;
       }
       candidates = kept;
@@ -1627,7 +1666,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           `  ⚠ #${issue.number}: planner said base \`${issue.base}\`, labels say \`${labelBase}\` — using the labels.`,
         );
       }
-      const base = resolveBase(issue.number, labelBase);
+      const base = resolveBase(issue.number, labelBase, iteration);
       assertBaseUsable(base);
       // Fast-forward the base to origin so agent branches fork from the latest
       // published tip, not a stale local ref (issue #14). Live only — the dry run
@@ -1641,6 +1680,12 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         .join('\n');
       return { ...issue, base, claimCommands };
     });
+
+    // The round's commitment (issue #32): from here on, a ticket that does not end
+    // in a published MR is an ABANDONMENT the summary must name. Appended after the
+    // bases resolve, because a ticket the round could not even resolve a base for
+    // keeps its queue label and is not work this run took on.
+    runEvents.push({ kind: 'planned', iteration, issues: issues.map((issue) => issue.number) });
 
     console.log(`Planned ${issues.length} issue(s) this round:`);
     for (const issue of issues) {
@@ -1802,8 +1847,32 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     );
 
     settled.forEach((outcome, i) => {
+      const number = issues[i]?.number;
       if (outcome.status === 'rejected') {
-        console.error(`  ✗ #${issues[i]?.number} (${issues[i]?.branch}) failed: ${outcome.reason}`);
+        console.error(`  ✗ #${number} (${issues[i]?.branch}) failed: ${outcome.reason}`);
+        // "agent implémenteur coupé" (issue #32): the sandbox threw — a severed
+        // model provider, a create that failed, a crash. Distinct from the case
+        // below, where the agent ran to the end and simply wrote nothing.
+        if (number !== undefined) {
+          runEvents.push({
+            kind: 'abandoned',
+            iteration,
+            issue: number,
+            reason: 'implementer-failed',
+            detail: String(outcome.reason).split('\n')[0]?.trim() || 'no message',
+          });
+        }
+        return;
+      }
+      if (outcome.value.commits === 0 && number !== undefined) {
+        console.log(`  ⊘ #${number} (${outcome.value.branch}): no commits — nothing to publish.`);
+        runEvents.push({
+          kind: 'abandoned',
+          iteration,
+          issue: number,
+          reason: 'no-commits',
+          detail: 'the implementer ran to the end and produced no commits',
+        });
       }
     });
 
@@ -1824,6 +1893,16 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
 
     if (completed.length === 0) {
       console.log('No branch produced commits. Stopping.');
+      // Two very different rounds reach this line: one whose agents ran and wrote
+      // nothing, and one whose agents were all severed mid-response (the 17 Aug
+      // 2026 shape). Blaming the agents for a dead provider is the mis-reporting
+      // issue #32 is about, so the stop reason is derived, not assumed.
+      runEvents.push({
+        kind: 'stopped',
+        reason: settled.every((outcome) => outcome.status === 'rejected')
+          ? 'implementers-failed'
+          : 'no-commits',
+      });
       break;
     }
 
@@ -1945,6 +2024,16 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           description: mrDesc,
           assignee: cfg.project.assignee,
         });
+        // The only site that makes a run fruitful (issue #32) — appended AFTER the
+        // create returns, so a 503 counts as `mr-not-opened` below and never as a
+        // publish.
+        runEvents.push({
+          kind: 'published',
+          iteration,
+          issue: issue.number,
+          branch,
+          base: issue.base,
+        });
       } catch (error) {
         if (pushed) {
           // The branch is on origin and its MR is not — durable trace for the next
@@ -1978,6 +2067,17 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           };
           pending = recordPendingPublish(pending, trace);
           persistPending();
+          // "MR restée à ouvrir" (issue #32). The work is not lost — the branch is on
+          // origin and the ledger will open its MR next run — but this run did not
+          // publish it, and the summary says so under its own cause.
+          runEvents.push({
+            kind: 'abandoned',
+            iteration,
+            issue: issue.number,
+            reason: 'mr-not-opened',
+            detail: `pushed \`${branch}\`, ${hostTerms.cr} creation failed (trace recorded): ` +
+              (String(error).split('\n')[0]?.trim() || 'no message'),
+          });
           console.error(
             `  ✗ #${issue.number}: ${hostTerms.cr} creation failed for pushed \`${branch}\` — ` +
               `trace recorded, the NEXT run will open it (issue #26). Or by hand:\n` +
@@ -1986,6 +2086,14 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           );
           continue;
         }
+        runEvents.push({
+          kind: 'abandoned',
+          iteration,
+          issue: issue.number,
+          reason: 'push-failed',
+          detail: `\`${branch}\` never reached origin: ` +
+            (String(error).split('\n')[0]?.trim() || 'no message'),
+        });
         console.error(
           `  ✗ #${issue.number}: publish failed for \`${branch}\` — the commits are on the ` +
             `${hostTerms.cr} by hand:\n` +
@@ -2003,8 +2111,23 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
     // pushed branch without its MR keeps its #26 ledger trace.
     // The guard is a type predicate, so `error` is a HostReadError past this
     // line — no cast at the one site the boundary must not get wrong.
-    if (!isLostIterationError(error)) throw error;
+    if (!isLostIterationError(error)) {
+      // Still stops the run, exactly as #31 requires. What changes (issue #32) is
+      // that it stops through the books instead of past them: an uncaught throw
+      // printed a stack and nothing else, so a run that died after publishing two
+      // MRs never said it had published them. Recorded, then broken out of — the
+      // error is re-reported below the summary, and the exit code stays non-zero.
+      fatal = error;
+      runEvents.push({ kind: 'stopped', reason: 'fatal' });
+      break;
+    }
     lostIterations = recordLostIteration(lostIterations, iteration, error);
+    runEvents.push({
+      kind: 'iteration-lost',
+      iteration,
+      reason: error.failure.reason,
+      detail: error.message.split('\n')[0]?.trim() || 'no message',
+    });
     console.error(describeLostIteration(lostIterations.at(-1)!, cfg.run.maxIterations));
     continue;
   }
@@ -2016,9 +2139,10 @@ if (lostIterations.length > 0) {
   console.log(`\n${describeIterationLosses(lostIterations, ranIterations)}`);
 }
 
-// Criterion 4: a run whose every iteration was lost is not a success. Exit
-// non-zero so the operator's automation sees the difference — the log above
-// already said it in words.
+// #31's criterion 4, said in words. The verdict and the exit code are the
+// summary's job below (a run that lost every iteration is `sterile`, exit 1);
+// what this line adds is the one thing the counters cannot say — that ALL of them
+// went the same way.
 if (isRunLost(lostIterations, ranIterations)) {
   // "no iteration published", not "nothing was published": drainPendingPublishes()
   // runs BEFORE this loop and may well have opened a previous run's missing MR
@@ -2027,7 +2151,44 @@ if (isRunLost(lostIterations, ranIterations)) {
   console.error(
     `\nEvery iteration of this run (${ranIterations}) was lost to host failures — no iteration published.`,
   );
-  process.exit(1);
 }
 
-console.log('\nAll done.');
+// ---------------------------------------------------------------------------
+// The end of the run (issue #32)
+//
+// A loop that fell out of its `for` without recording a stop spent its whole
+// iteration budget — the one stop reason no site can append, because there is no
+// site: it is the absence of a break. Filled in here so the summary never has to
+// say `unknown` about a run that simply finished.
+// ---------------------------------------------------------------------------
+if (!runEvents.some((event) => event.kind === 'stopped')) {
+  runEvents.push({ kind: 'stopped', reason: 'iterations-exhausted' });
+}
+
+const summary = summarizeRun({
+  events: runEvents,
+  maxIterations: cfg.run.maxIterations,
+  // The flag, recorded against what the rounds actually applied — criterion 4
+  // is precisely about the two being allowed to disagree.
+  chainRequested: cfg.run.chain,
+});
+console.log(`\n${renderRunSummary(summary)}`);
+
+// The stack, after the books: it is the detail of ONE fact the summary already
+// stated ("a definitive failure ended the run"), and printing it first would bury
+// the counters under it.
+if (fatal !== null) {
+  console.error(`\nThe failure that ended the run:`);
+  console.error(fatal);
+}
+
+// The verdict in the one word automation reads: 0 published, 1 sterile (or died),
+// 2 nothing to do. `All done.` used to be printed here whatever happened, which
+// is the whole of issue #32.
+//
+// `process.exitCode`, not `process.exit()`: the run has just printed its summary
+// and possibly a stack, and `process.exit()` truncates a stdout that is a PIPE —
+// which is exactly how the operator skill launches a run (`> run.log 2>&1`, and
+// `| tee` when they watch it live). Setting the code lets Node flush and leave on
+// its own, which is what every successful run already did.
+process.exitCode = exitCodeFor(summary);
