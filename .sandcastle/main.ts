@@ -135,6 +135,11 @@ import {
   decideImageStatus,
   describeImageStatus,
   buildMissingImageMessage,
+  parseToolRequirements,
+  toolProbeScript,
+  toolProbeArgv,
+  parseToolProbeOutput,
+  describeToolProbe,
   type SandboxImageStatus,
 } from './image.ts';
 
@@ -326,37 +331,6 @@ try {
 }
 const dotEnv: Record<string, string> = dotEnvRaw !== undefined ? parseEnvFile(dotEnvRaw) : {};
 
-// ---------------------------------------------------------------------------
-// Report reachability (issue #47)
-//
-// The report phase costs a half-hour sandbox and only discovers at the END that
-// it had no way to publish — and the reason it then renders names the symptom
-// ("that is not a url a reviewer can open") instead of the cause. So it says so
-// HERE, before anything is spent, exactly as `chainableBases` refuses an
-// impossible chain before the planner (issue #24).
-//
-// Two differences from the chain guard, both deliberate: this verdict never
-// throws (a courtesy phase does not get to fail a run — it announces itself and
-// is skipped), and it is computed against `.sandcastle/.env` rather than the
-// operator's shell, because the Engine's `resolveEnv` merges only the keys that
-// file DECLARES. It reads values only to tell empty from non-empty; what it
-// returns and prints is keys.
-//
-// Placed above the dry-run block so `SANDCASTLE_DRYRUN=1` renders the SAME
-// verdict as the live run.
-// ---------------------------------------------------------------------------
-const REPORT_READINESS: ReportReadiness | null =
-  cfg.project.report === null
-    ? null
-    : decideReportReadiness({
-        config: cfg.project.report,
-        dotEnv,
-        processEnv: process.env,
-      });
-if (REPORT_READINESS !== null && REPORT_READINESS.verdict !== 'ready') {
-  console.warn(`  📖 ⚠ report: ${REPORT_READINESS.message}`);
-}
-
 // .env token-key guard (startup fence, like gitHost / mergeStrategy above). A PROVIDER
 // token key in .env leaks into every sandbox under env-first → 401; fail loudly before
 // any agent runs. The host token (GH_TOKEN/GITLAB_TOKEN) is the deliberate, documented
@@ -499,6 +473,85 @@ const preflightSandboxImage = (): void => {
     throw new Error(buildMissingImageMessage(SANDBOX_IMAGE, cfg.project.gitHost));
   }
 };
+
+// ---------------------------------------------------------------------------
+// Report reachability (issue #47)
+//
+// The report phase costs a half-hour sandbox and only discovers at the END that
+// it had no way to publish — and the reason it then renders names the symptom
+// ("that is not a url a reviewer can open") instead of the cause. So it says so
+// HERE, before anything is spent, exactly as `chainableBases` refuses an
+// impossible chain before the planner (issue #24).
+//
+// Two differences from the chain guard, both deliberate: this verdict never
+// throws (a courtesy phase does not get to fail a run — it announces itself and
+// is skipped), and it is computed against `.sandcastle/.env` rather than the
+// operator's shell, because the Engine's `resolveEnv` merges only the keys that
+// file DECLARES. It reads values only to tell empty from non-empty; what it
+// returns and prints is keys.
+//
+// Since issue #53 the same verdict carries a SECOND dimension: the capabilities
+// the phase declared its sandbox image must carry (`requiredTools`). Same three
+// outcomes, same consequence — a phase whose image lacks a module it imports is
+// skipped with a stated cause, never fatal. What made that necessary is a premise
+// that went stale without a sound: a project layer asserting "stdlib only,
+// therefore no pip" was true until a report phase mounted a skill that imports a
+// third-party module, and nothing checked.
+//
+// Placed BELOW the image pre-flight (it needs the image name and its status) and
+// above the dry-run block, so `SANDCASTLE_DRYRUN=1` renders the SAME verdict as
+// the live run.
+// ---------------------------------------------------------------------------
+
+/** The capabilities this project's report phase declared, or none. */
+const REQUIRED_TOOLS: readonly string[] = cfg.project.report?.requiredTools ?? [];
+
+/**
+ * Ask the TAGGED image what it carries — one throwaway container, seconds.
+ *
+ * `null` means "could not ask", never "absent": if the daemon is down or the
+ * image is not built, `docker run` fails for reasons that have nothing to do with
+ * the declaration, and claiming a module is missing would send the operator to
+ * fix the wrong thing (the same guard `decideImageStatus` makes explicit one
+ * layer down). A malformed declaration is not probed either — it is reported as
+ * unprovable by the verdict, and its name never reaches a shell.
+ *
+ * Memoised because both the pre-flight and the dry-run report read it, and a
+ * second container would be a second chance to disagree with the first.
+ */
+let toolProbesCache: Readonly<Record<string, boolean>> | null | undefined;
+const sandboxToolProbes = (): Readonly<Record<string, boolean>> | null => {
+  if (toolProbesCache !== undefined) return toolProbesCache;
+  const { ok } = parseToolRequirements(REQUIRED_TOOLS);
+  if (ok.length === 0 || sandboxImageStatus() !== 'built') {
+    toolProbesCache = null;
+    return toolProbesCache;
+  }
+  try {
+    const stdout = execFileSync('docker', toolProbeArgv(SANDBOX_IMAGE, toolProbeScript(ok)) as string[], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    toolProbesCache = parseToolProbeOutput(stdout);
+  } catch {
+    // Anything from a pull attempt to a broken entrypoint. Unprovable, not absent.
+    toolProbesCache = null;
+  }
+  return toolProbesCache;
+};
+const REPORT_READINESS: ReportReadiness | null =
+  cfg.project.report === null
+    ? null
+    : decideReportReadiness({
+        config: cfg.project.report,
+        dotEnv,
+        processEnv: process.env,
+        toolProbes: sandboxToolProbes(),
+      });
+if (REPORT_READINESS !== null && REPORT_READINESS.verdict !== 'ready') {
+  console.warn(`  📖 ⚠ report: ${REPORT_READINESS.message}`);
+}
+
 
 // Per-sandbox provider env, baked on docker({ env }) — layered ON TOP of resolvedEnv.
 // Exactly ONE auth token per sandbox. All three ANTHROPIC_DEFAULT_*_MODEL are set so
@@ -1521,6 +1574,11 @@ if (cfg.run.dryRun) {
         }),
       ),
       sandboxImage: describeImageStatus(SANDBOX_IMAGE, sandboxImageStatus()),
+      // The second half of the image pre-flight (issue #53): what the phase
+      // declared it needs INSIDE that image, and what the image was found to
+      // carry. An empty declaration says so here rather than degrading the live
+      // verdict — the dry run is where "nothing is being checked" belongs.
+      sandboxTools: describeToolProbe(SANDBOX_IMAGE, REQUIRED_TOOLS, sandboxToolProbes()),
     },
     { depth: null },
   );

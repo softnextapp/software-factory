@@ -45,6 +45,8 @@
  * therefore here.
  */
 
+import { parseToolRequirements } from './image.ts';
+
 /** A host directory the report sandbox needs mounted. */
 export interface ReportMount {
   /** Host path. Tilde-expanded by the Engine. */
@@ -87,6 +89,24 @@ export interface ReportConfig {
    * yields an HONEST `unverifiable` verdict, not a healthy-looking one.
    */
   readonly requiredEnv?: readonly string[];
+  /**
+   * The sandbox CAPABILITIES the skill needs — a command on `PATH`, a module the
+   * image's `python3` can import (issue #53). Declared with a probe-kind prefix,
+   * because a bare name is not probeable: `cmd:gh`, `py:edge_tts`.
+   *
+   * Same doctrine as `requiredEnv`, one dimension over: names only, and the
+   * Factory never learns what a tool DOES. What this closes is the asymmetry that
+   * cost a consumer a half-hour run — the run could say before spending whether
+   * the phase could reach an instance, and could say nothing about whether the
+   * image carried the module the skill imports. A premise a build depends on
+   * cannot live in a Dockerfile comment; it goes stale without a sound.
+   *
+   * Omitted (or empty) is the default and changes nothing: a phase that needs no
+   * third-party tool is not in trouble. The absence is stated in the dry run
+   * (`describeToolProbe`) rather than folded into this verdict, so it is said
+   * where statements belong without crying wolf every round.
+   */
+  readonly requiredTools?: readonly string[];
 }
 
 /** What the phase produced, as the MR body needs to state it. */
@@ -249,22 +269,91 @@ export type ReportReadiness =
   /** At least one declared key never reaches the sandbox. The phase is skipped. */
   | { readonly verdict: 'unreachable'; readonly missing: readonly string[]; readonly message: string };
 
+/**
+ * What the tools dimension has to say (issue #53).
+ *
+ * Kept apart from the env dimension and merged by the caller, because the two
+ * absences do not read alike: a key that never reaches the sandbox and a module
+ * the image does not carry want different sentences and different fixes. One
+ * verdict, distinct clauses.
+ *
+ * `says` carries every clause worth printing, whether or not anything is
+ * actually missing — a malformed declaration is unprovable, not satisfied, and
+ * has to be heard even when the round is otherwise green.
+ */
+function judgeTools(
+  declared: readonly string[],
+  probes: Readonly<Record<string, boolean>> | null,
+): { readonly missing: readonly string[]; readonly says: readonly string[] } {
+  if (declared.length === 0) return { missing: [], says: [] };
+  if (probes === null) {
+    return {
+      missing: [],
+      says: [
+        "les capacités déclarées (`requiredTools` : " +
+          declared.join(', ') +
+          ") n'ont pas pu être sondées : docker est injoignable, ou l'image du sandbox " +
+          "n'est pas construite.",
+      ],
+    };
+  }
+  const { ok, malformed } = parseToolRequirements(declared);
+  const says: string[] = [];
+  if (malformed.length > 0) {
+    says.push(
+      '`requiredTools` porte ' +
+        malformed.join(', ') +
+        " — une déclaration se préfixe par son mode de sondage (`cmd:` pour une commande " +
+        "du `PATH`, `py:` pour un module importable), et son nom est un identifiant simple. " +
+        'Sans cela, elle est insondable, donc non prouvée.',
+    );
+  }
+  // `!== true` and not `=== false`: a requirement with no line in the probe
+  // output is UNPROVEN, and an unknown falls on the absent side.
+  const absent = ok.filter((req) => probes[req.raw] !== true).map((req) => req.raw);
+  if (absent.length > 0) {
+    says.push(
+      "l'image du sandbox ne porte pas " +
+        absent.join(', ') +
+        " — la phase ne peut pas faire ce qu'elle annonce. Ajoutez-les à la couche projet " +
+        '(`.sandcastle/Dockerfile`) PUIS reconstruisez l\'image : ' +
+        '`npx @ai-hero/sandcastle docker build-image`. Une recette corrigée sans ' +
+        "reconstruction laisse l'image telle quelle.",
+    );
+  }
+  return { missing: absent, says };
+}
+
+/** The env-dimension sentences, kept as constants so the two dimensions can be
+ *  merged without either one's wording drifting. */
+const NO_ENV_DECLARED =
+  "la phase de rapport ne déclare aucune clé (`requiredEnv`) : impossible de dire avant le " +
+  "sandbox si elle peut joindre une instance publiable. Elle est tentée quand même.";
+
+const envUnreachableMessage = (missing: readonly string[]): string =>
+  `aucune instance publiable n'est joignable depuis ce sandbox — ${missing.join(', ')} ` +
+  `n'y arrive pas. Une clé n'atteint le sandbox que si \`report.env\` la porte, ou si ` +
+  `\`.sandcastle/.env\` la DÉCLARE (sa valeur peut alors venir de l'environnement).`;
+
 export function decideReportReadiness(input: {
   readonly config: ReportConfig;
   /** Parsed `.sandcastle/.env` — the ONE file the Engine merges into a sandbox. */
   readonly dotEnv: Readonly<Record<string, string>>;
   /** The host environment, consulted only as the Engine's per-declared-key fallback. */
   readonly processEnv: Readonly<Record<string, string | undefined>>;
+  /**
+   * What the sandbox image was found to carry, keyed by declaration, or `null`
+   * when docker could not be asked (issue #53). The docker IO is main.ts's and
+   * the probe mechanics are image.ts's; this function only judges. Omitted
+   * behaves like `null`, which is why a consumer that declares no tool is
+   * unaffected either way.
+   */
+  readonly toolProbes?: Readonly<Record<string, boolean>> | null;
 }): ReportReadiness {
-  const required = input.config.requiredEnv ?? [];
-  if (required.length === 0) {
-    return {
-      verdict: 'unverifiable',
-      message:
-        "la phase de rapport ne déclare aucune clé (`requiredEnv`) : impossible de dire avant le " +
-        "sandbox si elle peut joindre une instance publiable. Elle est tentée quand même.",
-    };
-  }
+  const requiredEnv = input.config.requiredEnv ?? [];
+  const requiredTools = input.config.requiredTools ?? [];
+  const tools = judgeTools(requiredTools, input.toolProbes ?? null);
+
   const reaches = (key: string): boolean => {
     const fromReportEnv = input.config.env[key];
     if (typeof fromReportEnv === 'string' && fromReportEnv !== '') return true;
@@ -273,17 +362,21 @@ export function decideReportReadiness(input: {
     if (!Object.prototype.hasOwnProperty.call(input.dotEnv, key)) return false;
     return (input.dotEnv[key] ?? '') !== '' || (input.processEnv[key] ?? '') !== '';
   };
-  const missing = required.filter((key) => !reaches(key));
-  if (missing.length === 0) return { verdict: 'ready', checked: required };
-  return {
-    verdict: 'unreachable',
-    missing,
-    message:
-      `aucune instance publiable n'est joignable depuis ce sandbox — ${missing.join(', ')} ` +
-      `n'y arrive pas. Une clé n'atteint le sandbox que si \`report.env\` la porte, ou si ` +
-      `\`.sandcastle/.env\` la DÉCLARE (sa valeur peut alors venir de l'environnement).`,
-  };
+  const missingEnv = requiredEnv.length === 0 ? [] : requiredEnv.filter((key) => !reaches(key));
+
+  // Precedence: unreachable beats unverifiable beats ready. A dimension that
+  // proves an absence decides the verdict; a dimension that could only shrug
+  // still gets its sentence into the message.
+  const missing = [...missingEnv, ...tools.missing];
+  if (missing.length > 0) {
+    const clauses = [...(missingEnv.length > 0 ? [envUnreachableMessage(missingEnv)] : []), ...tools.says];
+    return { verdict: 'unreachable', missing, message: clauses.join(' ') };
+  }
+  const shrugs = [...(requiredEnv.length === 0 ? [NO_ENV_DECLARED] : []), ...tools.says];
+  if (shrugs.length > 0) return { verdict: 'unverifiable', message: shrugs.join(' ') };
+  return { verdict: 'ready', checked: [...requiredEnv, ...requiredTools] };
 }
+
 
 /**
  * The branch strategy the report sandbox runs under (issue #47).
