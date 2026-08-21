@@ -295,6 +295,88 @@ export function ghPrCreateArgs(args: CreateChangeRequestArgs): readonly string[]
   return argv;
 }
 
+// ---------------------------------------------------------------------------
+// The created change request, and the ONE write verb that follows it (issue #46)
+//
+// Until #46 the create verb returned `void` and printed the url it had just been
+// handed. That was enough while the report phase ran BEFORE the MR existed — the
+// report url rode into the initial body and nothing downstream needed to name the
+// MR. Now the order is reversed (the report must be able to point AT the MR), so
+// two things the host layer never had are required: the create must hand back the
+// MR's identity, and something must be able to rewrite an open MR's description.
+// ---------------------------------------------------------------------------
+
+/** The change request a create verb opened: how everything downstream names it. */
+export interface ChangeRequestRef {
+  /** GitLab iid / GitHub PR number — the `!46` / `#46` a human, and a report's
+   *  `origine.mr`, actually use. */
+  readonly number: number;
+  /** Its web url, verbatim as the CLI printed it. */
+  readonly url: string;
+}
+
+// Both CLIs announce the new change request by url, and both urls carry the
+// number in their last segment: `…/owner/repo/pull/123` (gh),
+// `…/group/project/-/merge_requests/123` (glab). One pattern reads either.
+const CHANGE_REQUEST_URL = /https?:\/\/\S*?\/(?:pull|merge_requests)\/(\d+)/g;
+
+/**
+ * The MR/PR a `create` just opened, read off what the CLI printed — or `null`
+ * when nothing on the stream named one.
+ *
+ * LAST match, not first: a create whose output carries chatter (an advisory, a
+ * repo url, a re-attempt) puts the created MR's url at the end, and the earlier
+ * links are not it.
+ *
+ * `null` is a real answer, and the caller must treat it as one: the MR EXISTS
+ * (the CLI exited 0), we merely cannot name it. Turning that into a throw would
+ * report a successful create as a failure — and file a publish-ledger trace for
+ * an MR that is already open.
+ */
+export function parseCreatedChangeRequest(stdout: string, stderr = ''): ChangeRequestRef | null {
+  for (const text of [stdout, stderr]) {
+    let found: ChangeRequestRef | null = null;
+    // `matchAll` needs the /g flag and a fresh iterator per text; the regex is
+    // stateless between calls because matchAll clones it internally.
+    for (const match of text.matchAll(CHANGE_REQUEST_URL)) {
+      found = { number: Number(match[1]), url: match[0] };
+    }
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/**
+ * gh's description-update argv — and deliberately NOT `gh pr edit`.
+ *
+ * `gh pr edit` resolves the PR through GraphQL, which on these repositories fails
+ * with `Projects (classic) is being deprecated … (repository.issue.projectCards)`
+ * and leaves the PR UNCHANGED while exiting non-zero. Observed, not theorised
+ * (issue #46). The REST route carries no projects field and simply works;
+ * `{owner}`/`{repo}` are placeholders `gh api` fills from the current remote, so
+ * this stays as repo-agnostic as every other builder here.
+ *
+ * `--silent` because the response body is the whole PR object: a page of JSON on
+ * stdout in the middle of a publish log, for a call whose only interesting
+ * outcome is its exit status.
+ */
+export function ghUpdateDescriptionArgs(number: number, description: string): readonly string[] {
+  return [
+    'api',
+    '-X',
+    'PATCH',
+    `repos/{owner}/{repo}/pulls/${number}`,
+    '-f',
+    `body=${description}`,
+    '--silent',
+  ];
+}
+
+/** glab's description-update argv. `mr update` is the supported verb and works. */
+export function glabUpdateDescriptionArgs(number: number, description: string): readonly string[] {
+  return ['mr', 'update', String(number), '--description', description];
+}
+
 /**
  * The human-readable `create` command an operator pastes to finish publishing a
  * branch by hand when Phase 3 fails after the push. Each host's flags differ, so
@@ -588,24 +670,73 @@ export function inferGitHostFromUrl(url: string): GitHost | null {
  * Run a host CLI's draft-MR/PR `create`, CAPTURING its output (not inheriting
  * stdio) so the publish phase can drop the host-tree "Warning: N uncommitted
  * changes" false positive and print the URL + real stderr itself (issue #21).
- * Throws on non-zero exit with the CLI's stderr in the message, so main.ts's
- * per-branch catch renders the manual-create hint with useful diagnostics — the
- * same shape `execFileSync`'s exception gave before this captured the stream.
- * The `\`gh pr create\`` / `\`glab mr create\`` prefix in the message is read off
- * the argv so it names the exact command that failed.
+ * Throws (via requireWriteSuccess) on non-zero exit, so main.ts's per-branch catch
+ * renders the manual-create hint with useful diagnostics. Returns the created MR's
+ * identity for the report phase and the body update that follow it (issue #46).
  */
-function runDraftCreate(cli: 'gh' | 'glab', argv: readonly string[]): void {
-  const result = spawnSync(cli, argv, { encoding: 'utf8' });
-  if (result.status !== 0) {
-    const signal = result.signal ? ` (signal ${result.signal})` : '';
-    const stderr = (result.stderr ?? '').trim();
-    const detail = stderr !== '' ? stderr : 'no stderr captured';
-    const subcommand = argv.slice(0, 2).join(' '); // 'pr create' | 'mr create'
-    throw new Error(`\`${cli} ${subcommand}\` failed (exit ${result.status}${signal}):\n${detail}`);
-  }
-  const { out, advisory } = classifyDraftCreateOutput(result.stdout ?? '', result.stderr ?? '');
+function runDraftCreate(
+  cli: 'gh' | 'glab',
+  argv: readonly string[],
+  write: HostWrite,
+): ChangeRequestRef | null {
+  const result = requireWriteSuccess(cli, argv, write(cli, argv));
+  const { out, advisory } = classifyDraftCreateOutput(result.stdout, result.stderr);
   if (out !== '') process.stdout.write(out.endsWith('\n') ? out : `${out}\n`);
   if (advisory !== '') console.warn(advisory);
+  // The identity is read from what the CLI printed, because that is the only place
+  // either CLI states it. `null` here means "opened, but unnamed" — see
+  // parseCreatedChangeRequest.
+  return parseCreatedChangeRequest(result.stdout, result.stderr);
+}
+
+/**
+ * What a captured host WRITE leaves behind — the four spawnSync fields the
+ * runners read. Named so the write path can be injected in a contract test the
+ * same way the read path already is.
+ */
+export interface HostWriteResult {
+  readonly status: number | null;
+  readonly signal: string | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** Run a host CLI write, capturing both streams. */
+export type HostWrite = (cli: 'gh' | 'glab', argv: readonly string[]) => HostWriteResult;
+
+const defaultHostWrite: HostWrite = (cli, argv) => {
+  const result = spawnSync(cli, argv, { encoding: 'utf8' });
+  return {
+    status: result.status,
+    signal: result.signal ?? null,
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+  };
+};
+
+/**
+ * Throw on a non-zero write, with the CLI's own stderr in the message — the shape
+ * `execFileSync`'s exception gave before these calls captured their streams, so
+ * main.ts's per-branch catch still renders a diagnosable failure. The
+ * `\`gh pr create\`` / `\`glab mr update\`` prefix is read off the argv, so the
+ * message names the exact command that failed.
+ */
+function requireWriteSuccess(
+  cli: 'gh' | 'glab',
+  argv: readonly string[],
+  result: HostWriteResult,
+): HostWriteResult {
+  if (result.status !== 0) {
+    const signal = result.signal ? ` (signal ${result.signal})` : '';
+    const stderr = result.stderr.trim();
+    const detail = stderr !== '' ? stderr : 'no stderr captured';
+    // 'pr create' | 'mr update' — and, for the REST route, the method and path
+    // rather than a useless `api -X`.
+    const subcommand =
+      argv[0] === 'api' ? `api ${argv[2] ?? ''} ${argv[3] ?? ''}`.trim() : argv.slice(0, 2).join(' ');
+    throw new Error(`\`${cli} ${subcommand}\` failed (exit ${result.status}${signal}):\n${detail}`);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -880,8 +1011,19 @@ export interface Host {
   labelsOf(issueNumber: number): string[];
   /** Issue facts for the Draft-MR/PR body (best-effort: never throws). */
   issueInfoOf(issueNumber: number, fallbackTitle: string): IssueInfo;
-  /** Push happened already on the host; this opens the Draft MR/PR. */
-  createDraftChangeRequest(args: CreateChangeRequestArgs): void;
+  /**
+   * Push happened already on the host; this opens the Draft MR/PR and hands back
+   * its identity. `null` ⇒ opened, but the CLI printed nothing that named it —
+   * never "not opened" (issue #46).
+   */
+  createDraftChangeRequest(args: CreateChangeRequestArgs): ChangeRequestRef | null;
+  /**
+   * Replace an open MR/PR's description — the one write verb that exists besides
+   * the create, because the report url can only be added AFTER the MR opens.
+   * Throws on a non-zero CLI exit; the caller decides what a failed body update
+   * costs (main.ts: a warning, never the run).
+   */
+  updateChangeRequestDescription(ref: ChangeRequestRef, description: string): void;
   /** Every open MR/PR of the current repo (for chained-base resolution). */
   openChangeRequests(): OpenMergeRequest[];
   /** The work queue: open issues carrying ANY of the given labels, deduped by number. */
@@ -893,12 +1035,16 @@ export interface Host {
  * itself — "labelsOf / openChangeRequests / queueIssues go through the retry" —
  * is a contract test rather than a claim. Production passes neither and gets
  * execFileSync + the real clock; the tests pass a stub CLI and a recording clock.
- * The WRITE verb (createDraftChangeRequest) is deliberately not routed here: a
- * retried create could open two PRs.
+ * The WRITE verbs are deliberately NOT routed through the retry: a retried create
+ * could open two PRs, and a retried description update could race a human edit.
+ * They take their own injection point (`runWrite`) so their argv and their
+ * captured result are contract-tested without ever touching a real host.
  */
 export interface CreateHostDeps {
   /** Run the host CLI and return its stdout; throws execFileSync-shaped errors. */
   readonly runCli?: (cli: 'gh' | 'glab', argv: readonly string[]) => string;
+  /** Run a host CLI WRITE and return its captured streams + exit status. */
+  readonly runWrite?: HostWrite;
   /** sleep/log/random for the retry loop. */
   readonly effects?: HostReadEffects;
 }
@@ -906,6 +1052,7 @@ export interface CreateHostDeps {
 export function createHost(host: GitHost, deps: CreateHostDeps = {}): Host {
   const runCli =
     deps.runCli ?? ((cli, argv) => execFileSync(cli, argv, { encoding: 'utf8' }));
+  const runWrite = deps.runWrite ?? defaultHostWrite;
   const effects = deps.effects ?? defaultHostReadEffects;
   // One read = one retrying runHostRead. The verb string names the exact CLI
   // invocation in the retry log, so a slow run reads back unambiguously.
@@ -927,7 +1074,11 @@ export function createHost(host: GitHost, deps: CreateHostDeps = {}): Host {
           return { number: issueNumber, title: fallbackTitle };
         }
       },
-      createDraftChangeRequest: (args) => runDraftCreate('gh', ghPrCreateArgs(args)),
+      createDraftChangeRequest: (args) => runDraftCreate('gh', ghPrCreateArgs(args), runWrite),
+      updateChangeRequestDescription: (ref, description) => {
+        const argv = ghUpdateDescriptionArgs(ref.number, description);
+        requireWriteSuccess('gh', argv, runWrite('gh', argv));
+      },
       openChangeRequests: () => parseGhPrList(ghRead('pr list', ghPrListArgs())),
       queueIssues: (labels) =>
         dedupeQueue(
@@ -973,7 +1124,11 @@ export function createHost(host: GitHost, deps: CreateHostDeps = {}): Host {
         return { number: issueNumber, title: fallbackTitle };
       }
     },
-    createDraftChangeRequest: (args) => runDraftCreate('glab', glabMrCreateArgs(args)),
+    createDraftChangeRequest: (args) => runDraftCreate('glab', glabMrCreateArgs(args), runWrite),
+    updateChangeRequestDescription: (ref, description) => {
+      const argv = glabUpdateDescriptionArgs(ref.number, description);
+      requireWriteSuccess('glab', argv, runWrite('glab', argv));
+    },
     openChangeRequests: () =>
       parseOpenMergeRequests(
         glabRead('mr list', ['mr', 'list', '--output', 'json', '--per-page', '100']),

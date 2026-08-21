@@ -132,8 +132,9 @@ export interface ProjectConfig {
    *  linked worktree; the tracked `.gitignore` is untouched), so a genuinely uncommitted
    *  TRACKED change still warns. Default: the pnpm local store; extend per consumer. */
   readonly worktreeExclude: readonly string[];
-  /** The pre-MR report phase: a client skill that explains the pushed branch, publishes a
-   *  report, and hands back one url that rides into the MR body (revue issue #26, parcours P2).
+  /** The post-MR report phase: a client skill that explains the pushed branch, publishes a
+   *  report, and hands back one url written into the MR body (revue issue #26, parcours P2;
+   *  reordered after the create by issue #46, so the report can name the MR it explains).
    *  Default `null` — the phase does not exist until a consumer names a skill. It has to be
    *  off by default: `adopt --force` copies main.ts and config.ts into every consumer, and
    *  most of them have no such skill and no platform to publish to (ADR-0004, optional

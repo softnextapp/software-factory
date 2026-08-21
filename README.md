@@ -23,7 +23,7 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/{plan,implement,review}-prompt.md` | The three agent prompts the Engine's `promptFile` loads — the planner's receives the queue inline and the effective `CHAIN_MODE`/`ONLY`/`FORCE` knobs. |
 | `.sandcastle/chain.ts` | Chained-MR base resolution — the pure, host-agnostic stack walk. |
 | `.sandcastle/host.ts` | The host abstraction — owns every glab-vs-gh difference (issue view/labels, draft MR/PR creation, open-MR/PR listing, work-queue enumeration, and the prompt-time command strings). Host reads retry on transient failure (#25) and classify their failure as transient vs definitive (#31). |
-| `.sandcastle/report.ts` | The **pre-MR report phase** — a client skill that explains the pushed branch and hands back one url for the MR body. Pure half: what counts as a report, what does not, and what the MR says either way. Off by default (`ProjectConfig.report: null`). |
+| `.sandcastle/report.ts` | The **post-MR report phase** — a client skill that explains the just-opened MR and hands back one url, written into its body. Pure half: what counts as a report, what does not, and what the MR says either way. Off by default (`ProjectConfig.report: null`). |
 | `.sandcastle/report-prompt.md` | The prompt driving that phase's sandbox. |
 | `.sandcastle/publish.ts` | The publish ledger — a durable trace of a pushed branch whose MR/PR creation failed, drained by the next run (issue #26). |
 | `.sandcastle/iteration.ts` | The per-iteration failure boundary — the pure decision of whether a failure loses its iteration or stops the run (issue #31). `main.ts` owns the try/catch. |
@@ -53,18 +53,28 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
    **Implementer** then a **Reviewer** that fixes *in place* (edits + commits
    directly on the branch — no verdict loop). Two *sequential* sandboxes on the
    same branch, because the provider env is baked at sandbox level.
-3. **Publish** — host-side `git push`, then — **only if the consumer enabled it** — the
-   optional **report phase**, then a Draft MR/PR (`glab mr create` or `gh pr create`, via
-   `host.ts`) for every branch that got commits. **Never auto-merged**
-   (`MERGE_STRATEGY=human`): a human
+3. **Publish** — host-side `git push`, then a Draft MR/PR (`glab mr create` or
+   `gh pr create`, via `host.ts`) for every branch that got commits, then — **only if
+   the consumer enabled it** — the optional **report phase**, whose url is written into
+   the MR body it just explained. **Never auto-merged** (`MERGE_STRATEGY=human`): a human
    reviews and merges.
 
 ### The report phase (optional, off by default)
 
-Between the push and the MR creation, `main.ts` can run one more sandbox: a **client
+Just after the Draft MR/PR is opened, `main.ts` can run one more sandbox: a **client
 skill** that reads the branch that was just pushed, writes a review report, publishes it
-somewhere, and prints a url. That url goes into the MR body, above the diff — so the
-human who opens the MR has something to read before the code.
+somewhere, and prints a url. That url is then written into the MR body, above the diff —
+so the human who opens the MR has something to read before the code.
+
+**After the MR, not before.** The report names the change it explains, and only an
+already-open MR has a number to name: run before the create, the phase left every report
+published in AFK pointing at the repository rather than at the MR. The price of the
+reversal is that the url cannot ride into the *initial* body — so the MR opens without a
+report section and `host.ts`'s description-update verb adds it, in **one** rewrite of the
+whole body (rebuilt, never appended: that is what makes a duplicated section impossible).
+On GitHub that update goes through `gh api -X PATCH repos/{owner}/{repo}/pulls/N`, never
+`gh pr edit` — `pr edit` resolves the PR through GraphQL, which fails on repositories
+carrying classic Projects and leaves the PR unchanged.
 
 It is `null` in `DEFAULT_PROJECT_CONFIG` and it stays that way for every consumer who
 does not opt in. That is not timidity: `adopt --force` copies `main.ts` and `config.ts`
@@ -90,13 +100,16 @@ report: {
 }
 ```
 
-**Its failure never costs the MR.** The MR is the work; the report is a courtesy.
-`runReportPhase` catches everything and returns an outcome — never rethrows. That matters
-more than it looks: it sits inside the `try` whose `catch` writes a `PendingPublish`
-trace, with `pushed` already true, so an escaping error would be filed as "the MR
-creation failed" for an MR that was never attempted. A missing report is **stated in the
-MR body**; a publish that degraded leaves the **replay command** there instead of a dead
-link. Secrets (instance urls, tokens) belong in `.sandcastle/.env`, not in the tracked
+**Its failure never costs the MR.** The MR is the work; the report is a courtesy — and
+since the phase moved after the create, that is structural rather than careful: the MR is
+already open when the phase starts. `runReportPhase` still catches everything and returns
+an outcome instead of rethrowing, and the phase now runs **outside** the `try` whose
+`catch` writes a `PendingPublish` trace — so a report crash can no longer be filed as "the
+MR creation failed" for an MR that is demonstrably open. A failed body update is a warning
+and nothing more: the MR and the report are both fine, only the link between them is
+missing, and the url is printed so an operator can paste it in. A missing report is
+**stated in the MR body**; a publish that degraded leaves the **replay command** there
+instead of a dead link. Secrets (instance urls, tokens) belong in `.sandcastle/.env`, not in the tracked
 `config.ts`.
 
 A publish whose **push succeeds but whose MR/PR creation fails** (a host 503) is not

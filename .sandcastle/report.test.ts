@@ -1,4 +1,4 @@
-// Contract tests for the pre-MR report phase (report.ts).
+// Contract tests for the post-MR report phase (report.ts).
 //
 // What is worth testing here is not "does the skill write a good report" — no
 // unit test reaches that. It is the boundary: what the orchestration accepts as
@@ -215,6 +215,8 @@ test('reportPromptArgs: the markers the prompt must use come from the module tha
     base: 'main',
     changedLines: 1505,
     skill: SKILL,
+    mrNumber: 118,
+    mrUrl: 'https://github.com/o/r/pull/118',
   });
   const round = classifyReport(
     SKILL,
@@ -246,10 +248,74 @@ test('reportPromptArgs: every value is a string — promptArgs substitution take
     base: 'main',
     changedLines: 0,
     skill: SKILL,
+    // The unnamed-MR case, which is exactly the one that would otherwise slip a
+    // `null` into a substitution map typed Record<string, string>.
+    mrNumber: null,
+    mrUrl: null,
   });
   for (const [key, value] of Object.entries(args)) {
     assert.equal(typeof value, 'string', key);
   }
+});
+
+test('reportPromptArgs: the MR the report explains rides in, number and url (issue #46)', () => {
+  // The whole point of the reordering: run before the create, this phase had no
+  // number to give the skill, and every report published in AFK named the repo
+  // instead of the change.
+  const args = reportPromptArgs({
+    issueNumber: 46,
+    issueTitle: 'Le rapport se produit après l’ouverture de la MR',
+    branch: 'sandcastle/issue-46-r1',
+    base: 'main',
+    changedLines: 240,
+    skill: SKILL,
+    mrNumber: 118,
+    mrUrl: 'https://github.com/softnextapp/software-factory/pull/118',
+  });
+  assert.equal(args.MR_NUMBER, '118');
+  assert.equal(args.MR_URL, 'https://github.com/softnextapp/software-factory/pull/118');
+});
+
+test('reportPromptArgs: an unnamed MR substitutes EMPTY, never a leftover {{MR_NUMBER}}', () => {
+  // The create succeeded but printed nothing we could parse. Omitting the keys
+  // would leave the literal braces in the prompt the skill reads, which is worse
+  // than a blank the prompt file explicitly tells the agent how to read.
+  const args = reportPromptArgs({
+    issueNumber: 46,
+    issueTitle: 't',
+    branch: 'b',
+    base: 'main',
+    changedLines: 1,
+    skill: SKILL,
+    mrNumber: null,
+    mrUrl: null,
+  });
+  assert.equal(args.MR_NUMBER, '');
+  assert.equal(args.MR_URL, '');
+  assert.ok('MR_NUMBER' in args && 'MR_URL' in args);
+});
+
+test('renderReport: the section no longer claims the report predates the MR (issue #46)', () => {
+  // The phase runs AFTER the create now; a body saying "avant l'ouverture de cette
+  // MR" would describe an order that no longer exists.
+  const section = renderReport({ kind: 'published', skill: SKILL, url: URL_OK })!;
+  assert.ok(!section.includes("avant l'ouverture"), section);
+});
+
+test('renderReport: exactly one report section per outcome — the body is rebuilt, never appended to', () => {
+  // main.ts renders the body twice (once for the create with `null`, once for the
+  // update with the outcome) and PATCHes the second whole. That is only safe while
+  // one outcome yields one heading.
+  for (const outcome of [
+    { kind: 'published', skill: SKILL, url: URL_OK },
+    { kind: 'degraded', skill: SKILL, reason: 'panne', replay: 'revue publier --depuis /p' },
+    { kind: 'failed', skill: SKILL, reason: 'rien' },
+  ] as const) {
+    const section = renderReport(outcome)!;
+    assert.equal(section.match(/## Rapport de revue/g)?.length, 1, outcome.kind);
+  }
+  // And no section at all before the phase has run — the body the MR opens with.
+  assert.equal(renderReport(null), null);
 });
 
 finish();

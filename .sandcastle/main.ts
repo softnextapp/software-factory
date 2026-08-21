@@ -56,6 +56,7 @@ import {
   claimLabels,
   hostTokenKey,
   hostTokenMissingMessage,
+  type ChangeRequestRef,
   type Host,
   type QueueIssue,
 } from './host.ts';
@@ -584,10 +585,13 @@ const commitsOn = (base: string, branch: string): CommitInfo[] => {
 
 // Three dots: the diff against the MERGE BASE, which is what GitLab shows in the
 // Changes tab. Two dots would fold in whatever landed on the base meanwhile.
-// --- The pre-MR report phase (revue issue #26, parcours P2) -------------------
-// Runs between the push and the MR creation, in its own sandbox, only when a
+// --- The post-MR report phase (revue issue #26, parcours P2; reordered by #46) -
+// Runs just AFTER the Draft MR/PR is opened, in its own sandbox, only when a
 // consumer configured `project.report`. Everything decidable about it lives in
 // report.ts — this is the side effect and nothing else.
+//
+// The MR's number rides in, because that is why the phase moved: the report names
+// the change it explains, and only an already-open MR has a number to name.
 //
 // It borrows a core role's provider rather than owning one: a report is a
 // reading-and-explaining job, the same shape as the review, and adding a fourth
@@ -597,6 +601,8 @@ const runReportPhase = async (input: {
   readonly issue: { number: number; title: string; base: string };
   readonly branch: string;
   readonly changedLines: number;
+  /** The MR/PR the report explains — `null` only when the create could not be named. */
+  readonly mr: ChangeRequestRef | null;
 }): Promise<ReportOutcome | null> => {
   const report = cfg.project.report;
   if (report === null) return null;
@@ -626,6 +632,8 @@ const runReportPhase = async (input: {
         base: input.issue.base,
         changedLines: input.changedLines,
         skill,
+        mrNumber: input.mr?.number ?? null,
+        mrUrl: input.mr?.url ?? null,
       }),
       idleTimeoutSeconds: report.idleTimeoutSeconds,
     });
@@ -1405,7 +1413,7 @@ if (cfg.run.dryRun) {
           ? { required: false, reason: 'local (no tracker) — no host token needed' }
           : { required: true, key: hostToken.key, ...tokenStatus(hostToken) },
       hostMismatch: warnHostMismatch(),
-      // The pre-MR report phase (revue issue #26). Reported here for the same reason as
+      // The post-MR report phase (revue issue #26, reordered by #46). Reported here for the same reason as
       // `hooks` above: a consumer must be able to confirm the wiring — the skill name, the
       // mounts, the env the sandbox will see — WITHOUT launching a sandbox, which is the
       // only other way to find out. Env KEYS only, never values: a consumer's report env
@@ -1414,7 +1422,7 @@ if (cfg.run.dryRun) {
         cfg.project.report === null
           ? {
               enabled: false,
-              hint: 'set project.report to run a client skill between the push and the MR',
+              hint: 'set project.report to run a client skill just after the MR is opened',
             }
           : {
               enabled: true,
@@ -1938,6 +1946,20 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
       let pushed = false;
       let mrTitle: string | undefined;
       let mrDesc: string | undefined;
+      // Set inside the try, consumed AFTER it (issue #46): the report phase and the
+      // body update it feeds live outside the trace-bearing try, because by then the
+      // MR is open and nothing they do can be a failure to create it. `renderDesc`
+      // is the body builder frozen over this branch's facts, so the second body is
+      // the first body PLUS the report section — never a second, differently-derived
+      // body, and never the report section appended twice.
+      let created: ChangeRequestRef | null = null;
+      let renderDesc: ((report: ReportOutcome | null) => string) | null = null;
+      // The facts the report phase needs, computed once inside the try for the body
+      // and read again out there — recomputing them would re-run `git` for values
+      // already in hand, and print their warnings a second time. One nullable
+      // object rather than two zero-initialised counters: `null` says "the try did
+      // not get this far", which a `0` would quietly spell as "no commits".
+      let facts: { readonly commitCount: number; readonly changedLines: number } | null = null;
       try {
         execFileSync('git', ['push', '-u', 'origin', branch], { stdio: 'inherit' });
         pushed = true;
@@ -1953,33 +1975,7 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
         }
         const commits = commitsOn(issue.base, branch);
         const diffstat = diffstatOf(issue.base, branch);
-
-        // The report phase, between the push and the MR (revue issue #26). It runs
-        // here and not earlier because the skill explains a branch that EXISTS on
-        // origin — a report whose links point at a branch nobody can fetch is worth
-        // less than none. And not later, because its url belongs in the body below.
-        //
-        // Its failure boundary is inside runReportPhase, which never throws. That
-        // matters more than it looks: this `try` is the one whose `catch` records a
-        // PendingPublish trace, and `pushed` is already true. An escaping error would
-        // be filed as "the MR creation failed" for an MR that was never attempted —
-        // the next run would then drain a ledger entry describing a phase, not a
-        // publish. See publish.ts and iteration.ts for who owns which failure.
-        let report: ReportOutcome | null = null;
-        if (shouldRunReport(cfg.project.report, commits.length)) {
-          console.log(`  · #${issue.number}: rapport de revue (${cfg.project.report!.skill})…`);
-          report = await runReportPhase({
-            issue: { number: issue.number, title: issue.title, base: issue.base },
-            branch,
-            changedLines: diffstat.insertions + diffstat.deletions,
-          });
-          const rendered = renderReport(report);
-          console.log(
-            report?.kind === 'published'
-              ? `  · #${issue.number}: rapport publié — ${report.url}`
-              : `  ⚠ #${issue.number}: ${rendered ? rendered.split('\n').pop() : 'pas de rapport'}`,
-          );
-        }
+        facts = { commitCount: commits.length, changedLines: diffstat.insertions + diffstat.deletions };
 
         const issueInfo = host.issueInfoOf(issue.number, issue.title);
         mrTitle = buildMrTitle({
@@ -1988,36 +1984,41 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           summary,
           commits,
         });
-        mrDesc = buildMrDescription({
-          issue: issueInfo,
-          branch,
-          base: issue.base,
-          // Drives the closure decision (issue #27): `Closes #n` only when the target
-          // IS the trunk, else the explicit why-not note. The trunk comes from the
-          // config — never a hardcoded 'main' — so a consumer with another default
-          // branch gets the same guarantee.
-          defaultBranch: cfg.project.baseBranch,
-          summary,
-          ...(summaryError ? { summaryError } : {}),
-          review: {
-            reviewed,
-            found: extractReviewLedger(reviewStdout, 'found').data,
-            resolved: extractReviewLedger(reviewStdout, 'resolved').data,
-          },
-          commits,
-          diffstat,
-          report,
-          run: {
-            profile: cfg.run.profile,
-            implementerModel: modelFor('implementer'),
-            reviewerModel: modelFor('reviewer'),
-            round: iteration,
-            logs,
-          },
-        });
+        renderDesc = (report: ReportOutcome | null): string =>
+          buildMrDescription({
+            issue: issueInfo,
+            branch,
+            base: issue.base,
+            // Drives the closure decision (issue #27): `Closes #n` only when the target
+            // IS the trunk, else the explicit why-not note. The trunk comes from the
+            // config — never a hardcoded 'main' — so a consumer with another default
+            // branch gets the same guarantee.
+            defaultBranch: cfg.project.baseBranch,
+            summary,
+            ...(summaryError ? { summaryError } : {}),
+            review: {
+              reviewed,
+              found: extractReviewLedger(reviewStdout, 'found').data,
+              resolved: extractReviewLedger(reviewStdout, 'resolved').data,
+            },
+            commits,
+            diffstat,
+            report,
+            run: {
+              profile: cfg.run.profile,
+              implementerModel: modelFor('implementer'),
+              reviewerModel: modelFor('reviewer'),
+              round: iteration,
+              logs,
+            },
+          });
+        // The body the MR OPENS with carries no report section: the phase that
+        // produces one has not run yet, and cannot until this create returns a
+        // number (issue #46). The section is added by the single update below.
+        mrDesc = renderDesc(null);
         // Open the Draft MR/PR through the host layer — glab mr create / gh pr create,
         // argv only. assignee null ⇒ leave it unassigned (host default).
-        host.createDraftChangeRequest({
+        created = host.createDraftChangeRequest({
           sourceBranch: branch,
           targetBranch: issue.base,
           title: mrTitle,
@@ -2098,6 +2099,80 @@ for (let iteration = 1; iteration <= cfg.run.maxIterations; iteration++) {
           `  ✗ #${issue.number}: publish failed for \`${branch}\` — the commits are on the ` +
             `${hostTerms.cr} by hand:\n` +
             `    git push -u origin ${branch} && ${manualCreateHint(cfg.project.gitHost, branch, issue.base)}\n` +
+            `    ${String(error)}`,
+        );
+        continue;
+      }
+
+      // ---------------------------------------------------------------------
+      // The report phase — AFTER the MR, deliberately outside the try above
+      // (issue #46).
+      //
+      // Before #46 it ran between the push and the create, and its url rode into
+      // the initial body. That was cheaper here but wrong there: the skill could
+      // not name the MR it explains, so every report published in AFK carried an
+      // empty origin and the review dashboard showed the reader a repository
+      // instead of a change. Issue #46 is the whole account.
+      //
+      // The publish-ledger resume (drainPendingPublishes, above) deliberately does
+      // NOT get this phase: it opens a previous run's missing MR from a recorded
+      // title and description, re-running no agent at all, and spending a report
+      // sandbox there would be exactly the agent re-run that resume exists to avoid.
+      //
+      // Being out here is the guarantee, not a nicety. The `try` above is the one
+      // whose `catch` files a `publish-pending.json` trace, and it does so on the
+      // strength of `pushed`. An error escaping the report phase in there would be
+      // recorded as "the MR creation failed" for an MR that is demonstrably open —
+      // and the next run would drain a ledger entry describing a phase rather than
+      // a publish. Out here the MR already exists: nothing below can cost it, and
+      // nothing below can be mistaken for its absence.
+      if (facts === null || renderDesc === null) continue;
+      if (!shouldRunReport(cfg.project.report, facts.commitCount)) continue;
+      console.log(`  · #${issue.number}: rapport de revue (${cfg.project.report!.skill})…`);
+      // Never throws — the boundary is inside runReportPhase.
+      const report = await runReportPhase({
+        issue: { number: issue.number, title: issue.title, base: issue.base },
+        branch,
+        changedLines: facts.changedLines,
+        mr: created,
+      });
+      const rendered = renderReport(report);
+      console.log(
+        report?.kind === 'published'
+          ? `  · #${issue.number}: rapport publié — ${report.url}`
+          : `  ⚠ #${issue.number}: ${rendered ? rendered.split('\n').pop() : 'pas de rapport'}`,
+      );
+
+      // ONE update, carrying the whole body rebuilt with the report section — the
+      // same builder, the same facts, plus the section. Rebuilding rather than
+      // appending is what makes a duplicated section impossible.
+      //
+      // Both notices below go to STDOUT (issue #46, criterion 6) and not to the
+      // ⚠-on-stderr channel the rest of Phase 3 uses. That is the honest stream for
+      // them: nothing here is a run failure — the MR is open, the report is
+      // published — only the link between the two is missing, and the operator's
+      // remedy is to paste the url in, which needs the url to be in the log they
+      // are reading. Said once, in English like every other operator line.
+      const pasteHint = report?.kind === 'published' ? ` The report is at ${report.url}` : '';
+      if (created === null) {
+        console.log(
+          `  ⚠ #${issue.number}: the ${hostTerms.cr} was opened but its number could not be read ` +
+            `from the CLI output, so its body carries no report section.${pasteHint}`,
+        );
+        continue;
+      }
+      try {
+        host.updateChangeRequestDescription(created, renderDesc(report));
+        console.log(
+          `  ✓ #${issue.number}: ${hostTerms.cr} ${hostTerms.ref}${created.number} body updated ` +
+            `with the report section.`,
+        );
+      } catch (error) {
+        // A body that lacks its report section is a cosmetic loss; failing the run
+        // over it would throw away a published MR and a published report.
+        console.log(
+          `  ⚠ #${issue.number}: could not update the ${hostTerms.cr} body with the report ` +
+            `section — the ${hostTerms.cr} and the report are both fine.${pasteHint}\n` +
             `    ${String(error)}`,
         );
       }

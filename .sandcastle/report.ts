@@ -1,11 +1,20 @@
 /**
- * report.ts — the pre-MR report phase: the pure half.
+ * report.ts — the post-MR report phase: the pure half.
  *
- * The step this module decides for runs in Phase 3, between `git push` and the
- * Draft MR/PR creation: a client skill reads the branch that was just pushed,
- * writes a review report, publishes it, and prints ONE url. That url rides into
- * the MR body, so the human who opens the MR has something to read before the
- * diff.
+ * The step this module decides for runs at the end of Phase 3, just AFTER the
+ * Draft MR/PR is opened: a client skill reads the branch that was just pushed,
+ * writes a review report, publishes it, and prints ONE url. That url is then
+ * added to the MR body, so the human who opens the MR has something to read
+ * before the diff.
+ *
+ * **Why after, when #41 deliberately put it before (issue #46).** The report
+ * names its own origin — the change it explains — and a reader of the review
+ * platform expects that origin to be the MR, clickable. Run before the create,
+ * the phase cannot know the MR number, so every report produced in AFK named the
+ * repository and nothing else. Ordering the phase after the create is the only
+ * way the number exists when the skill needs it; the price is that the url can no
+ * longer ride into the INITIAL body and must be written into it afterwards (see
+ * `Host.updateChangeRequestDescription`).
  *
  * Three things shape this module, and none of them is cosmetic.
  *
@@ -26,6 +35,12 @@
  * summary already does (see mr-body.ts). `main.ts` owns the try/catch; this
  * module owns the classification, which is the part worth testing.
  *
+ * Since #46 that guarantee is structural rather than careful: the MR is already
+ * open when the phase starts, so nothing this phase does can prevent it. The
+ * corollary is that a failure here is no longer confusable with a failed MR
+ * creation — the phase runs OUTSIDE the try that records a `publish-pending.json`
+ * trace, and a report crash therefore never files one.
+ *
  * `main.ts` executes at import, so it has no unit test. Everything decidable is
  * therefore here.
  */
@@ -38,7 +53,7 @@ export interface ReportMount {
   readonly sandboxPath: string;
 }
 
-/** The pre-MR report phase, as a consumer configures it. `null` ⇒ no phase. */
+/** The post-MR report phase, as a consumer configures it. `null` ⇒ no phase. */
 export interface ReportConfig {
   /** The skill the report agent must invoke, by name. Reported in the MR body so
    *  a reader knows which doctrine produced what they are about to read. */
@@ -193,7 +208,7 @@ export function renderReport(outcome: ReportOutcome | null): string | null {
       '',
       // The url is wrapped in `<>`: a url containing a `)` is accepted by `new URL`
       // and would otherwise close the markdown link early, spilling the rest into the body.
-      `📖 **[Lire le rapport](<${outcome.url}>)** — produit par la skill \`${outcome.skill}\` avant l'ouverture de cette MR.`,
+      `📖 **[Lire le rapport](<${outcome.url}>)** — produit par la skill \`${outcome.skill}\` à l'ouverture de cette MR.`,
     ].join('\n');
   }
   if (outcome.kind === 'degraded') {
@@ -233,6 +248,13 @@ export function shouldRunReport(config: ReportConfig | null, commitCount: number
  * `{{DIFF_BASE}}`/`{{BRANCH}}` are what the skill diffs; the markers are passed
  * in so the prompt file and this module cannot disagree about the contract they
  * share. Two spellings of a marker is a phase that silently never reports.
+ *
+ * `MR_NUMBER`/`MR_URL` are the whole point of #46: the MR the report explains is
+ * already open, and the skill needs its number to record a clickable origin. They
+ * are EMPTY STRINGS, never absent, when the create could not be named (see
+ * `parseCreatedChangeRequest`) — a `{{MR_NUMBER}}` left unsubstituted in the
+ * prompt would reach the skill as literal braces, which is worse than a blank the
+ * prompt file already tells the agent how to read.
  */
 export function reportPromptArgs(input: {
   readonly issueNumber: number;
@@ -241,6 +263,10 @@ export function reportPromptArgs(input: {
   readonly base: string;
   readonly changedLines: number;
   readonly skill: string;
+  /** The open MR/PR's number, or `null` when it could not be determined. */
+  readonly mrNumber: number | null;
+  /** Its web url, or `null` for the same reason. */
+  readonly mrUrl: string | null;
 }): Record<string, string> {
   return {
     ISSUE_NUMBER: String(input.issueNumber),
@@ -249,6 +275,8 @@ export function reportPromptArgs(input: {
     BASE_BRANCH: input.base,
     CHANGED_LINES: String(input.changedLines),
     REPORT_SKILL: input.skill,
+    MR_NUMBER: input.mrNumber === null ? '' : String(input.mrNumber),
+    MR_URL: input.mrUrl ?? '',
     REPORT_OPEN: OPEN,
     REPORT_CLOSE: CLOSE,
     REPORT_REPLAY_OPEN: REPLAY_OPEN,
