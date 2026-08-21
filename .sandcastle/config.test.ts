@@ -216,6 +216,21 @@ test('effectiveMaxParallel: no chain → maxParallel', () => {
   assert.equal(c.effectiveMaxParallel, 3);
 });
 
+test('default split profile: GLM 5.3 at effort low on both z.ai roles', () => {
+  // Issue #43: the shipped default for Split mode is GLM 5.3 at effort low.
+  // Effort follows the provider (README), and `zai` is bound only by `split` —
+  // so pinning the provider IS pinning what Split runs on. `opus` is unaffected.
+  const c = loadConfig(DEFAULT_PROJECT_CONFIG, {});
+  assert.equal(c.run.profile, 'split');
+  for (const role of ['planner', 'implementer'] as const) {
+    assert.equal(c.providerFor(role).model, 'glm-5.3[1m]');
+    assert.equal(c.providerFor(role).effort, 'low');
+  }
+  // The cross-provider reviewer keeps its own model and effort.
+  assert.equal(c.providerFor('reviewer').model, 'claude-opus-5');
+  assert.equal(c.providerFor('reviewer').effort, 'medium');
+});
+
 test('loadConfig() convenience wires defaults end to end', () => {
   const c = loadConfig(humanProject, {});
   assert.equal(c.run.profile, 'split');

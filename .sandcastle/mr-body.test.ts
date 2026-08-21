@@ -126,7 +126,7 @@ const input = (over: Partial<MrBodyInput> = {}): MrBodyInput => ({
   },
   run: {
     profile: 'split',
-    implementerModel: 'glm-5.2[1m]',
+    implementerModel: 'glm-5.3[1m]',
     reviewerModel: 'claude-opus-5',
     round: 1,
   },
