@@ -34,6 +34,7 @@ re-assembling a Sandcastle setup by hand and re-tuning it each time.
 | `.sandcastle/skills-lock.ts` | Hashes, scans, and verifies the vendored skills; regenerates `skills-lock.json`. |
 | `.sandcastle/adopt.ts` | One-command in-place adoption into an existing repo — copies the config layer, wires the runtime, and puts the config under git in the consumer. See [Adopt into an existing repo](#adopt-into-an-existing-repo). |
 | `.claude/skills/` | The vendored Matt Pocock skills — see [Vendored skills](#vendored-skills). |
+| `skills/` | The Factory's **own** skills — written here, not vendored, not hashed. See [Our own skills](#our-own-skills). |
 | `skills-lock.json` | Manifest of record for the vendored skills (source + path + content hash each). |
 | `templates/` | Project-context skeletons a consumer fills in after cloning — see [Project context](#consuming-the-factory-clone-and-own). |
 | `.sandcastle/.env.secrets.example` | Template for the provider-token file `main.ts` reads (copy to `.env.secrets`). |
@@ -700,6 +701,43 @@ A consumer who prefers auto-updating skills can ignore the vendored set and
 install the `mattpocock-skills` plugin instead — both are documented
 alternatives in ADR-0005.
 
+## Our own skills
+
+`.claude/skills/` holds skills that come from **upstream**. Skills the Factory
+writes **itself** live in a top-level `skills/` directory instead — flat, one
+directory per skill:
+
+```
+skills/sandcastle-run/SKILL.md
+```
+
+They are deliberately **outside the lock's scan**
+([ADR-0006](docs/adr/0006-own-skills-live-outside-the-lock-scan.md)): the hash in
+`skills-lock.json` exists to detect drift *against an upstream*, and a skill we
+author has none — every deliberate edit would read as tampering. So `npm run
+skills:check` stays green when you edit one, and there is no lock entry to
+regenerate.
+
+**`sandcastle-run`** is the operator skill: it turns "traite le ticket #42 en AFK
+avec Sandcastle en mode split" into the right gestures on a Factory instance —
+which half of the sentence is *invocation* (a `SANDCASTLE_*` variable) and which
+half is *identity* (`config.ts`, only ever edited with your confirmation), the
+read-only prerequisite checks, the mandatory dry-run, then the background launch.
+Its body is French; its contract test
+(`.sandcastle/sandcastle-run-skill.test.ts`) pins the bijection between the
+`SANDCASTLE_*` variables it documents and the ones `loadRunConfig` actually
+reads — so a new run knob cannot ship invisible to the skill.
+
+Install it on your workstation (nothing automates this — one `cp`):
+
+```sh
+cp -r skills/sandcastle-run ~/.claude/skills/
+```
+
+Nothing here ships to a consumer: `adopt.ts` copies `.sandcastle/` only, and the
+skill serves the Factory repo itself as much as any instance. A per-consumer copy
+would be a per-consumer *stale* copy.
+
 ## v0.1 scope
 
 **Served out of the box:** the **Split** profile + **human-merge** (draft MR/PR,
@@ -751,3 +789,5 @@ via the shared `.sandcastle/test-harness.ts`.
   config-driven canonical Orchestration with optional modules.
 - [docs/adr/0005](docs/adr/0005-matt-skills-vendored-with-lockfile.md) — Matt skills
   vendored in the Factory, with `skills-lock.json` as manifest.
+- [docs/adr/0006](docs/adr/0006-own-skills-live-outside-the-lock-scan.md) — our own
+  skills live in `skills/`, outside the lock's scan.

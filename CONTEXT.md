@@ -65,3 +65,11 @@ The first-class config option encoding who merges implemented work: `agent` (a M
 **skills-lock.json**:
 The manifest of record for the Matt Pocock skills vendored into the Factory — each skill's source, path, and content hash — so the vendored versions are known and updatable.
 _Avoid_: lockfile (ambiguous), package manifest.
+
+**Vendored skill**:
+A skill authored upstream (the Matt Pocock suite) and copied into the Factory's `.claude/skills/`. It has an upstream, so it is hashed in `skills-lock.json` and `npm run skills:check` rules on its drift; editing one in place is tampering, not maintenance. Updating means re-fetching from upstream and regenerating the lock.
+_Avoid_: our skills, installed skill.
+
+**Own skill**:
+A skill the Factory writes itself, living in the top-level `skills/` directory (flat: `skills/<name>/SKILL.md`) — outside the lock's scan, because it has no upstream to drift from ([ADR-0006](docs/adr/0006-own-skills-live-outside-the-lock-scan.md)). Its body is French; it is installed on a workstation by hand into `~/.claude/skills/`, and ships to no consumer.
+_Avoid_: custom skill, local skill, vendored skill (an own skill has no upstream).
