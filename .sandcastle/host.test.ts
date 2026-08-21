@@ -21,6 +21,9 @@ import {
   parseGhIssue,
   glabMrCreateArgs,
   ghPrCreateArgs,
+  ghUpdateDescriptionArgs,
+  glabUpdateDescriptionArgs,
+  parseCreatedChangeRequest,
   ghPrListArgs,
   parseGhPrList,
   manualCreateHint,
@@ -516,12 +519,19 @@ test('HOST_TERMS: glab = merge request / GitLab / !N, gh = pull request / GitHub
   assert.equal(HOST_TERMS.gh.ref, '#');
 });
 
-test('createHost: returns the five operations for each host', () => {
+test('createHost: returns the six operations for each host', () => {
   for (const host of ['glab', 'gh'] as const) {
     const h = createHost(host);
     assert.equal(typeof h.labelsOf, 'function', `${host}.labelsOf`);
     assert.equal(typeof h.issueInfoOf, 'function', `${host}.issueInfoOf`);
     assert.equal(typeof h.createDraftChangeRequest, 'function', `${host}.createDraftChangeRequest`);
+    // The second write verb (issue #46): without it the report url has no way into
+    // the body of an MR that is already open.
+    assert.equal(
+      typeof h.updateChangeRequestDescription,
+      'function',
+      `${host}.updateChangeRequestDescription`,
+    );
     assert.equal(typeof h.openChangeRequests, 'function', `${host}.openChangeRequests`);
     assert.equal(typeof h.queueIssues, 'function', `${host}.queueIssues`);
   }
@@ -986,6 +996,162 @@ for (const host of ['gh', 'glab'] as const) {
     assert.equal(calls.length, 1);
     assert.deepEqual(slept, []);
     assert.deepEqual(logged, []);
+  });
+}
+
+// --- the created MR's identity, and the ONE write verb after it (issue #46) ---
+//
+// Before #46 the create returned void: nothing downstream could name the MR, so
+// the report phase had to run BEFORE it and every report published in AFK carried
+// an empty origin. These pin the two pieces that reversal needs.
+
+// Real capture shapes. gh prints the PR url and nothing else; glab prints a
+// summary line and the url.
+const GH_CREATE_STDOUT = 'https://github.com/softnextapp/software-factory/pull/118\n';
+const GLAB_CREATE_STDOUT =
+  '!42 Draft: feat(report): x (issue-46)\n https://gitlab.com/softnext/captable/-/merge_requests/42\n';
+
+test('parseCreatedChangeRequest: gh prints a /pull/N url — number and url come back', () => {
+  assert.deepEqual(parseCreatedChangeRequest(GH_CREATE_STDOUT), {
+    number: 118,
+    url: 'https://github.com/softnextapp/software-factory/pull/118',
+  });
+});
+
+test('parseCreatedChangeRequest: glab prints a /-/merge_requests/N url — same shape out', () => {
+  assert.deepEqual(parseCreatedChangeRequest(GLAB_CREATE_STDOUT), {
+    number: 42,
+    url: 'https://gitlab.com/softnext/captable/-/merge_requests/42',
+  });
+});
+
+test('parseCreatedChangeRequest: the LAST url wins — chatter before it is not the MR', () => {
+  // A create whose output carries an advisory, a repo link, or a re-attempt puts
+  // the MR it actually opened at the end.
+  const noisy =
+    'remote: see https://github.com/o/r/pull/1 for the previous attempt\n' +
+    'https://github.com/o/r/pull/9\n';
+  assert.deepEqual(parseCreatedChangeRequest(noisy), { number: 9, url: 'https://github.com/o/r/pull/9' });
+});
+
+test('parseCreatedChangeRequest: nothing nameable → null, which is NOT "not created"', () => {
+  // The MR exists (the CLI exited 0); we merely cannot name it. Throwing here
+  // would file a publish-ledger trace for an MR that is already open.
+  assert.equal(parseCreatedChangeRequest(''), null);
+  assert.equal(parseCreatedChangeRequest('Creating draft pull request\n'), null);
+  // A repo url without a /pull/N or /merge_requests/N tail is not an MR.
+  assert.equal(parseCreatedChangeRequest('https://github.com/o/r\n'), null);
+});
+
+test('parseCreatedChangeRequest: falls back to stderr, but prefers stdout', () => {
+  assert.equal(parseCreatedChangeRequest('', 'https://github.com/o/r/pull/7\n')?.number, 7);
+  assert.equal(
+    parseCreatedChangeRequest('https://github.com/o/r/pull/7\n', 'https://github.com/o/r/pull/8\n')?.number,
+    7,
+  );
+});
+
+test('ghUpdateDescriptionArgs: the REST route, never `gh pr edit` (issue #46)', () => {
+  // `gh pr edit` resolves through GraphQL and dies on these repos with
+  // `Projects (classic) is being deprecated … (repository.issue.projectCards)`,
+  // leaving the PR UNCHANGED. Observed, not theorised — hence the assertion on the
+  // absence of `edit` as much as on the presence of the PATCH.
+  const argv = ghUpdateDescriptionArgs(118, 'corps\navec\nlignes');
+  assert.deepEqual(argv, [
+    'api',
+    '-X',
+    'PATCH',
+    'repos/{owner}/{repo}/pulls/118',
+    '-f',
+    'body=corps\navec\nlignes',
+    '--silent',
+  ]);
+  assert.equal(argv.includes('edit'), false, 'gh pr edit must never be used here');
+  assert.equal(argv.includes('pr'), false);
+});
+
+test('glabUpdateDescriptionArgs: `mr update --description`, which does work on GitLab', () => {
+  assert.deepEqual(glabUpdateDescriptionArgs(42, 'corps'), [
+    'mr',
+    'update',
+    '42',
+    '--description',
+    'corps',
+  ]);
+});
+
+// The write path takes its runner as a dep for the same reason the read path does:
+// so "the verb uses THAT argv, and hands back THAT ref" is a contract test.
+const stubWrites = (
+  host: 'gh' | 'glab',
+  results: readonly { status: number | null; stdout?: string; stderr?: string }[],
+) => {
+  const calls: { cli: string; argv: readonly string[] }[] = [];
+  let step = 0;
+  const api = createHost(host, {
+    runWrite: (cli, argv) => {
+      calls.push({ cli, argv });
+      const next = results[Math.min(step, results.length - 1)]!;
+      step++;
+      return { status: next.status, signal: null, stdout: next.stdout ?? '', stderr: next.stderr ?? '' };
+    },
+  });
+  return { api, calls };
+};
+
+const CR_CREATE_STDOUT = { gh: GH_CREATE_STDOUT, glab: GLAB_CREATE_STDOUT } as const;
+const CR_NUMBER = { gh: 118, glab: 42 } as const;
+
+for (const host of ['gh', 'glab'] as const) {
+  test(`createHost(${host}): createDraftChangeRequest hands back the MR it opened`, () => {
+    const { api, calls } = stubWrites(host, [{ status: 0, stdout: CR_CREATE_STDOUT[host] }]);
+    const ref = api.createDraftChangeRequest(CR_ARGS);
+    assert.equal(ref?.number, CR_NUMBER[host]);
+    assert.ok(ref!.url.startsWith('https://'), ref!.url);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.cli, host);
+  });
+
+  test(`createHost(${host}): a create whose output names nothing still reports SUCCESS`, () => {
+    // Exit 0 with unparseable output: the MR is open. `null` says "unnamed", and
+    // main.ts degrades to a body without its report section rather than filing a
+    // "creation failed" trace for an MR that exists.
+    const { api } = stubWrites(host, [{ status: 0, stdout: 'done\n' }]);
+    assert.equal(api.createDraftChangeRequest(CR_ARGS), null);
+  });
+
+  test(`createHost(${host}): a failed create still throws, with the CLI's stderr`, () => {
+    const { api } = stubWrites(host, [{ status: 1, stderr: 'HTTP 503: upstream unavailable' }]);
+    assert.throws(() => api.createDraftChangeRequest(CR_ARGS), /503/);
+  });
+
+  test(`createHost(${host}): updateChangeRequestDescription sends the host's own argv, once`, () => {
+    const { api, calls } = stubWrites(host, [{ status: 0 }]);
+    api.updateChangeRequestDescription({ number: CR_NUMBER[host], url: 'https://x/1' }, 'nouveau corps');
+    assert.equal(calls.length, 1, 'ONE update — a body written twice is the defect');
+    assert.equal(calls[0]!.cli, host);
+    assert.deepEqual(
+      calls[0]!.argv,
+      host === 'gh'
+        ? ghUpdateDescriptionArgs(CR_NUMBER.gh, 'nouveau corps')
+        : glabUpdateDescriptionArgs(CR_NUMBER.glab, 'nouveau corps'),
+    );
+  });
+
+  test(`createHost(${host}): a failed update throws — the caller decides what it costs`, () => {
+    // main.ts turns this into a warning: the MR and the report are both fine, only
+    // the link between them is missing.
+    const { api } = stubWrites(host, [{ status: 1, stderr: 'HTTP 422: Validation Failed' }]);
+    assert.throws(
+      () => api.updateChangeRequestDescription({ number: 1, url: 'https://x/1' }, 'corps'),
+      /422/,
+    );
+  });
+
+  test(`createHost(${host}): an update is NOT retried — it could race a human edit`, () => {
+    const { api, calls } = stubWrites(host, [{ status: 1, stderr: 'HTTP 503: upstream unavailable' }]);
+    assert.throws(() => api.updateChangeRequestDescription({ number: 1, url: 'https://x/1' }, 'corps'));
+    assert.equal(calls.length, 1, 'one attempt, even on a retryable-looking failure');
   });
 }
 

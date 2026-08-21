@@ -184,7 +184,7 @@ export interface MrBodyInput {
   /** Omitted only by a caller that has no recipe to give — the section then rests on
    *  the agent's own words alone, and says so. */
   testing?: TestingRecipe | undefined;
-  /** What the pre-MR report phase produced, or `null`/absent when no consumer enabled it.
+  /** What the post-MR report phase produced, or `null`/absent when no consumer enabled it.
    *  Note the asymmetry, and it is deliberate: a phase that is OFF renders nothing, while a
    *  phase that RAN AND FAILED renders its reason. Collapsing the two would let a broken
    *  report look exactly like a report nobody asked for — the failure mode this whole
