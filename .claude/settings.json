@@ -1,5 +1,6 @@
 {
   "enabledPlugins": {
     "mattpocock-skills@claude-plugins-official": true
-  }
+  },
+  "outputStyle": "Concise"
 }
