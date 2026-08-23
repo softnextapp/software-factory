@@ -420,4 +420,97 @@ test('renderReport: exactly one report section per outcome — the body is rebui
   assert.equal(renderReport(null), null);
 });
 
+// --- requiredTools: the image dimension of the same verdict (issue #53) ------
+
+const TOOLED: ReportConfig = {
+  ...CONFIG,
+  requiredEnv: ['REVUE_URL'],
+  env: { REVUE_URL: 'https://revue.exemple.fr' },
+  requiredTools: ['py:edge_tts'],
+};
+
+test('requiredTools: absent from the image ⇒ unreachable, and the phase is skipped', () => {
+  const verdict = decideReportReadiness({
+    config: TOOLED,
+    dotEnv: {},
+    processEnv: {},
+    toolProbes: { 'py:edge_tts': false },
+  });
+  assert.equal(verdict.verdict, 'unreachable');
+  if (verdict.verdict !== 'unreachable') return;
+  assert.deepEqual(verdict.missing, ['py:edge_tts']);
+  // The message must name the SECOND step, because it is the one that was
+  // skipped in the failure that produced this issue: a recipe corrected without
+  // a rebuild leaves the tagged image exactly as it was.
+  assert.match(verdict.message, /build-image/);
+  // And it must not blame the environment, which is fine here.
+  assert.doesNotMatch(verdict.message, /instance publiable n'est joignable/);
+});
+
+test('requiredTools: carried by the image ⇒ ready, and the verdict names both dimensions', () => {
+  const verdict = decideReportReadiness({
+    config: TOOLED,
+    dotEnv: {},
+    processEnv: {},
+    toolProbes: { 'py:edge_tts': true },
+  });
+  assert.equal(verdict.verdict, 'ready');
+  if (verdict.verdict !== 'ready') return;
+  assert.deepEqual(verdict.checked, ['REVUE_URL', 'py:edge_tts']);
+});
+
+test('requiredTools: unprobed is unverifiable, never a green and never an absence', () => {
+  // docker down, or the image not built. Claiming the module is missing would
+  // send the operator to fix the wrong thing.
+  const verdict = decideReportReadiness({ config: TOOLED, dotEnv: {}, processEnv: {}, toolProbes: null });
+  assert.equal(verdict.verdict, 'unverifiable');
+  if (verdict.verdict !== 'unverifiable') return;
+  assert.match(verdict.message, /pas pu être sondées/);
+});
+
+test('requiredTools: a malformed declaration is heard even when the round is green', () => {
+  const verdict = decideReportReadiness({
+    config: { ...TOOLED, requiredTools: ['edge_tts'] },
+    dotEnv: {},
+    processEnv: {},
+    toolProbes: {},
+  });
+  assert.equal(verdict.verdict, 'unverifiable');
+  if (verdict.verdict !== 'unverifiable') return;
+  assert.match(verdict.message, /edge_tts/);
+  assert.match(verdict.message, /cmd:/);
+  assert.match(verdict.message, /py:/);
+});
+
+test('requiredTools: both dimensions failing say BOTH things, not the first one', () => {
+  const verdict = decideReportReadiness({
+    config: { ...TOOLED, env: {} },
+    dotEnv: {},
+    processEnv: {},
+    toolProbes: { 'py:edge_tts': false },
+  });
+  assert.equal(verdict.verdict, 'unreachable');
+  if (verdict.verdict !== 'unreachable') return;
+  assert.deepEqual(verdict.missing, ['REVUE_URL', 'py:edge_tts']);
+  assert.match(verdict.message, /instance publiable n'est joignable/);
+  assert.match(verdict.message, /build-image/);
+});
+
+test('requiredTools: declaring none changes nothing — with or without probes', () => {
+  // ADR-0004: `adopt --force` copies this file into consumers who have no skill
+  // and no such need. The new dimension must be invisible to them, and the two
+  // verdicts must be INDISTINGUISHABLE, not merely both green.
+  const sans = decideReportReadiness({ config: READY_CONFIG, dotEnv: {}, processEnv: {} });
+  const avec = decideReportReadiness({
+    config: READY_CONFIG,
+    dotEnv: {},
+    processEnv: {},
+    toolProbes: { 'py:edge_tts': false },
+  });
+  assert.deepEqual(avec, sans);
+  assert.equal(sans.verdict, 'unreachable');
+  if (sans.verdict !== 'unreachable') return;
+  assert.deepEqual(sans.missing, ['REVUE_URL', 'REVUE_TOKEN']);
+});
+
 finish();
