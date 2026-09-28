@@ -497,8 +497,9 @@ The dry run (`SANDCASTLE_DRYRUN=1`) surfaces it as
 Two Engine mechanics this relies on, so the image you build is the image the loop expects:
 
 - **Image name.** `main.ts` runs `docker()` without an `imageName`, so the Engine derives
-  it from the repo directory — `sandcastle:<lowercased-repo-basename>` (e.g.
-  `sandcastle:my-project`). `build-image` tags it that way automatically; there is nothing
+  it from the repo directory — `sandcastle:<sanitized-repo-basename>`: lowercased, every
+  character outside `[a-z0-9_.-]` replaced by `-`, `local` if empty (e.g.
+  `App Gestion des marques` → `sandcastle:app-gestion-des-marques`). `build-image` tags it that way automatically; there is nothing
   to pass. (Hand-rolling `docker build -t sandcastle:my-project …` works too, as long as
   the tag matches the repo directory.)
 - **UID pre-flight check.** Before starting a sandbox the Engine inspects the image's

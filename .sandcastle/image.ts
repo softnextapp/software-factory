@@ -27,12 +27,15 @@ const BUILD_CMD = 'npx @ai-hero/sandcastle docker build-image';
 
 /** The sandbox image tag the Engine derives from a repo directory, mirrored here. */
 export function sandboxImageName(cwd: string): string {
-  // The Engine derives the tag from the repo directory's basename, lowercased
-  // (README §Sandbox image: `sandcastle:<lowercased-repo-basename>`). Mirror that
-  // derivation so the name we probe is exactly the name the loop will ask docker
-  // for. The Factory launches from the repo root, so process.cwd() is that dir.
-  const base = cwd.replace(/\/+$/, '').split('/').pop() ?? '';
-  return `sandcastle:${base.toLowerCase()}`;
+  // Mirror @ai-hero/sandcastle 0.12.0 `defaultImageName` EXACTLY (issue #57):
+  // basename (either separator, trailing ones stripped), lowercased, every char
+  // outside [a-z0-9_.-] replaced by '-', and 'local' when nothing is left. A
+  // plain lowercase probed `sandcastle:app gestion des marques` while the Engine
+  // built `sandcastle:app-gestion-des-marques`. The Factory launches from the
+  // repo root, so process.cwd() is that dir.
+  const dirName = cwd.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? 'local';
+  const sanitized = dirName.toLowerCase().replace(/[^a-z0-9_.-]/g, '-');
+  return `sandcastle:${sanitized || 'local'}`;
 }
 
 /** Outcome of probing the local docker for the sandbox image. */
