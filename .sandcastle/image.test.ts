@@ -35,6 +35,27 @@ test('sandboxImageName: a trailing slash does not yield an empty segment', () =>
   assert.equal(sandboxImageName('/home/chris/repo/'), 'sandcastle:repo');
 });
 
+test('sandboxImageName: spaces become dashes, as the Engine sanitizes them (issue #57)', () => {
+  assert.equal(
+    sandboxImageName('/Users/marty/Documents/Claude Code/App Gestion des marques'),
+    'sandcastle:app-gestion-des-marques',
+  );
+});
+
+test('sandboxImageName: accents and uppercase are lowercased then replaced outside [a-z0-9_.-]', () => {
+  assert.equal(sandboxImageName('/dev/Déjà_Vu.v2'), 'sandcastle:d-j-_vu.v2');
+});
+
+test('sandboxImageName: an empty basename falls back to local', () => {
+  assert.equal(sandboxImageName('/'), 'sandcastle:local');
+  assert.equal(sandboxImageName(''), 'sandcastle:local');
+});
+
+test('sandboxImageName: trailing slashes and backslash separators mirror the Engine', () => {
+  assert.equal(sandboxImageName('/home/chris/My Repo//'), 'sandcastle:my-repo');
+  assert.equal(sandboxImageName('C:\\work\\My Repo\\'), 'sandcastle:my-repo');
+});
+
 // --- decideImageStatus ------------------------------------------------------
 // The 3-way decision main.ts composes with its two docker probes. The guard is
 // the whole point: a dead daemon must NOT read as "image missing".
